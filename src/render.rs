@@ -462,6 +462,15 @@ impl Renderer {
                 );
             }
         }
+        for particle in &g.feedback.particles {
+            let size = 0.045 * (particle.life / 0.15).min(1.);
+            box_mesh(
+                &mut dynamic,
+                particle.pos,
+                Vec3::splat(size),
+                particle.color,
+            );
+        }
         if let Some((p, _)) = g.target {
             let p = p.as_vec3() - Vec3::splat(0.005);
             let t = 0.012;
@@ -480,6 +489,18 @@ impl Renderer {
                 }
             }
         }
+        let mut held_mesh = vec![];
+        if !pack && !paused {
+            held_model(&mut held_mesh, g);
+        }
+        let held_buffer = (!held_mesh.is_empty()).then(|| {
+            self.device
+                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("Held item"),
+                    contents: bytemuck::cast_slice(&held_mesh),
+                    usage: wgpu::BufferUsages::VERTEX,
+                })
+        });
         let dynamic_buffer = (!dynamic.is_empty()).then(|| {
             self.device
                 .create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -579,6 +600,33 @@ impl Renderer {
                 pass.set_vertex_buffer(0, b.slice(..));
                 pass.draw(0..dynamic.len() as u32, 0..1);
             }
+        }
+        if let Some(buffer) = &held_buffer {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("Held item pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &view,
+                    resolve_target: None,
+                    depth_slice: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Load,
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                    view: &self.depth,
+                    depth_ops: Some(wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(1.),
+                        store: wgpu::StoreOp::Store,
+                    }),
+                    stencil_ops: None,
+                }),
+                ..Default::default()
+            });
+            pass.set_pipeline(&self.pipeline);
+            pass.set_bind_group(0, &self.bind, &[]);
+            pass.set_vertex_buffer(0, buffer.slice(..));
+            pass.draw(0..held_mesh.len() as u32, 0..1);
         }
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -810,5 +858,108 @@ mod tests {
         assert_eq!(one, 36);
         w.set(IVec3::new(1, 100, 0), Block::Planks);
         assert_eq!(mesh_chunk(&w, IVec3::new(0, 6, 0)).len(), 60);
+    }
+}
+
+fn held_model(out: &mut Vec<Vertex>, g: &Game) {
+    use crate::items::Item;
+    let item = g.player.inventory.selected();
+    let equipped = g.player.inventory.selected_count() > 0;
+    let swing = (g.feedback.swing / 0.32 * std::f32::consts::PI).sin();
+    let moving = g.velocity.x * g.velocity.x + g.velocity.z * g.velocity.z > 0.1 && g.grounded;
+    let bob = if moving {
+        (g.feedback.clock * 11.).sin() * 0.014
+    } else {
+        0.
+    };
+    let origin = Vec3::new(
+        0.32 - swing * 0.18,
+        -0.30 + bob + swing * 0.06,
+        -0.65 + swing * 0.12,
+    );
+    box_mesh(
+        out,
+        Vec3::new(-0.065, -0.22, -0.06),
+        Vec3::new(0.13, 0.25, 0.12),
+        [0.65, 0.43, 0.29],
+    );
+    if equipped && (item.pick() > 0 || item.axe() > 0 || item == Item::Sword) {
+        let material = match item {
+            Item::WoodAxe | Item::WoodPick => [0.55, 0.35, 0.17],
+            Item::StoneAxe | Item::StonePick => [0.53, 0.55, 0.57],
+            _ => [0.77, 0.43, 0.24],
+        };
+        box_mesh(
+            out,
+            Vec3::new(-0.025, -0.10, -0.025),
+            Vec3::new(0.05, 0.48, 0.05),
+            [0.38, 0.23, 0.12],
+        );
+        if item.pick() > 0 {
+            box_mesh(
+                out,
+                Vec3::new(-0.20, 0.29, -0.04),
+                Vec3::new(0.40, 0.07, 0.08),
+                material,
+            );
+            box_mesh(
+                out,
+                Vec3::new(-0.23, 0.23, -0.035),
+                Vec3::new(0.07, 0.09, 0.07),
+                material,
+            );
+        } else if item.axe() > 0 {
+            box_mesh(
+                out,
+                Vec3::new(-0.13, 0.20, -0.045),
+                Vec3::new(0.14, 0.15, 0.09),
+                material,
+            );
+            box_mesh(
+                out,
+                Vec3::new(-0.20, 0.17, -0.025),
+                Vec3::new(0.07, 0.21, 0.05),
+                material,
+            );
+        } else {
+            box_mesh(
+                out,
+                Vec3::new(-0.045, 0.10, -0.025),
+                Vec3::new(0.09, 0.48, 0.05),
+                material,
+            );
+            box_mesh(
+                out,
+                Vec3::new(-0.13, 0.08, -0.04),
+                Vec3::new(0.26, 0.05, 0.08),
+                material,
+            );
+        }
+    } else if equipped {
+        box_mesh(
+            out,
+            Vec3::new(-0.09, 0.02, -0.10),
+            Vec3::splat(0.18),
+            item.block().map_or([0.65, 0.46, 0.24], Block::color),
+        );
+    }
+    let forward = g.player.direction();
+    let right = forward.cross(Vec3::Y).normalize();
+    let up = right.cross(forward);
+    let basis = Mat4::from_cols(
+        right.extend(0.),
+        up.extend(0.),
+        (-forward).extend(0.),
+        g.player.eye().extend(1.),
+    );
+    let transform =
+        basis * Mat4::from_translation(origin) * Mat4::from_rotation_z(-0.3 + swing * 0.95);
+    for v in out {
+        v.pos = transform
+            .transform_point3(Vec3::from_array(v.pos))
+            .to_array();
+        v.normal = transform
+            .transform_vector3(Vec3::from_array(v.normal))
+            .to_array();
     }
 }

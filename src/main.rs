@@ -1,6 +1,8 @@
+mod audio;
 mod ecs;
 #[path = "../tools/expedition.rs"]
 mod expedition;
+mod feedback;
 mod game;
 mod items;
 #[path = "../tools/performance.rs"]
@@ -27,6 +29,7 @@ struct Options {
     smoke: bool,
     expedition: bool,
     tour: bool,
+    mute: bool,
     frames: Option<u32>,
     capture: Option<PathBuf>,
     pack: bool,
@@ -39,6 +42,7 @@ fn options() -> Result<Options, String> {
         smoke: false,
         expedition: false,
         tour: false,
+        mute: false,
         frames: None,
         capture: None,
         pack: false,
@@ -48,6 +52,7 @@ fn options() -> Result<Options, String> {
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
+            "--mute" => o.mute = true,
             "--seed" => {
                 o.seed = args
                     .next()
@@ -83,7 +88,7 @@ fn options() -> Result<Options, String> {
             }
             "--help" | "-h" => {
                 println!(
-                    "Voxel Adventure\n  --seed N       seed for a new world (default 314159)\n  --save PATH    world file (default saves/world.json)\n  --smoke        headless gameplay/persistence check; uses a temporary save\n  --frames N     render N frames then save and exit\n  --capture PATH save final frame as PPM (defaults to 240 frames)\n  --tour         scripted camera relocations for streaming measurements\n  --expedition   run controlled headless progression expedition\n  --profile PATH write frame timings and chunk backlog as CSV\n  --pack         start with the inventory open\n\nWASD move; mouse look; Space jump; Shift sprint\nLMB mine/attack; RMB place/eat/use; wheel or 1-9 select\nE inventory/crafting/stats; R sleep near bed; F5 save; Esc menu"
+                    "Voxel Adventure\n  --seed N       seed for a new world (default 314159)\n  --save PATH    world file (default saves/world.json)\n  --smoke        headless gameplay/persistence check; uses a temporary save\n  --frames N     render N frames then save and exit\n  --capture PATH save final frame as PPM (defaults to 240 frames)\n  --tour         scripted camera relocations for streaming measurements\n  --expedition   run controlled headless progression expedition\n  --profile PATH write frame timings and chunk backlog as CSV\n  --mute         disable sound playback\n  --pack         start with the inventory open\n\nWASD move; mouse look; Space jump; Shift sprint\nLMB mine/attack; RMB place/eat/use; wheel or 1-9 select\nE inventory/crafting/stats; R sleep near bed; F5 save; Esc menu"
                 );
                 std::process::exit(0);
             }
@@ -106,6 +111,7 @@ struct App {
     options: Options,
     window: Option<Arc<Window>>,
     renderer: Option<render::Renderer>,
+    audio: Option<audio::Audio>,
     keys: HashSet<KeyCode>,
     attack: bool,
     pack: bool,
@@ -185,6 +191,13 @@ impl App {
                     mode = 0;
                 }
                 let empty = self.game.player.inventory.cursor.is_none();
+                if self.keys.contains(&KeyCode::ShiftLeft)
+                    || self.keys.contains(&KeyCode::ShiftRight)
+                {
+                    self.drag_origin = None;
+                    self.game.quick_output(mode);
+                    return;
+                }
                 self.game.craft_grid(mode);
                 if empty && self.game.player.inventory.cursor.is_some() {
                     self.drag_origin = Some(usize::MAX);
@@ -356,6 +369,15 @@ impl ApplicationHandler for App {
                             .and_then(|r| r.ui.click(self.cursor.0, self.cursor.1))
                     {
                         if let ui::Action::Slot(n) = a {
+                            if button == MouseButton::Left
+                                && (self.keys.contains(&KeyCode::ShiftLeft)
+                                    || self.keys.contains(&KeyCode::ShiftRight))
+                            {
+                                self.drag_origin = None;
+                                let mode = self.renderer.as_ref().map_or(0, |r| r.ui.mode);
+                                self.game.quick_transfer(n, mode);
+                                return;
+                            }
                             self.drag_origin = if self.game.player.inventory.cursor.is_none()
                                 && button == MouseButton::Left
                             {
@@ -454,6 +476,11 @@ impl ApplicationHandler for App {
                         self.game.velocity = glam::Vec3::ZERO;
                     }
                     self.game.player.yaw += 0.003;
+                }
+                for cue in self.game.feedback.sounds.drain(..) {
+                    if let Some(audio) = &self.audio {
+                        audio.play(cue);
+                    }
                 }
                 let simulation_ms = now.elapsed().as_secs_f64() * 1000.;
                 let stream_start = Instant::now();
@@ -573,11 +600,13 @@ fn run() -> Result<(), String> {
         .as_deref()
         .map(performance::Profile::new)
         .transpose()?;
+    let audio = (!options.mute).then(audio::Audio::new);
     let mut app = App {
         game,
         options,
         window: None,
         renderer: None,
+        audio,
         keys: HashSet::new(),
         attack: false,
         pack,

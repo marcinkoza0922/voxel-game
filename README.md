@@ -19,6 +19,7 @@ The first release build takes a while. `cargo run` also works for development. B
 | 1–9 / mouse wheel | Select hotbar slot |
 | E | Open/close pack, recipes, and attributes |
 | Left-click / drag a slot | Pick up, move, merge, or swap stacks |
+| Shift-left-click a slot / output | Move directly into crafting/furnace slots or back to inventory |
 | Right-click a slot | Pick up half a stack / place one item |
 | Click / drag crafting output | Take the result and consume arranged ingredients |
 | Right-click a table or furnace | Open its crafting or processing screen |
@@ -41,6 +42,11 @@ Existing saves migrate automatically and retain your inventory and tools. Old sh
 Leaves yield berries; eat them with right mouse while selected. Husks pursue and attack, and drop meat that can be cooked in the furnace. Bedrolls restore rest and advance to dawn; nearby enemies prevent sleep. Torches provide warm light while held or placed; placed torches burn out after ten minutes of active gameplay. Death returns you to spawn with your inventory.
 
 Discovering biomes and resources, crafting, and defeating sufficiently strong enemies award XP. Repeated crafting awards one quarter as much XP each time, rounding down to zero. Spend level points on health, melee damage, attack speed, mobility, or crafting yield. Wisdom and Willpower are reserved for the future magic system and cannot consume points yet.
+
+Held axes, pickaxes and swords now swing in first person, with movement bob,
+material-colored mining chips, block-break bursts, melee hit markers and a damage
+flash. Sound effects use optional `paplay` (PulseAudio/PipeWire); install your
+distribution's PulseAudio utilities for playback, or use `--mute` to disable it.
 
 The terrain streams in chunks and supports a vertical range from **-512 to 1535**. Terrain streams up to 160 blocks horizontally, with full-height mountain surfaces, refresh-synchronized presentation, and camera/shadow chunk culling. Venture far from spawn for large mountains. Grasslands, oak forests, caves, coal and copper are implemented; the broader biomes, metallurgy, magic, and automation remain future milestones.
 

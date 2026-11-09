@@ -137,6 +137,26 @@ impl Ui {
             }
             return;
         }
+        if g.feedback.hurt > 0. {
+            let alpha = g.feedback.hurt / 0.3 * 0.35;
+            for (x, y, rw, rh) in [
+                (0., 0., w, 14.),
+                (0., h - 14., w, 14.),
+                (0., 14., 14., h - 28.),
+                (w - 14., 14., 14., h - 28.),
+            ] {
+                self.rect(x, y, rw, rh, [0.9, 0.12, 0.08, alpha]);
+            }
+        }
+        if g.feedback.hit > 0. {
+            let color = [1., 0.82, 0.35, g.feedback.hit / 0.18];
+            for (dx, dy) in [(-1., -1.), (1., -1.), (-1., 1.), (1., 1.)] {
+                for i in 0..4 {
+                    let offset = 7. + i as f32;
+                    self.rect(w / 2. + dx * offset, h / 2. + dy * offset, 2., 2., color);
+                }
+            }
+        }
         self.rect(20., 20., 260., 86., PANEL);
         self.text(32., 31., g.biome().name(), 1.8, INK);
         self.text(

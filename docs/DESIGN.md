@@ -205,3 +205,64 @@ without placed stations, and one-time legacy recovery on placement. The expediti
 also compares all furnace states after reload. README now describes five-second
 smelting and station ownership. Native mouse interaction has not been manually
 playtested for this change.
+
+## Quick transfers and presentation priority
+
+Shift-left-click moves stacks directly between inventory and the active crafting
+or furnace slots, merging matching stacks before filling empty cells. Personal
+crafting uses only its four valid cells. Furnace routing accepts coal as fuel
+and copper ore/raw meat as input; rejected or excess items remain at the source.
+Ingredients can be returned to inventory with wear preserved. Shift-click output
+collects one crafting result or the completed furnace stack into inventory only
+when the entire result fits, preserving the carried stack and normal XP rules.
+Placed furnace transfers use the selected station transaction and reach checks.
+
+Player feedback identifies presentation as the next priority: held tool/view
+models and action animations, synchronized mining/combat audio, impact/break
+particles, and clear hit feedback. These should make existing actions readable
+before expanding progression content.
+
+## First-person action feedback
+
+`feedback` owns transient fixed-step swing/hit/hurt timers, a presentation clock,
+a capped 192-particle pool and up to eight queued sound cues. None is serialized.
+Mining cadence emits material-specific impacts only after tool requirements pass;
+successful block removal emits a larger break burst. Successful melee damage
+emits a hit marker and particles. Health loss triggers a brief red border, with
+repeated damage cues throttled by its lifetime. Holding attack repeats a 0.32 s
+swing, including misses; combat damage retains its existing independent cooldown.
+Particle gravity is cosmetic, without voxel collision. Effects freeze with gameplay.
+
+The renderer builds voxel hand/tool silhouettes for axes, picks and swords,
+material variants, and simple held blocks/other-item placeholders. Camera-relative
+geometry includes swing and grounded movement bob. A separate color-load/depth-clear
+pass draws the held item over terrain without casting a world shadow; it uses
+existing world lighting. Menus hide it. Break chips use source block colors;
+melee particles are green impact motes. Hit and damage overlays use the owned GUI.
+
+`audio` synthesizes short mono noise/tone cues, mixed with a 12-voice cap on a
+background worker and an eight-cue nonblocking channel. Optional `paplay` streams
+22,050 Hz s16 PCM to PulseAudio or PipeWire; no new Cargo dependency or authored
+assets are required. Missing playback support disables audio; `--mute` skips
+worker/process creation. Audio is currently non-spatial with a fixed conservative
+mix. Sounds already submitted may finish after pausing. This is a first feedback
+pass; food, placement, footsteps, creature locomotion animations and authored
+sound design remain follow-up work.
+
+Validation: formatting, short Clippy with warnings denied, quiet nextest, smoke
+and expedition passed. Regression checks cover bounded particle/cue storage,
+effect expiry and successful versus tool-rejected mining feedback. A native
+120-frame Vulkan capture rendered the held axe and exited cleanly; capture
+inspection confirmed visible tool/hand placement. Live swing/impact timing and
+sound quality have not been manually evaluated.
+
+Audio buffering correction: PCM production is paced in real time at one 441-frame
+chunk per 20 ms, independently of pipe backpressure. After a worker stall the
+schedule restarts from the current time instead of generating catch-up chunks.
+Cues carry emission timestamps and are discarded after 100 ms in the queue.
+This prevents the pipe from accumulating seconds of future audio and replaying
+old swings after release. Already playing cues retain their short decay tails.
+A regression test uses a freely accepting fake sink to verify that 200 ms of PCM
+cannot be generated faster than real time; another checks stale cue rejection.
+Formatting, short Clippy, quiet nextest, smoke and expedition passed. Live desktop
+listening has not been repeated for this correction.

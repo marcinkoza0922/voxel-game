@@ -99,6 +99,7 @@ pub struct Input {
     pub attack: bool,
 }
 pub struct Game {
+    pub feedback: crate::feedback::Feedback,
     pub world: World,
     pub player: Player,
     pub entities: Entities,
@@ -121,6 +122,7 @@ impl Game {
         let world = World::new(seed);
         let player = Player::new(&world);
         Self {
+            feedback: Default::default(),
             world,
             player,
             entities: Entities::default(),
@@ -200,6 +202,30 @@ impl Game {
             self.furnace_transaction(|inv| inv.transfer(n, right));
         } else {
             self.player.inventory.transfer(n, right);
+        }
+    }
+    pub fn quick_transfer(&mut self, n: usize, mode: u8) {
+        let (table, furnace) = self.stations();
+        if mode == 1 && !table || mode == 2 && !furnace {
+            return;
+        }
+        if mode == 2 {
+            self.furnace_transaction(|inv| inv.quick_transfer(n, mode));
+        } else {
+            self.player.inventory.quick_transfer(n, mode);
+        }
+    }
+    pub fn quick_output(&mut self, mode: u8) {
+        let (table, furnace) = self.stations();
+        if mode == 1 && !table || mode == 2 && !furnace {
+            return;
+        }
+        if mode == 2 {
+            self.furnace_transaction(|inv| {
+                inv.quick_output(mode);
+            });
+        } else if let Some(index) = self.player.inventory.quick_output(mode) {
+            self.reward_craft(index);
         }
     }
     pub fn craft(&mut self, index: usize) {
@@ -354,6 +380,8 @@ impl Game {
     }
 
     pub fn tick(&mut self, input: &Input, dt: f32) {
+        let previous_health = self.player.health;
+        self.feedback.tick(dt);
         self.tick_furnace();
         self.time += dt / 900.;
         self.message_time = (self.message_time - dt).max(0.);
@@ -428,12 +456,20 @@ impl Game {
         self.player.discover(format!("biome:{}", biome.name()), 30);
         self.target();
         if input.attack {
+            if self.feedback.swing == 0. {
+                self.feedback.swing = 0.32;
+                self.feedback.sound(crate::feedback::Cue::Swing);
+            }
             self.attack(dt);
         } else {
             self.mining = None;
             self.mining_progress = 0.;
         }
         self.update_mobs(dt);
+        if self.player.health < previous_health && self.feedback.hurt == 0. {
+            self.feedback.hurt = 0.3;
+            self.feedback.sound(crate::feedback::Cue::Hurt);
+        }
         if self.player.health <= 0. || pos.y < crate::world::MIN_Y as f32 {
             self.player.pos = self.player.spawn;
             self.velocity = Vec3::ZERO;
@@ -491,6 +527,9 @@ impl Game {
                     killed = Some(m.level);
                 }
             }
+            self.feedback.hit = 0.18;
+            self.feedback.sound(crate::feedback::Cue::Hit);
+            self.feedback.burst(eye + dir * 1.8, [0.55, 0.63, 0.32], 12);
             if equipped {
                 self.player.inventory.damage_tool(selected);
             }
@@ -545,7 +584,25 @@ impl Game {
         } else {
             0.35
         };
+        let previous_progress = self.mining_progress;
         self.mining_progress += dt / seconds;
+        if previous_progress == 0.
+            || (previous_progress * seconds / 0.32).floor()
+                < (self.mining_progress * seconds / 0.32).floor()
+        {
+            let cue = if hard {
+                crate::feedback::Cue::Stone
+            } else if matches!(b, Block::Log | Block::Planks | Block::Table) {
+                crate::feedback::Cue::Wood
+            } else {
+                crate::feedback::Cue::Earth
+            };
+            self.feedback.sound(cue);
+            let (_, adjacent) = self.target.unwrap();
+            let face = (adjacent - p).as_vec3();
+            self.feedback
+                .burst(p.as_vec3() + Vec3::splat(0.5) + face * 0.53, b.color(), 4);
+        }
         if self.mining_progress >= 1. && p.y > crate::world::MIN_Y && p.y <= crate::world::MAX_Y {
             if b == Block::Furnace
                 && self.furnaces.get(&p.to_array()).is_some_and(|f| {
@@ -576,6 +633,9 @@ impl Game {
                 }
                 self.player.discover(format!("resource:{}", i.name()), 15);
             }
+            self.feedback.sound(crate::feedback::Cue::Break);
+            self.feedback
+                .burst(p.as_vec3() + Vec3::splat(0.5), b.color(), 20);
             self.world.set(p, Block::Air);
             self.torch_life.remove(&p.to_array());
             self.furnaces.remove(&p.to_array());
@@ -764,11 +824,20 @@ mod tests {
         g.attack(5.);
         assert_eq!(g.world.get(p), Block::Copper);
         assert_eq!(g.player.inventory.count(Item::CopperOre), 0);
+        assert!(g.feedback.particles.is_empty());
+        assert!(g.feedback.sounds.is_empty());
         g.player.inventory.add(Item::StonePick, 1);
         g.player.inventory.equip(Item::StonePick, 1);
         g.attack(5.);
         assert_eq!(g.world.get(p), Block::Air);
         assert_eq!(g.player.inventory.count(Item::CopperOre), 1);
+        assert!(!g.feedback.particles.is_empty());
+        assert!(
+            g.feedback
+                .sounds
+                .iter()
+                .any(|cue| matches!(cue, crate::feedback::Cue::Break))
+        );
     }
     #[test]
     fn stations_gate_complete_copper_progression() {

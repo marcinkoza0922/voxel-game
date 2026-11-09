@@ -342,6 +342,72 @@ impl Inventory {
         }
         self.set_slot(n, target);
     }
+    /// Move as much as fits, preserving wear and leaving the carried stack alone.
+    fn move_stack(&mut self, mut stack: Stack, destinations: &[usize]) -> Option<Stack> {
+        for empty in [false, true] {
+            for &n in destinations {
+                let target = self.slot(n);
+                let capacity = match target {
+                    Some(t) if !empty && t.item == stack.item && t.wear == stack.wear => {
+                        Stack::limit(t.item) - t.count
+                    }
+                    None if empty => Stack::limit(stack.item),
+                    _ => 0,
+                };
+                let amount = capacity.min(stack.count);
+                if amount > 0 {
+                    self.set_slot(
+                        n,
+                        Some(Stack {
+                            count: target.map_or(0, |s| s.count) + amount,
+                            ..stack
+                        }),
+                    );
+                    stack.count -= amount;
+                    if stack.count == 0 {
+                        return None;
+                    }
+                }
+            }
+        }
+        Some(stack)
+    }
+    pub fn quick_transfer(&mut self, n: usize, mode: u8) {
+        let Some(stack) = self.slot(n) else {
+            return;
+        };
+        let destinations: Vec<usize> = if n < 36 {
+            match mode {
+                2 => match stack.item {
+                    Item::Coal => vec![46],
+                    Item::CopperOre | Item::Meat => vec![45],
+                    _ => vec![],
+                },
+                1 => (36..45).collect(),
+                _ => vec![47, 48, 50, 51],
+            }
+        } else {
+            (0..36).collect()
+        };
+        let remaining = self.move_stack(stack, &destinations);
+        self.set_slot(n, remaining);
+    }
+    /// Take one crafting result (or available furnace output) directly into storage.
+    pub fn quick_output(&mut self, mode: u8) -> Option<usize> {
+        let mut trial = self.clone();
+        trial.cursor = None;
+        let index = take_output(&mut trial, mode)?;
+        let stack = trial.cursor.take()?;
+        if trial
+            .move_stack(stack, &(0..36).collect::<Vec<_>>())
+            .is_some()
+        {
+            return None;
+        }
+        trial.cursor = self.cursor;
+        *self = trial;
+        Some(index)
+    }
     pub fn valid(&self) -> bool {
         self.processing.valid()
             && self.selected < 9
@@ -726,6 +792,50 @@ pub fn recipe_grid(index: usize) -> [Option<Stack>; 9] {
 #[cfg(test)]
 mod slot_tests {
     use super::*;
+    #[test]
+    fn quick_moves_respect_capacity_routes_and_wear() {
+        let mut inv = Inventory::empty();
+        inv.slots[0] = Some(Stack::new(Item::Coal, 10));
+        inv.processing.furnace[1] = Some(Stack::new(Item::Coal, 60));
+        inv.quick_transfer(0, 2);
+        assert_eq!(inv.slots[0].unwrap().count, 6);
+        assert_eq!(inv.processing.furnace[1].unwrap().count, 64);
+        inv.slots[1] = Some(Stack::new(Item::CopperOre, 8));
+        inv.quick_transfer(1, 2);
+        assert!(inv.slots[1].is_none());
+        assert_eq!(inv.processing.furnace[0].unwrap().count, 8);
+        inv.slots[2] = Some(Stack::new(Item::CopperIngot, 3));
+        inv.quick_transfer(2, 2);
+        assert_eq!(inv.slots[2].unwrap().count, 3);
+        inv.slots[3] = Some(Stack {
+            wear: 2,
+            ..Stack::new(Item::WoodPick, 1)
+        });
+        inv.quick_transfer(3, 0);
+        assert_eq!(inv.hand[0].unwrap().wear, 2);
+        inv.quick_transfer(47, 0);
+        assert_eq!(inv.slots[1].unwrap().wear, 2);
+        assert!(inv.valid());
+    }
+    #[test]
+    fn quick_output_is_atomic_and_preserves_cursor() {
+        let mut inv = Inventory::empty();
+        inv.processing.furnace_output = Some(Stack::new(Item::CopperIngot, 8));
+        inv.cursor = Some(Stack::new(Item::Coal, 2));
+        inv.slots.fill(Some(Stack::new(Item::Coal, 64)));
+        let before = inv.clone();
+        assert!(inv.quick_output(2).is_none());
+        assert_eq!(inv, before);
+        inv.slots[4] = None;
+        assert!(inv.quick_output(2).is_some());
+        assert_eq!(inv.slots[4], Some(Stack::new(Item::CopperIngot, 8)));
+        assert_eq!(inv.cursor, before.cursor);
+        assert!(inv.processing.furnace_output.is_none());
+        inv.hand = recipe_grid(0);
+        inv.slots[5] = None;
+        assert!(inv.quick_output(0).is_some());
+        assert!(inv.hand.iter().all(Option::is_none));
+    }
     #[test]
     fn patterns_match_declared_ingredients_and_outputs() {
         for (index, r) in RECIPES
