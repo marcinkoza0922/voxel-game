@@ -145,7 +145,7 @@ pub fn read(path: &Path) -> Result<Option<Game>, String> {
         _ => return Err(format!("Unsupported save version {}", value["version"])),
     }
     if let Some(crafts) = value["player"]["crafts"].as_array_mut()
-        && crafts.len() == 15
+        && matches!(crafts.len(), 15 | 20)
     {
         crafts.resize(RECIPES.len(), 0.into());
     }
@@ -606,5 +606,57 @@ mod expansion_tests {
         })();
         let _ = fs::remove_file(path);
         result.unwrap();
+    }
+}
+
+#[cfg(test)]
+mod vegetation_tests {
+    use super::*;
+    use crate::{
+        items::{Item, Stack},
+        world::Block,
+    };
+    use glam::IVec3;
+    #[test]
+    fn plants_inventory_and_harvested_positions_survive_reload_and_old_craft_counts() {
+        let mut g = Game::new(314159);
+        let p = (-100..100)
+            .map(|x| IVec3::new(x, g.world.height(x, 0) + 1, 0))
+            .find(|p| g.world.get(*p).plant())
+            .unwrap();
+        g.world.set(p, Block::Air);
+        let flower = IVec3::new(-16, 100, 16);
+        g.world.set(flower - IVec3::Y, Block::Grass);
+        g.world.set(flower, Block::BlueFlower);
+        let soil = IVec3::new(10, 100, 10);
+        g.world.set(soil, Block::Dirt);
+        g.world.set(soil + IVec3::X, Block::Grass);
+        g.world.spread_grass(soil);
+        g.player.inventory.add(Item::WheatSeeds, 4);
+        g.player.inventory.add(Item::BlueFlower, 1);
+        g.player.inventory.add(Item::BlueDye, 2);
+        let path =
+            std::env::temp_dir().join(format!("voxel-plant-save-{}.json", std::process::id()));
+        write(&g, &path).unwrap();
+        let loaded = read(&path).unwrap().unwrap();
+        assert_eq!(loaded.world.get(p), Block::Air);
+        assert_eq!(loaded.world.get(flower), Block::BlueFlower);
+        assert_eq!(loaded.world.get(soil), Block::Grass);
+        assert_eq!(loaded.player.inventory, g.player.inventory);
+        let mut old: serde_json::Value = serde_json::from_slice(&encode(&g).unwrap()).unwrap();
+        old["player"]["crafts"].as_array_mut().unwrap().truncate(20);
+        fs::write(&path, serde_json::to_vec(&old).unwrap()).unwrap();
+        let mut loaded = read(&path).unwrap().unwrap();
+        assert_eq!(loaded.player.crafts.len(), RECIPES.len());
+        loaded.player.inventory.hand[4] = Some(Stack::new(Item::BlueFlower, 1));
+        assert_eq!(
+            crate::items::take_output(&mut loaded.player.inventory, 0),
+            Some(25)
+        );
+        assert_eq!(
+            loaded.player.inventory.cursor,
+            Some(Stack::new(Item::BlueDye, 1))
+        );
+        fs::remove_file(path).unwrap();
     }
 }

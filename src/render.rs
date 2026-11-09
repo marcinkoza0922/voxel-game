@@ -329,7 +329,10 @@ impl Renderer {
                 compilation_options: Default::default(),
                 buffers: &[Vertex::layout()],
             },
-            primitive: Default::default(),
+            primitive: wgpu::PrimitiveState {
+                cull_mode: None,
+                ..Default::default()
+            },
             depth_stencil: Some(wgpu::DepthStencilState {
                 bias: wgpu::DepthBiasState {
                     constant: 2,
@@ -339,7 +342,12 @@ impl Renderer {
                 ..ds
             }),
             multisample: Default::default(),
-            fragment: None,
+            fragment: Some(wgpu::FragmentState {
+                module: &shader,
+                entry_point: Some("shadow_fs"),
+                compilation_options: Default::default(),
+                targets: &[],
+            }),
             multiview: None,
             cache: None,
         });
@@ -954,8 +962,13 @@ pub fn mesh_halo(
                     torch_model(&mut out, (base + p).as_vec3(), IVec3::from_array(mount));
                     continue;
                 }
+                if block.plant() {
+                    vegetation(&mut out, seed, base + p - IVec3::Y, block);
+                    continue;
+                }
                 for (normal, u, v) in FACES {
-                    if get(p + normal).solid() {
+                    let neighbor = get(p + normal);
+                    if neighbor.solid() && neighbor != Block::Leaves {
                         continue;
                     }
                     let mut vertices = [Vertex {
@@ -981,7 +994,13 @@ pub fn mesh_halo(
                             + u.as_vec3() * (*a as f32 * 0.5)
                             + v.as_vec3() * (*b as f32 * 0.5);
                         vertices[i].pos = pos.to_array();
-                        let face = if normal.y > 0 {
+                        let face = if block == Block::Grass
+                            && normal.y == 0
+                            && (!get(p - IVec3::Y).solid() || get(p + normal - IVec3::Y).solid())
+                        {
+                            // A one-block step: grass wraps the whole side.
+                            1
+                        } else if normal.y > 0 {
                             1
                         } else if normal.y < 0 {
                             2
@@ -1012,6 +1031,70 @@ pub fn mesh_halo(
         }
     }
     out
+}
+// Plant geometry lives in its own voxel; seed and support coordinates determine its shape.
+fn vegetation(out: &mut Vec<Vertex>, seed: u64, support: IVec3, block: Block) {
+    let h = crate::world::vegetation_hash(seed, support);
+    let origin = support.as_vec3() + Vec3::Y;
+    if block == Block::TallGrass {
+        for i in 0..3 {
+            let bits = h.rotate_right(i * 17);
+            let center = origin
+                + Vec3::new(
+                    0.24 + (bits & 255) as f32 / 500.,
+                    0.,
+                    0.24 + ((bits >> 8) & 255) as f32 / 500.,
+                );
+            let height = crate::world::grass_height(h, i);
+            let angle = ((bits >> 24) & 255) as f32 * std::f32::consts::TAU / 255.;
+            let direction = Vec3::new(angle.cos(), 0., angle.sin());
+            for blade in 0..3 {
+                let side = glam::Quat::from_rotation_y(blade as f32 * 2.094) * direction;
+                let tip = center + Vec3::Y * height + side * height * 0.3;
+                let normal = side.cross(Vec3::Y).normalize().to_array();
+                for (point, color) in [
+                    (center - side * 0.045, [0.16, 0.30, 0.07]),
+                    (center + side * 0.045, [0.22, 0.39, 0.09]),
+                    (tip, [0.43, 0.59, 0.16]),
+                ] {
+                    out.push(Vertex {
+                        pos: point.to_array(),
+                        normal,
+                        color,
+                        tile: [0., 0., -3.],
+                    });
+                }
+            }
+        }
+        return;
+    }
+    let Some(flower) = block.flower_index() else {
+        return;
+    };
+    let height = 0.35 + ((h >> 40) & 255) as f32 / 640.;
+    let stem = origin + Vec3::new(0.5, 0., 0.5);
+    box_mesh(
+        out,
+        stem - Vec3::new(0.018, 0., 0.018),
+        Vec3::new(0.036, height, 0.036),
+        [0.17, 0.38, 0.08],
+    );
+    let color = crate::world::FLOWER_COLORS[flower];
+    let head = stem + Vec3::Y * height;
+    for offset in [Vec3::X, Vec3::NEG_X, Vec3::Z, Vec3::NEG_Z] {
+        box_mesh(
+            out,
+            head + offset * 0.09 - Vec3::splat(0.055),
+            Vec3::new(0.11, 0.065, 0.11),
+            color,
+        );
+    }
+    box_mesh(
+        out,
+        head - Vec3::splat(0.045),
+        Vec3::splat(0.09),
+        [1., 0.64, 0.08],
+    );
 }
 // Shared held/placed model. Wall mounts lean away from the supporting face.
 fn torch_model(out: &mut Vec<Vertex>, origin: Vec3, mount: IVec3) {
@@ -1129,6 +1212,73 @@ mod tests {
         let light = Mat4::orthographic_rh(-80., 80., -80., 80., 0.1, 250.);
         assert!(chunk_visible(light, IVec3::new(0, 0, -2)));
         assert!(!chunk_visible(light, IVec3::new(20, 0, -2)));
+    }
+    #[test]
+    fn vegetation_is_repeatable_varied_and_rooted() {
+        let mut first = Vec::new();
+        let mut second = Vec::new();
+        for x in 0..512 {
+            let p = IVec3::new(x, 100, 0);
+            let block = crate::world::vegetation_block(314159, p);
+            if block == Block::Air {
+                continue;
+            }
+            vegetation(&mut first, 314159, p, block);
+            vegetation(&mut second, 314159, p, block);
+        }
+        assert_eq!(
+            bytemuck::cast_slice::<_, u8>(&first),
+            bytemuck::cast_slice::<_, u8>(&second)
+        );
+        assert!(first.iter().all(|v| v.pos[1] >= 101. && v.pos[1] < 102.));
+        let flower_colors = first
+            .iter()
+            .filter(|v| v.tile[2] == -1. && v.color[0] > 0.6)
+            .map(|v| v.color.map(f32::to_bits))
+            .collect::<std::collections::HashSet<_>>();
+        assert!(flower_colors.len() >= 4);
+        let mut w = World::new(314159);
+        let p = IVec3::new(0, 100, 0);
+        w.set(p, Block::Grass);
+        assert!(mesh_chunk(&w, crate::world::chunk(p)).len() >= 36);
+        w.set(p, Block::Air);
+        assert!(mesh_chunk(&w, crate::world::chunk(p)).is_empty());
+    }
+    #[test]
+    fn grassy_dirt_wraps_steps_but_keeps_cliff_sides_bare() {
+        let mut w = World::new(314159);
+        let p = IVec3::new(-1, 111, 0);
+        w.set(p - IVec3::Y, Block::Dirt);
+        w.set(p, Block::Grass);
+        let side_layers = |w: &World| {
+            mesh_chunk(w, crate::world::chunk(p))
+                .chunks_exact(3)
+                .filter(|triangle| {
+                    triangle.iter().all(|v| {
+                        v.normal == Vec3::X.to_array()
+                            && v.pos[0] == p.x as f32 + 1.
+                            && v.pos[1] >= p.y as f32
+                    })
+                })
+                .flat_map(|triangle| triangle.iter().map(|v| v.tile[2] as u32))
+                .collect::<Vec<_>>()
+        };
+        let cliff = side_layers(&w);
+        assert_eq!(cliff.len(), 6);
+        assert!(
+            cliff
+                .iter()
+                .all(|&l| l == crate::art::layer(Block::Grass, 0))
+        );
+        w.set(p + IVec3::X - IVec3::Y, Block::Dirt);
+        let step = side_layers(&w);
+        assert_eq!(step.len(), 6);
+        assert!(
+            step.iter()
+                .all(|&l| l == crate::art::layer(Block::Grass, 1))
+        );
+        w.set(p + IVec3::X - IVec3::Y, Block::Air);
+        assert_eq!(side_layers(&w), cliff);
     }
     #[test]
     fn empty_sky_has_no_mesh() {
@@ -1272,6 +1422,12 @@ fn held_model(out: &mut Vec<Vertex>, g: &Game) {
         for vertex in &mut out[start..] {
             vertex.pos =
                 ((Vec3::from_array(vertex.pos) - Vec3::new(0.5, 0.1, 0.5)) * 0.55).to_array();
+        }
+    } else if equipped && item.flower_index().is_some() {
+        let start = out.len();
+        vegetation(out, 0, IVec3::ZERO, item.block().unwrap());
+        for v in &mut out[start..] {
+            v.pos = ((Vec3::from_array(v.pos) - Vec3::new(0.5, 1., 0.5)) * 0.65).to_array();
         }
     } else if equipped {
         textured_box(

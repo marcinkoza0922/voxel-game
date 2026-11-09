@@ -284,6 +284,16 @@ impl Ui {
             Bed => [0.63, 0.29, 0.24, 1.],
             _ => [0.73, 0.53, 0.29, 1.],
         };
+        let flower = item.flower_index();
+        let dye = item.dye_index();
+        let color = if let Some(i) = flower.or(dye) {
+            let c = crate::world::FLOWER_COLORS[i];
+            [c[0], c[1], c[2], 1.]
+        } else if item == WheatSeeds {
+            [0.62, 0.72, 0.22, 1.]
+        } else {
+            color
+        };
         let tool = item.durability() > 0;
         for py in 0..16 {
             for px in 0_i32..16 {
@@ -295,7 +305,15 @@ impl Ui {
                     (3..10).contains(&px) && (2..7).contains(&py)
                 };
                 let handle = tool && (7..9).contains(&px) && (5..15).contains(&py);
-                let filled = if block {
+                let stem = flower.is_some() && (7..9).contains(&px) && (7..15).contains(&py);
+                let filled = if flower.is_some() {
+                    stem || ((4..12).contains(&px)
+                        && (2..9).contains(&py)
+                        && ((6..10).contains(&px) || (4..7).contains(&py)))
+                } else if item == WheatSeeds {
+                    ((4..7).contains(&px) && (4..8).contains(&py))
+                        || ((9..12).contains(&px) && (8..12).contains(&py))
+                } else if block {
                     (1..15).contains(&px)
                         && py >= 2 + (px - 8).abs() / 2
                         && py <= 14 - (px - 8).abs() / 2
@@ -313,7 +331,11 @@ impl Ui {
                 if !filled {
                     continue;
                 }
-                let mut c = if handle {
+                let mut c = if stem {
+                    [0.22, 0.49, 0.13, 1.]
+                } else if flower.is_some() && (7..9).contains(&px) && (4..6).contains(&py) {
+                    [1., 0.72, 0.12, 1.]
+                } else if handle {
                     [0.47, 0.30, 0.15, 1.]
                 } else {
                     color

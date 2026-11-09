@@ -30,16 +30,36 @@ pub enum Block {
     Snow,
     RuinStone,
     Reliquary,
+    TallGrass,
+    RedFlower,
+    YellowFlower,
+    PurpleFlower,
+    WhiteFlower,
+    PinkFlower,
+    BlueFlower,
 }
 impl Block {
     pub fn solid(self) -> bool {
-        !matches!(self, Self::Air | Self::Torch)
+        !matches!(self, Self::Air | Self::Torch) && !self.plant()
+    }
+    pub fn plant(self) -> bool {
+        self == Self::TallGrass || self.flower_index().is_some()
+    }
+    pub fn flower_index(self) -> Option<usize> {
+        FLOWERS.iter().position(|b| *b == self)
     }
     pub fn processor(self) -> bool {
         matches!(self, Self::Furnace | Self::Smelter)
     }
     pub fn color(self) -> [f32; 3] {
         match self {
+            Self::TallGrass => [0.25, 0.45, 0.12],
+            Self::RedFlower => FLOWER_COLORS[0],
+            Self::YellowFlower => FLOWER_COLORS[1],
+            Self::PurpleFlower => FLOWER_COLORS[2],
+            Self::WhiteFlower => FLOWER_COLORS[3],
+            Self::PinkFlower => FLOWER_COLORS[4],
+            Self::BlueFlower => FLOWER_COLORS[5],
             Self::Air => [0.; 3],
             Self::Grass => [0.34, 0.52, 0.23],
             Self::Dirt => [0.38, 0.25, 0.16],
@@ -64,8 +84,15 @@ impl Block {
     }
     pub fn name(self) -> &'static str {
         match self {
+            Self::TallGrass => "Tall grass",
+            Self::RedFlower => "Red flower",
+            Self::YellowFlower => "Yellow flower",
+            Self::PurpleFlower => "Purple flower",
+            Self::WhiteFlower => "White flower",
+            Self::PinkFlower => "Pink flower",
+            Self::BlueFlower => "Blue flower",
             Self::Air => "Air",
-            Self::Grass => "Grass",
+            Self::Grass => "Dirt",
             Self::Dirt => "Dirt",
             Self::Stone => "Granite",
             Self::Log => "Oak log",
@@ -85,6 +112,89 @@ impl Block {
             Self::RuinStone => "Ancient masonry",
             Self::Reliquary => "Sealed iron cache",
         }
+    }
+}
+pub const FLOWER_COLORS: [[f32; 3]; 6] = [
+    [0.91, 0.15, 0.19],
+    [0.98, 0.75, 0.10],
+    [0.65, 0.28, 0.86],
+    [0.95, 0.89, 0.77],
+    [0.95, 0.34, 0.59],
+    [0.24, 0.48, 0.94],
+];
+pub const FLOWERS: [Block; 6] = [
+    Block::RedFlower,
+    Block::YellowFlower,
+    Block::PurpleFlower,
+    Block::WhiteFlower,
+    Block::PinkFlower,
+    Block::BlueFlower,
+];
+pub fn vegetation_hash(seed: u64, support: IVec3) -> u64 {
+    hash(seed ^ 0x767567, support.x, support.y, support.z)
+}
+pub fn grass_height(h: u64, tuft: u32) -> f32 {
+    let bits = h.rotate_right(tuft * 17);
+    0.48 + ((bits >> 16) & 255) as f32 / 950.
+}
+// Small selection bounds let rays pass above low grass or beside flower stems.
+fn plant_hit(seed: u64, p: IVec3, block: Block, origin: Vec3, dir: Vec3, reach: f32) -> bool {
+    let h = vegetation_hash(seed, p - IVec3::Y);
+    let (min, max) = if block == Block::TallGrass {
+        (
+            Vec3::new(0.02, 0., 0.02),
+            Vec3::new(
+                0.98,
+                (0..3).map(|i| grass_height(h, i)).fold(0., f32::max),
+                0.98,
+            ),
+        )
+    } else {
+        (
+            Vec3::new(0.35, 0., 0.35),
+            Vec3::new(0.65, 0.35 + ((h >> 40) & 255) as f32 / 640. + 0.045, 0.65),
+        )
+    };
+    let mut near = 0_f32;
+    let mut far = reach;
+    for axis in 0..3 {
+        let low = p.as_vec3()[axis] + min[axis];
+        let high = p.as_vec3()[axis] + max[axis];
+        if dir[axis].abs() < 1e-6 {
+            if origin[axis] < low || origin[axis] > high {
+                return false;
+            }
+        } else {
+            let a = (low - origin[axis]) / dir[axis];
+            let b = (high - origin[axis]) / dir[axis];
+            near = near.max(a.min(b));
+            far = far.min(a.max(b));
+        }
+    }
+    near <= far
+}
+pub fn vegetation_block(seed: u64, support: IVec3) -> Block {
+    let h = vegetation_hash(seed, support);
+    // Keep flower abundance independent of the much sparser grass objects.
+    if !h.is_multiple_of(5) && (h >> 32).is_multiple_of(13) {
+        return FLOWERS[((h >> 48) % 6) as usize];
+    }
+    let patch = noise(
+        seed ^ 0x74756674,
+        support.x as f32 / 14.,
+        support.z as f32 / 14.,
+    );
+    let density = if patch > 0.65 {
+        38
+    } else if patch > 0.5 {
+        12
+    } else {
+        2
+    };
+    if h % 100 < density {
+        Block::TallGrass
+    } else {
+        Block::Air
     }
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -296,6 +406,9 @@ impl World {
                     return Block::Leaves;
                 }
             }
+            if p.y == height + 1 && self.biome(p.x, p.z) != Biome::Tundra {
+                return vegetation_block(self.seed, p - IVec3::Y);
+            }
             return Block::Air;
         }
         if p.y == MIN_Y {
@@ -336,17 +449,32 @@ impl World {
     }
     pub fn get(&self, p: IVec3) -> Block {
         if let Some(b) = self.edits.get(&p.to_array()) {
-            return *b;
+            return self.supported_plant(p, *b);
         }
         if let Some(c) = self.chunks.get(&chunk(p)) {
-            return c[index(p)];
+            return self.supported_plant(p, c[index(p)]);
         }
-        self.natural_column(
+        self.supported_plant(
             p,
-            self.height(p.x, p.z),
-            self.tree(p.x, p.z),
-            self.nearby_ruin(p.x, p.z),
+            self.natural_column(
+                p,
+                self.height(p.x, p.z),
+                self.tree(p.x, p.z),
+                self.nearby_ruin(p.x, p.z),
+            ),
         )
+    }
+    fn supported_plant(&self, p: IVec3, b: Block) -> Block {
+        if b.plant()
+            && self
+                .edits
+                .get(&(p - IVec3::Y).to_array())
+                .is_some_and(|support| *support != Block::Grass)
+        {
+            Block::Air
+        } else {
+            b
+        }
     }
     /// Sample a chunk and its AO halo, reusing generation data for each column.
     pub fn halo(&self, key: IVec3) -> Vec<Block> {
@@ -367,7 +495,8 @@ impl World {
                         .copied()
                         .or_else(|| self.chunks.get(&chunk(p)).map(|c| c[index(p)]))
                         .unwrap_or_else(|| self.natural_column(p, h, t, ruin));
-                    blocks[((x + 1) + 18 * ((z + 1) + 18 * (y + 1))) as usize] = block;
+                    blocks[((x + 1) + 18 * ((z + 1) + 18 * (y + 1))) as usize] =
+                        self.supported_plant(p, block);
                 }
             }
         }
@@ -376,6 +505,9 @@ impl World {
     pub fn set(&mut self, p: IVec3, b: Block) -> bool {
         if !(MIN_Y + 1..=MAX_Y).contains(&p.y) {
             return false;
+        }
+        if b != Block::Grass && self.get(p + IVec3::Y).plant() {
+            self.set(p + IVec3::Y, Block::Air);
         }
         self.edits.insert(p.to_array(), b);
         if b != Block::Torch {
@@ -399,6 +531,47 @@ impl World {
         }
         self.revision += 1;
         true
+    }
+    /// Spread cover one step per pulse around edits, where dirt can become exposed.
+    /// Natural unedited surfaces already have grass; edits and the blocks below
+    /// them cover both placed dirt and freshly dug surfaces without a world scan.
+    pub fn spread_grass(&mut self, center: IVec3) -> usize {
+        const RADIUS: i32 = 32;
+        let mut candidates = std::collections::BTreeSet::new();
+        for (&p, _) in self.edits.range(
+            [center.x - RADIUS, i32::MIN, i32::MIN]..=[center.x + RADIUS, i32::MAX, i32::MAX],
+        ) {
+            let p = IVec3::from_array(p);
+            if (p.z - center.z).abs() > RADIUS || (p.y - center.y).abs() > RADIUS {
+                continue;
+            }
+            candidates.insert(p.to_array());
+            candidates.insert((p - IVec3::Y).to_array());
+        }
+        let changes: Vec<_> = candidates
+            .into_iter()
+            .map(IVec3::from_array)
+            .filter(|&p| {
+                if self.get(p) != Block::Dirt || self.get(p + IVec3::Y).solid() {
+                    return false;
+                }
+                [IVec3::X, IVec3::NEG_X, IVec3::Z, IVec3::NEG_Z]
+                    .into_iter()
+                    .any(|side| {
+                        (-1..=1).any(|dy| {
+                            let neighbor = p + side + IVec3::Y * dy;
+                            self.get(neighbor) == Block::Grass
+                                && !self.get(neighbor + IVec3::Y).solid()
+                        })
+                    })
+            })
+            .take(32)
+            .collect();
+        let count = changes.len();
+        for p in changes {
+            self.set(p, Block::Grass);
+        }
+        count
     }
     pub fn stream(&mut self, pos: Vec3, radius: i32) -> Vec<IVec3> {
         self.meshes.clear();
@@ -588,7 +761,10 @@ impl World {
         );
         let mut prev = p;
         loop {
-            if self.get(p) != Block::Air {
+            let block = self.get(p);
+            if block != Block::Air
+                && (!block.plant() || plant_hit(self.seed, p, block, origin, dir, reach))
+            {
                 return Some((p, prev));
             }
             let axis = if t.x <= t.y && t.x <= t.z {
@@ -840,5 +1016,138 @@ mod expansion_tests {
             }
             assert!(iron, "Iron must occur naturally below the surface");
         }
+    }
+}
+
+#[cfg(test)]
+mod vegetation_tests {
+    use super::*;
+    #[test]
+    fn plants_are_non_solid_selectable_and_lose_support() {
+        let mut w = World::new(314159);
+        let p = IVec3::new(-16, 100, 16);
+        w.set(p - IVec3::Y, Block::Grass);
+        w.set(p, Block::RedFlower);
+        assert!(!w.get(p).solid());
+        assert_eq!(
+            w.raycast(p.as_vec3() + Vec3::new(0.5, 0.2, 2.), Vec3::NEG_Z, 3.)
+                .unwrap()
+                .0,
+            p
+        );
+        assert!(
+            w.raycast(p.as_vec3() + Vec3::new(0.1, 0.9, 2.), Vec3::NEG_Z, 3.)
+                .is_none()
+        );
+        w.set(p - IVec3::Y, Block::Air);
+        assert_eq!(w.get(p), Block::Air);
+        w.set(p - IVec3::Y, Block::Grass);
+        assert_eq!(w.get(p), Block::Air);
+    }
+    #[test]
+    fn tall_grass_is_sparse_with_denser_patches() {
+        let mut grass = 0;
+        let mut total = 0;
+        let mut dense = (0, 0);
+        let mut sparse = (0, 0);
+        for x in -96..96 {
+            for z in -96..96 {
+                let p = IVec3::new(x, 100, z);
+                let block = vegetation_block(314159, p);
+                let patch = noise(314159 ^ 0x74756674, x as f32 / 14., z as f32 / 14.);
+                let bucket = if patch > 0.65 {
+                    Some(&mut dense)
+                } else if patch <= 0.5 {
+                    Some(&mut sparse)
+                } else {
+                    None
+                };
+                if let Some(bucket) = bucket {
+                    bucket.1 += 1;
+                    if block == Block::TallGrass {
+                        bucket.0 += 1;
+                    }
+                }
+                if block == Block::TallGrass {
+                    grass += 1;
+                    let h = vegetation_hash(314159, p);
+                    assert!((0..3).all(|i| (0.48..0.75).contains(&grass_height(h, i))));
+                }
+                total += 1;
+            }
+        }
+        assert!(grass > total / 30 && grass < total / 5);
+        assert!(dense.0 as f32 / dense.1 as f32 > 5. * sparse.0 as f32 / sparse.1 as f32);
+    }
+    #[test]
+    fn exposed_dirt_spreads_in_steps_across_slopes_and_chunk_boundaries() {
+        let mut w = World::new(314159);
+        let source = IVec3::new(-1, 100, 0);
+        w.set(source, Block::Grass);
+        let first = source + IVec3::X;
+        let second = first + IVec3::X;
+        let uphill = source + IVec3::Z + IVec3::Y;
+        let covered = source + IVec3::NEG_Z;
+        let isolated = source + IVec3::X * 5;
+        for p in [first, second, uphill, covered, isolated] {
+            w.set(p, Block::Dirt);
+        }
+        w.set(covered + IVec3::Y, Block::Stone);
+        assert_eq!(w.spread_grass(source), 2);
+        assert_eq!(w.get(first), Block::Grass);
+        assert_eq!(w.get(uphill), Block::Grass);
+        assert_eq!(w.get(second), Block::Dirt);
+        assert_eq!(w.get(covered), Block::Dirt);
+        assert_eq!(w.get(isolated), Block::Dirt);
+        assert_eq!(w.spread_grass(source), 1);
+        assert_eq!(w.get(second), Block::Grass);
+        w.set(covered + IVec3::Y, Block::Air);
+        assert_eq!(w.spread_grass(source), 1);
+        assert_eq!(w.get(covered), Block::Grass);
+        assert_eq!(Block::Grass.name(), Block::Dirt.name());
+    }
+    #[test]
+    fn dug_natural_dirt_can_gain_cover_without_a_dirt_edit() {
+        let mut w = World::new(314159);
+        let p = IVec3::new(0, w.height(0, 0) - 1, 0);
+        assert_eq!(w.get(p), Block::Dirt);
+        w.set(p + IVec3::Y, Block::Air);
+        w.set(p + IVec3::X, Block::Grass);
+        w.set(p + IVec3::X + IVec3::Y, Block::Air);
+        assert!(!w.edits.contains_key(&p.to_array()));
+        assert!(w.spread_grass(p) > 0);
+        assert_eq!(w.get(p), Block::Grass);
+    }
+    #[test]
+    fn natural_plants_match_chunk_halos_and_tall_grass_is_sparse() {
+        let w = World::new(314159);
+        let mut grass = 0;
+        let mut tall = 0;
+        let mut flowers = 0;
+        for x in -128..128 {
+            let y = w.height(x, 0) + 1;
+            let p = IVec3::new(x, y, 0);
+            let block = w.get(p);
+            if block.plant() {
+                assert_eq!(block, vegetation_block(w.seed, p - IVec3::Y));
+                let key = chunk(p);
+                let local = p - key * SIZE;
+                assert_eq!(
+                    w.halo(key)
+                        [((local.x + 1) + 18 * ((local.z + 1) + 18 * (local.y + 1))) as usize],
+                    block
+                );
+                if block == Block::TallGrass {
+                    grass += 1;
+                    let h = vegetation_hash(w.seed, p - IVec3::Y);
+                    if (0..3).any(|i| grass_height(h, i) > 0.4) {
+                        tall += 1;
+                    }
+                } else {
+                    flowers += 1;
+                }
+            }
+        }
+        assert!(grass > 0 && tall == grass && flowers > 0);
     }
 }

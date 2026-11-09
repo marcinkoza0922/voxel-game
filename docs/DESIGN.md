@@ -448,3 +448,79 @@ Torch validation: all 69 quiet nextest tests, short-format Clippy, formatting an
 headless gameplay/save smoke passed. Regressions cover wall placement, rejection
 of torch supports, support removal, and saved attachment round trips. The updated
 appearance has not been checked in a live GPU window.
+
+## Ground vegetation and light-transmitting leaves
+
+Natural generation places non-solid tall-grass and six colored flower blocks
+above grass surfaces, with the same seed/coordinate hash used by their meshes.
+Three tapered blade tufts vary in position, orientation, height and green shading.
+Grass objects are consistently tall (0.48–0.75 blocks), with no short-grass
+objects. A smooth seeded 14-block density field gives 2% placement in open
+regions, 12% in transition areas and 38% inside denser tufts. Flower placement
+keeps its previous independent abundance, with 3D stems, four petals
+and golden centers in red, yellow, purple, white/cream, pink and blue. Snow, sand
+and ruin floors receive no plants. Existing unedited terrain gains these plants.
+
+Plants occupy their own streamed voxels, are selectable with reduced height/width
+bounds and use the regular mining, particles and world-drop systems. They break
+in 0.12 seconds by hand or tool without consuming tool durability. Tall grass
+drops one wheat seed at one in eight seeded coordinates; flowers always drop
+one item of their color. Breaking plants writes ordinary air edits so they stay
+removed across streaming and reload. Removing/changing their grass support also
+removes the plant. Sampling suppresses natural plants above legacy support edits.
+Flower items can be replanted on grass, and each crafts into one matching dye
+in any personal/table crafting cell. Seeds and dyes are collectible ingredients;
+wheat cultivation and dye application remain future systems. Flowers, seeds and
+dyes have distinct inventory/drop icons; held flowers use the 3D plant mesh.
+
+Item/block variants and six hand recipes are appended to preserve existing
+indices. Saves retain v3, with enum names for new items and blocks; known legacy
+craft histories of fifteen or twenty entries expand to the current recipe count.
+
+Leaf faces use a stable world-space perforation mask in both color and shadow
+passes, allowing views and sunlight through small gaps. Internal leaf faces and
+solid faces beside leaves remain visible through those gaps. Leaf and grass
+lighting includes softer reverse-side sunlight transmission. This approximates
+translucency with cutouts and backlighting; it does not use blended transparent
+voxel faces. The shadow pipeline now has a depth-only fragment stage for the
+mask and renders both sides of grass blades. Existing collision rules remain.
+
+Validation: all 79 quiet nextest tests and short-format Clippy passed. Mesh and
+world regressions cover repeatable shapes, sparse taller grass, natural/halo
+agreement, plant selection and support removal. Gameplay checks cover chance
+seed drops, all six flower drops and preserved tool wear. Craft pattern tests
+cover all dye recipes; save checks cover harvested natural plants, placed
+flowers, new items and twenty-entry craft-history migration. Native capture
+could not start because the session has no Wayland compositor; visual quality
+and GPU shader validation still need a desktop run.
+
+## Dirt and spreading grass cover
+
+Both bare and grass-covered soil are labeled Dirt and drop/place the existing
+Dirt item. The serialized `Grass` variant remains the internal covered-soil
+state to retain save compatibility; `Dirt` is bare soil. Surface cover and tall
+grass objects are independent, so gaining cover does not respawn harvested plants.
+
+Every five active simulation seconds, exposed bare dirt within 32 blocks of
+the player can gain cover from a horizontally adjacent covered dirt block,
+including a one-block height difference for slopes. Both source and destination
+require a non-solid block directly above. Exposure here means an uncovered top
+face; it does not require a sky ray. Pausing stops this timer; reloading restarts
+the five-second interval. Candidate positions come from edits and blocks directly
+below edits, including natural dirt uncovered by excavation. Unedited natural
+surfaces already have cover. Each pulse applies up to 32 simultaneous conversions
+so cover advances one step per pulse; ordinary block edits persist the result
+and invalidate streamed meshes. No scan of all resident voxels is needed.
+
+Grass-covered dirt wraps its grassy material around exposed one-block side
+faces. A cliff is detected per face when the block below continues the solid
+column but the neighboring block below that face is empty/non-solid: this is
+at least a two-block drop. Cliff sides retain the existing thin grassy lip
+and bare soil beneath. Meshing uses the chunk halo, including across boundaries;
+changing adjacent terrain updates the classification. Isolated soil cubes also
+get grassy sides, since they have no continuing cliff column.
+
+Regression checks cover sparse/clustered grass distribution and height, soil
+spread timing, covered/isolated soil rejection, slope and chunk-boundary spread,
+natural dirt exposed by digging, saved cover, and step-versus-cliff materials.
+The latest headless tests do not substitute for a native visual check.

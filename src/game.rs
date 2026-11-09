@@ -122,6 +122,7 @@ pub struct Game {
     pub mining_progress: f32,
     attack_timer: f32,
     spawn_timer: f32,
+    grass_timer: f32,
     pub furnaces: std::collections::BTreeMap<[i32; 3], items::Furnace>,
     pub active_furnace: Option<[i32; 3]>,
     pub torch_life: std::collections::BTreeMap<[i32; 3], f32>,
@@ -146,6 +147,7 @@ impl Game {
             mining_progress: 0.,
             attack_timer: 0.,
             spawn_timer: 4.,
+            grass_timer: 5.,
             furnaces: Default::default(),
             active_furnace: None,
             torch_life: Default::default(),
@@ -321,6 +323,10 @@ impl Game {
                 if adjacent == hit || self.world.get(adjacent) != Block::Air {
                     return;
                 }
+                if block.plant() && self.world.get(adjacent - IVec3::Y) != Block::Grass {
+                    self.say("Flowers need grass-covered dirt beneath them");
+                    return;
+                }
                 let pos = Vec3::from_array(self.player.pos);
                 if block.solid() && overlaps(pos, adjacent) {
                     self.say("Cannot place a block inside yourself");
@@ -493,6 +499,12 @@ impl Game {
         self.feedback.tick(dt);
         self.tick_furnace();
         self.time += dt / 900.;
+        self.grass_timer -= dt;
+        if self.grass_timer <= 0. {
+            self.grass_timer = 5.;
+            self.world
+                .spread_grass(Vec3::from_array(self.player.pos).floor().as_ivec3());
+        }
         self.message_time = (self.message_time - dt).max(0.);
         self.attack_timer = (self.attack_timer - dt).max(0.);
         let mut expired = vec![];
@@ -734,7 +746,9 @@ impl Game {
             self.mining = Some(p);
             self.mining_progress = 0.;
         }
-        let seconds = if hard {
+        let seconds = if b.plant() {
+            0.12
+        } else if hard {
             1.8 / (pick as f32).max(1.)
         } else if b == Block::Log {
             1.2 / (axe as f32).max(1.)
@@ -769,22 +783,32 @@ impl Game {
                 self.say("Empty the furnace before mining it");
                 return;
             }
-            let drop = match b {
-                Block::Log => Some(Item::Log),
-                Block::Stone | Block::Cobble | Block::RuinStone => Some(Item::Cobble),
-                Block::Iron => Some(Item::IronOre),
-                Block::Reliquary => Some(Item::IronIngot),
-                Block::Smelter => Some(Item::Smelter),
-                Block::Copper => Some(Item::CopperOre),
-                Block::Coal => Some(Item::Coal),
-                Block::Dirt | Block::Grass | Block::Sand | Block::Snow => Some(Item::Dirt),
-                Block::Planks => Some(Item::Planks),
-                Block::Table => Some(Item::Table),
-                Block::Furnace => Some(Item::Furnace),
-                Block::Bed => Some(Item::Bed),
-                Block::Torch => Some(Item::Torch),
-                Block::Leaves => Some(Item::Berries),
-                _ => None,
+            let drop = if let Some(index) = b.flower_index() {
+                Some(crate::items::FLOWER_ITEMS[index])
+            } else {
+                match b {
+                    Block::TallGrass
+                        if crate::world::hash(self.world.seed ^ 0x5eed, p.x, p.y, p.z)
+                            .is_multiple_of(8) =>
+                    {
+                        Some(Item::WheatSeeds)
+                    }
+                    Block::Log => Some(Item::Log),
+                    Block::Stone | Block::Cobble | Block::RuinStone => Some(Item::Cobble),
+                    Block::Iron => Some(Item::IronOre),
+                    Block::Reliquary => Some(Item::IronIngot),
+                    Block::Smelter => Some(Item::Smelter),
+                    Block::Copper => Some(Item::CopperOre),
+                    Block::Coal => Some(Item::Coal),
+                    Block::Dirt | Block::Grass | Block::Sand | Block::Snow => Some(Item::Dirt),
+                    Block::Planks => Some(Item::Planks),
+                    Block::Table => Some(Item::Table),
+                    Block::Furnace => Some(Item::Furnace),
+                    Block::Bed => Some(Item::Bed),
+                    Block::Torch => Some(Item::Torch),
+                    Block::Leaves => Some(Item::Berries),
+                    _ => None,
+                }
             };
             if let Some(i) = drop {
                 self.drops.push(WorldDrop {
@@ -800,7 +824,9 @@ impl Game {
             self.world.set(p, Block::Air);
             self.torch_life.remove(&p.to_array());
             self.furnaces.remove(&p.to_array());
-            self.player.inventory.damage_tool(tool);
+            if !b.plant() {
+                self.player.inventory.damage_tool(tool);
+            }
             self.mining_progress = 0.;
             self.mining = None;
         }
@@ -1000,6 +1026,46 @@ mod tests {
             }
         }
         g
+    }
+    #[test]
+    fn dirt_gains_cover_after_simulation_time() {
+        let mut g = sky_fixture();
+        g.spawn_timer = 100.;
+        let p = IVec3::new(2, 100, 0);
+        g.world.set(p, Block::Dirt);
+        g.world.set(p + IVec3::X, Block::Grass);
+        g.grass_timer = 0.05;
+        g.tick(&Input::default(), 0.04);
+        assert_eq!(g.world.get(p), Block::Dirt);
+        g.tick(&Input::default(), 0.02);
+        assert_eq!(g.world.get(p), Block::Grass);
+        assert_eq!(g.world.edits.get(&p.to_array()), Some(&Block::Grass));
+    }
+    #[test]
+    fn harvesting_plants_drops_flowers_and_occasional_seeds_without_tool_wear() {
+        let mut g = sky_fixture();
+        let before = g.player.inventory.clone();
+        for x in 0..128 {
+            let p = IVec3::new(x, 101, -2);
+            g.world.set(p - IVec3::Y, Block::Grass);
+            g.world.set(p, Block::TallGrass);
+            g.target = Some((p, p + IVec3::Z));
+            g.attack(0.13);
+            assert_eq!(g.world.get(p), Block::Air);
+        }
+        assert!(!g.drops.is_empty() && g.drops.len() < 40);
+        assert!(g.drops.iter().all(|d| d.item == Item::WheatSeeds));
+        assert_eq!(g.player.inventory, before);
+        g.drops.clear();
+        for (index, block) in crate::world::FLOWERS.into_iter().enumerate() {
+            let p = IVec3::new(index as i32, 101, -2);
+            g.world.set(p, block);
+            g.target = Some((p, p + IVec3::Z));
+            g.attack(0.13);
+            assert_eq!(g.drops[index].item, crate::items::FLOWER_ITEMS[index]);
+            assert_eq!(g.drops[index].count, 1);
+            assert_eq!(g.world.get(p), Block::Air);
+        }
     }
     #[test]
     fn wall_torches_attach_reject_stacking_and_lose_support() {

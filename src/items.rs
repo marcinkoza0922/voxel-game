@@ -32,8 +32,21 @@ pub enum Item {
     IronAxe,
     IronPick,
     IronSword,
+    WheatSeeds,
+    RedFlower,
+    YellowFlower,
+    PurpleFlower,
+    WhiteFlower,
+    PinkFlower,
+    BlueFlower,
+    RedDye,
+    YellowDye,
+    PurpleDye,
+    WhiteDye,
+    PinkDye,
+    BlueDye,
 }
-pub const ITEMS: [Item; 28] = [
+pub const ITEMS: [Item; 41] = [
     Item::Log,
     Item::Planks,
     Item::Stick,
@@ -62,10 +75,58 @@ pub const ITEMS: [Item; 28] = [
     Item::IronAxe,
     Item::IronPick,
     Item::IronSword,
+    Item::WheatSeeds,
+    Item::RedFlower,
+    Item::YellowFlower,
+    Item::PurpleFlower,
+    Item::WhiteFlower,
+    Item::PinkFlower,
+    Item::BlueFlower,
+    Item::RedDye,
+    Item::YellowDye,
+    Item::PurpleDye,
+    Item::WhiteDye,
+    Item::PinkDye,
+    Item::BlueDye,
+];
+pub const FLOWER_ITEMS: [Item; 6] = [
+    Item::RedFlower,
+    Item::YellowFlower,
+    Item::PurpleFlower,
+    Item::WhiteFlower,
+    Item::PinkFlower,
+    Item::BlueFlower,
+];
+pub const DYE_ITEMS: [Item; 6] = [
+    Item::RedDye,
+    Item::YellowDye,
+    Item::PurpleDye,
+    Item::WhiteDye,
+    Item::PinkDye,
+    Item::BlueDye,
 ];
 impl Item {
+    pub fn flower_index(self) -> Option<usize> {
+        FLOWER_ITEMS.iter().position(|i| *i == self)
+    }
+    pub fn dye_index(self) -> Option<usize> {
+        DYE_ITEMS.iter().position(|i| *i == self)
+    }
     pub fn name(self) -> &'static str {
         match self {
+            Self::WheatSeeds => "Wheat seeds",
+            Self::RedFlower => "Red flower",
+            Self::YellowFlower => "Yellow flower",
+            Self::PurpleFlower => "Purple flower",
+            Self::WhiteFlower => "White flower",
+            Self::PinkFlower => "Pink flower",
+            Self::BlueFlower => "Blue flower",
+            Self::RedDye => "Red dye",
+            Self::YellowDye => "Yellow dye",
+            Self::PurpleDye => "Purple dye",
+            Self::WhiteDye => "White dye",
+            Self::PinkDye => "Pink dye",
+            Self::BlueDye => "Blue dye",
             Self::Log => "Oak log",
             Self::Planks => "Oak planks",
             Self::Stick => "Sticks",
@@ -98,6 +159,12 @@ impl Item {
     }
     pub fn block(self) -> Option<Block> {
         Some(match self {
+            Self::RedFlower => Block::RedFlower,
+            Self::YellowFlower => Block::YellowFlower,
+            Self::PurpleFlower => Block::PurpleFlower,
+            Self::WhiteFlower => Block::WhiteFlower,
+            Self::PinkFlower => Block::PinkFlower,
+            Self::BlueFlower => Block::BlueFlower,
             Self::Log => Block::Log,
             Self::Planks => Block::Planks,
             Self::Dirt => Block::Dirt,
@@ -607,6 +674,48 @@ pub const RECIPES: &[Recipe] = &[
         station: Station::Table,
         xp: 70,
     },
+    Recipe {
+        output: RedDye,
+        amount: 1,
+        inputs: &[(RedFlower, 1)],
+        station: Station::Hand,
+        xp: 6,
+    },
+    Recipe {
+        output: YellowDye,
+        amount: 1,
+        inputs: &[(YellowFlower, 1)],
+        station: Station::Hand,
+        xp: 6,
+    },
+    Recipe {
+        output: PurpleDye,
+        amount: 1,
+        inputs: &[(PurpleFlower, 1)],
+        station: Station::Hand,
+        xp: 6,
+    },
+    Recipe {
+        output: WhiteDye,
+        amount: 1,
+        inputs: &[(WhiteFlower, 1)],
+        station: Station::Hand,
+        xp: 6,
+    },
+    Recipe {
+        output: PinkDye,
+        amount: 1,
+        inputs: &[(PinkFlower, 1)],
+        station: Station::Hand,
+        xp: 6,
+    },
+    Recipe {
+        output: BlueDye,
+        amount: 1,
+        inputs: &[(BlueFlower, 1)],
+        station: Station::Hand,
+        xp: 6,
+    },
 ];
 pub fn craft(
     inv: &mut Inventory,
@@ -682,6 +791,7 @@ mod tests {
 /// Compact row-major patterns; spaces are required empty cells.
 pub fn pattern(index: usize) -> (&'static str, usize) {
     match index {
+        20..=25 => ("F", 1),
         0 => ("L", 1),
         1 => ("PP", 1),
         2 => ("PPPP", 2),
@@ -697,6 +807,9 @@ pub fn pattern(index: usize) -> (&'static str, usize) {
 }
 fn ingredient(index: usize, c: char) -> Option<Item> {
     match c {
+        'F' => RECIPES
+            .get(index)
+            .and_then(|r| r.inputs.first().map(|i| i.0)),
         'L' => Some(Item::Log),
         'P' => Some(Item::Planks),
         'S' => Some(Item::Stick),
