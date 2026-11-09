@@ -15,13 +15,14 @@ pub struct Vertex {
     pos: [f32; 3],
     normal: [f32; 3],
     color: [f32; 3],
+    tile: [f32; 3],
 }
-const VERTEX_ATTRIBUTES: [wgpu::VertexAttribute; 3] =
-    wgpu::vertex_attr_array![0=>Float32x3,1=>Float32x3,2=>Float32x3];
+const VERTEX_ATTRIBUTES: [wgpu::VertexAttribute; 4] =
+    wgpu::vertex_attr_array![0=>Float32x3,1=>Float32x3,2=>Float32x3,3=>Float32x3];
 impl Vertex {
     fn layout() -> wgpu::VertexBufferLayout<'static> {
         wgpu::VertexBufferLayout {
-            array_stride: 36,
+            array_stride: 48,
             step_mode: wgpu::VertexStepMode::Vertex,
             attributes: &VERTEX_ATTRIBUTES,
         }
@@ -165,6 +166,22 @@ impl Renderer {
                     ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Comparison),
                     count: None,
                 },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 3,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2Array,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 4,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
             ],
         });
         let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
@@ -174,6 +191,49 @@ impl Renderer {
             compare: Some(wgpu::CompareFunction::LessEqual),
             mag_filter: wgpu::FilterMode::Linear,
             min_filter: wgpu::FilterMode::Linear,
+            ..Default::default()
+        });
+        let tiles = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("32px pixel material tiles"),
+            size: wgpu::Extent3d {
+                width: crate::art::TILE_SIZE,
+                height: crate::art::TILE_SIZE,
+                depth_or_array_layers: (crate::art::BLOCKS.len() * 3) as u32,
+            },
+            mip_level_count: 6,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        for (level, pixels) in crate::art::mipmaps().iter().enumerate() {
+            let size = crate::art::TILE_SIZE >> level;
+            queue.write_texture(
+                wgpu::TexelCopyTextureInfo {
+                    mip_level: level as u32,
+                    ..tiles.as_image_copy()
+                },
+                pixels,
+                wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(size * 4),
+                    rows_per_image: Some(size),
+                },
+                wgpu::Extent3d {
+                    width: size,
+                    height: size,
+                    depth_or_array_layers: (crate::art::BLOCKS.len() * 3) as u32,
+                },
+            );
+        }
+        let tiles_view = tiles.create_view(&wgpu::TextureViewDescriptor {
+            dimension: Some(wgpu::TextureViewDimension::D2Array),
+            ..Default::default()
+        });
+        let tile_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("Crisp pixel sampler"),
+            mipmap_filter: wgpu::FilterMode::Linear,
             ..Default::default()
         });
         let bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -191,6 +251,14 @@ impl Renderer {
                 wgpu::BindGroupEntry {
                     binding: 2,
                     resource: wgpu::BindingResource::Sampler(&sampler),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: wgpu::BindingResource::TextureView(&tiles_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: wgpu::BindingResource::Sampler(&tile_sampler),
                 },
             ],
         });
@@ -437,6 +505,7 @@ impl Renderer {
         let mut dynamic = vec![];
         for (_, m) in g.entities.iter() {
             let p = m.pos;
+            let creature_start = dynamic.len();
             let guardian = matches!(m.kind, crate::ecs::MobKind::Guardian(_));
             box_mesh(
                 &mut dynamic,
@@ -478,6 +547,79 @@ impl Renderer {
                     },
                 );
             }
+            // Recessed face, paired eyes, brow, belt and distinct armor silhouette.
+            let eye_color = if guardian {
+                [0.40, 0.88, 0.96]
+            } else {
+                [0.93, 0.65, 0.25]
+            };
+            box_mesh(
+                &mut dynamic,
+                p + Vec3::new(-0.18, 1.49, -0.245),
+                Vec3::new(0.36, 0.13, 0.025),
+                [0.13, 0.17, 0.18],
+            );
+            for x in [-0.14, 0.07] {
+                box_mesh(
+                    &mut dynamic,
+                    p + Vec3::new(x, 1.53, -0.265),
+                    Vec3::new(0.07, 0.045, 0.025),
+                    eye_color,
+                );
+            }
+            box_mesh(
+                &mut dynamic,
+                p + Vec3::new(-0.25, 1.64, -0.26),
+                Vec3::new(0.50, 0.065, 0.10),
+                if guardian {
+                    [0.30, 0.40, 0.48]
+                } else {
+                    [0.31, 0.34, 0.23]
+                },
+            );
+            textured_box(
+                &mut dynamic,
+                p + Vec3::new(-0.28, 0.70, -0.205),
+                Vec3::new(0.56, 0.10, 0.41),
+                Block::Log,
+            );
+            box_mesh(
+                &mut dynamic,
+                p + Vec3::new(-0.055, 0.71, -0.23),
+                Vec3::new(0.11, 0.08, 0.04),
+                [0.66, 0.51, 0.28],
+            );
+            if guardian {
+                for x in [-0.44, 0.24] {
+                    textured_box(
+                        &mut dynamic,
+                        p + Vec3::new(x, 1.18, -0.20),
+                        Vec3::new(0.20, 0.19, 0.39),
+                        Block::RuinStone,
+                    );
+                }
+                box_mesh(
+                    &mut dynamic,
+                    p + Vec3::new(-0.06, 1.05, -0.23),
+                    Vec3::new(0.12, 0.18, 0.055),
+                    eye_color,
+                );
+            } else {
+                textured_box(
+                    &mut dynamic,
+                    p + Vec3::new(-0.22, 0.91, -0.205),
+                    Vec3::new(0.18, 0.25, 0.035),
+                    Block::Leaves,
+                );
+            }
+            let toward = (Vec3::from_array(g.player.pos) - p)
+                .with_y(0.)
+                .normalize_or_zero();
+            let rotation = glam::Quat::from_rotation_y((-toward.x).atan2(-toward.z));
+            for vertex in &mut dynamic[creature_start..] {
+                vertex.pos = (p + rotation * (Vec3::from_array(vertex.pos) - p)).to_array();
+                vertex.normal = (rotation * Vec3::from_array(vertex.normal)).to_array();
+            }
         }
         let mut icon = Ui::new();
         icon.width = 16.;
@@ -497,6 +639,7 @@ impl Renderer {
                     pos: (center + right * v.pos[0] * 0.3 + Vec3::Y * v.pos[1] * 0.3).to_array(),
                     normal: normal.to_array(),
                     color: [v.color[0], v.color[1], v.color[2]],
+                    tile: [0., 0., -1.],
                 });
             }
         }
@@ -807,7 +950,8 @@ pub fn mesh_halo(seed: u64, k: IVec3, halo: &[Block]) -> Vec<Vertex> {
                     let mut vertices = [Vertex {
                         pos: [0.; 3],
                         normal: normal.as_vec3().to_array(),
-                        color: block.color(),
+                        color: [1.; 3],
+                        tile: [0.; 3],
                     }; 4];
                     let mut aos = [0; 4];
                     for (i, (a, b)) in CORNERS.iter().enumerate() {
@@ -826,15 +970,23 @@ pub fn mesh_halo(seed: u64, k: IVec3, halo: &[Block]) -> Vec<Vertex> {
                             + u.as_vec3() * (*a as f32 * 0.5)
                             + v.as_vec3() * (*b as f32 * 0.5);
                         vertices[i].pos = pos.to_array();
-                        let mut color = block.color();
-                        if block == Block::Grass && normal.y == 0 {
-                            color = Block::Dirt.color();
-                        }
-                        let variation = 0.94
-                            + (crate::world::hash(seed, base.x + x, base.y + y, base.z + z) % 11)
+                        let face = if normal.y > 0 {
+                            1
+                        } else if normal.y < 0 {
+                            2
+                        } else {
+                            0
+                        };
+                        vertices[i].tile = [
+                            (*a as f32 + 1.) * 0.5,
+                            (1. - *b as f32) * 0.5,
+                            crate::art::layer(block, face) as f32,
+                        ];
+                        let variation = 0.96
+                            + (crate::world::hash(seed, base.x + x, base.y + y, base.z + z) % 9)
                                 as f32
                                 * 0.01;
-                        vertices[i].color = color.map(|c| c * (1. - ao as f32 * 0.16) * variation);
+                        vertices[i].color = [((1. - ao as f32 * 0.16) * variation); 3];
                     }
                     let indices = if aos[0] + aos[2] > aos[1] + aos[3] {
                         [0, 1, 3, 1, 2, 3]
@@ -850,6 +1002,29 @@ pub fn mesh_halo(seed: u64, k: IVec3, halo: &[Block]) -> Vec<Vertex> {
     }
     out
 }
+fn textured_box(out: &mut Vec<Vertex>, pos: Vec3, size: Vec3, block: Block) {
+    let start = out.len();
+    box_mesh(out, pos, size, [1.; 3]);
+    for vertex in &mut out[start..] {
+        let n = Vec3::from_array(vertex.normal);
+        let local = (Vec3::from_array(vertex.pos) - pos) / size;
+        let uv = if n.y.abs() > 0.5 {
+            [local.x, local.z]
+        } else if n.x.abs() > 0.5 {
+            [local.z, 1. - local.y]
+        } else {
+            [local.x, 1. - local.y]
+        };
+        let face = if n.y > 0.5 {
+            1
+        } else if n.y < -0.5 {
+            2
+        } else {
+            0
+        };
+        vertex.tile = [uv[0], uv[1], crate::art::layer(block, face) as f32];
+    }
+}
 fn box_mesh(out: &mut Vec<Vertex>, pos: Vec3, size: Vec3, color: [f32; 3]) {
     for (n, u, v) in FACES {
         let verts = CORNERS.map(|(a, b)| {
@@ -861,6 +1036,7 @@ fn box_mesh(out: &mut Vec<Vertex>, pos: Vec3, size: Vec3, color: [f32; 3]) {
                 pos: (pos + p * size).to_array(),
                 normal: n.as_vec3().to_array(),
                 color,
+                tile: [0., 0., -1.],
             }
         });
         for i in [0, 1, 2, 0, 2, 3] {
@@ -930,11 +1106,25 @@ fn held_model(out: &mut Vec<Vertex>, g: &Game) {
             Item::IronAxe | Item::IronPick | Item::IronSword => [0.72, 0.77, 0.81],
             _ => [0.77, 0.43, 0.24],
         };
-        box_mesh(
+        textured_box(
             out,
             Vec3::new(-0.025, -0.10, -0.025),
             Vec3::new(0.05, 0.48, 0.05),
-            [0.38, 0.23, 0.12],
+            Block::Log,
+        );
+        for y in [-0.06, -0.01, 0.04, 0.09] {
+            box_mesh(
+                out,
+                Vec3::new(-0.031, y, -0.031),
+                Vec3::new(0.062, 0.018, 0.062),
+                [0.57, 0.42, 0.25],
+            );
+        }
+        box_mesh(
+            out,
+            Vec3::new(-0.035, 0.24, -0.035),
+            Vec3::new(0.07, 0.055, 0.07),
+            [0.24, 0.23, 0.21],
         );
         if item.pick() > 0 {
             box_mesh(
@@ -976,12 +1166,41 @@ fn held_model(out: &mut Vec<Vertex>, g: &Game) {
                 material,
             );
         }
+        let edge = material.map(|c| (c * 1.25_f32).min(1.));
+        if item.axe() > 0 {
+            box_mesh(
+                out,
+                Vec3::new(-0.207, 0.18, -0.029),
+                Vec3::new(0.022, 0.19, 0.058),
+                edge,
+            );
+        } else if item.pick() > 0 {
+            box_mesh(
+                out,
+                Vec3::new(-0.18, 0.345, -0.044),
+                Vec3::new(0.36, 0.018, 0.088),
+                edge,
+            );
+        } else {
+            box_mesh(
+                out,
+                Vec3::new(-0.045, 0.14, -0.031),
+                Vec3::new(0.018, 0.42, 0.012),
+                edge,
+            );
+            box_mesh(
+                out,
+                Vec3::new(-0.035, -0.11, -0.035),
+                Vec3::splat(0.07),
+                material,
+            );
+        }
     } else if equipped {
-        box_mesh(
+        textured_box(
             out,
             Vec3::new(-0.09, 0.02, -0.10),
             Vec3::splat(0.18),
-            item.block().map_or([0.65, 0.46, 0.24], Block::color),
+            item.block().unwrap_or(Block::Planks),
         );
     }
     let forward = g.player.direction();

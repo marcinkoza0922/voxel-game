@@ -9,10 +9,12 @@ struct Camera {
 @group(0) @binding(0) var<uniform> camera: Camera;
 @group(0) @binding(1) var shadow_map: texture_depth_2d;
 @group(0) @binding(2) var shadow_sampler: sampler_comparison;
-struct In { @location(0) pos: vec3<f32>, @location(1) normal: vec3<f32>, @location(2) color: vec3<f32> };
-struct Out { @builtin(position) clip: vec4<f32>, @location(0) world: vec3<f32>, @location(1) normal: vec3<f32>, @location(2) color: vec3<f32>, @location(3) shadow: vec4<f32> };
+@group(0) @binding(3) var tiles: texture_2d_array<f32>;
+@group(0) @binding(4) var tile_sampler: sampler;
+struct In { @location(0) pos: vec3<f32>, @location(1) normal: vec3<f32>, @location(2) color: vec3<f32>, @location(3) tile: vec3<f32> };
+struct Out { @builtin(position) clip: vec4<f32>, @location(0) world: vec3<f32>, @location(1) normal: vec3<f32>, @location(2) color: vec3<f32>, @location(3) shadow: vec4<f32>, @location(4) tile: vec3<f32> };
 @vertex fn vs(v:In)->Out {
-    var o:Out; o.clip=camera.view*vec4(v.pos,1.0);o.world=v.pos;o.normal=v.normal;o.color=v.color;o.shadow=camera.light_view*vec4(v.pos,1.0);return o;
+    var o:Out; o.clip=camera.view*vec4(v.pos,1.0);o.world=v.pos;o.normal=v.normal;o.color=v.color;o.tile=v.tile;o.shadow=camera.light_view*vec4(v.pos,1.0);return o;
 }
 @fragment fn fs(v:Out)->@location(0) vec4<f32> {
     let p=v.shadow.xyz/v.shadow.w;
@@ -29,7 +31,9 @@ struct Out { @builtin(position) clip: vec4<f32>, @location(0) world: vec3<f32>, 
         let l=camera.lights[i];let d=distance(v.world,l.xyz);let falloff=max(1.0-d/9.0,0.0);
         light+=vec3(1.0,0.49,0.16)*falloff*falloff*l.w;
     }
-    let color=v.color*light;
+    let tile_color=textureSample(tiles,tile_sampler,v.tile.xy,i32(round(max(v.tile.z,0.0)))).rgb;
+    let surface=select(vec3(1.0),tile_color,v.tile.z>=0.0);
+    let color=v.color*surface*light;
     let fog=smoothstep(112.0,160.0,distance(v.world.xz,camera.eye.xz));
     return vec4(mix(color,camera.sky.xyz,fog),1.0);
 }

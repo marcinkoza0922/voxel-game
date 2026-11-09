@@ -347,6 +347,11 @@ impl Ui {
                 if item == Berries && py < 5 {
                     c = [0.25, 0.57, 0.24, 1.];
                 }
+                if block && let Some(material) = item.block() {
+                    let top = py <= 6 - (px - 8).abs() / 2;
+                    let rgb = crate::art::texel(material, usize::from(top), px * 2, py * 2);
+                    c = [rgb[0], rgb[1], rgb[2], 1.];
+                }
                 let shade = if block {
                     if py <= 6 - (px - 8).abs() / 2 {
                         1.20

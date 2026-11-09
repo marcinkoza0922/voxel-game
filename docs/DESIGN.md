@@ -398,3 +398,37 @@ performance, balance and fun still require separate native/human checks. Existin
 unit tests cover detailed transaction rejection and persistence edge cases.
 Add new functional checkpoints here or extend the expedition as systems arrive;
 keep fixtures explicit and assert observable outcomes through game actions.
+
+## Pixel material art
+
+`art` owns deterministic 32×32 RGB material tiles for every current block,
+with separate side/top/underside layers. Broad pixel clusters establish bark
+ridges, cut-log rings, grass overhangs, soil pebbles, granite veins, embedded
+ore clusters, leaf clusters, staggered plank joints, masonry mortar, furnace
+openings, crafting grids, cloth, snow, sand ripples and the cache emblem.
+Full-resolution grain adds fine variation. Ruins have moss and cyan carvings.
+The textures are generated from fixed integer hashes at startup, without files,
+network access, world generation changes or save changes.
+
+The renderer uploads a 60-layer texture array with six box-filtered mip levels
+in linear color. Nearest texel filtering preserves close pixel edges; linear
+mip filtering reduces distant shimmer. World vertices carry UV/layer attributes
+and retain existing corner AO and seeded block brightness variation. Untextured
+geometry uses a negative layer sentinel. Face counts and chunk geometry are
+unchanged; vertex stride increases from 36 to 48 bytes. The shadow pass uses the
+same vertex layout. Inventory block icons sample the same materials within their
+existing 16-pixel silhouettes; held block cubes use full material UVs.
+
+Held tools gain grip wraps, collars and brighter cutting edges. Creatures gain
+recessed faces, eyes, brows, belts and buckles, with moss patches for husks and
+masonry shoulder armor/cyan chest details for guardians. Rendered creatures face
+the player; this is cosmetic and does not change AI or collision bounds.
+
+Validation: short Clippy, all 68 quiet nextest tests, and diff whitespace checks
+passed. Material regression coverage checks complete mip sizes/opaque pixels,
+face-specific textures and distinct ore layer mapping. A bounded 240-frame native Vulkan run exited cleanly; its terrain capture was
+inspected for grass, soil edges, bark, foliage, shadows and the held axe. Inspection
+caught and corrected float-to-layer truncation artifacts by rounding the tile
+layer before integer conversion. The smoke gameplay/save round trip also passed.
+Creature details and all crafted materials have not been individually inspected
+in native views.
