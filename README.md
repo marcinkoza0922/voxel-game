@@ -51,3 +51,26 @@ cargo clippy --message-format=short
 Cargo output and nextest are configured to be quiet. The verification helper prints diagnostics only on failure. A display-free gameplay/persistence check is available with `cargo run -- --smoke` and uses a temporary save, leaving your world untouched.
 
 For reproducible GPU checks, `--frames 180 --capture /tmp/frame.ppm --save /tmp/test-world.json` renders a fixed number of frames, captures the final framebuffer, saves, and exits. Add `--pack` to inspect the GUI. `--capture` defaults to 240 frames if no frame count is supplied. PPM is intentionally dependency-free and readable by standard image viewers/converters.
+
+For frame-time diagnostics, add `--profile /tmp/frames.csv`, then run
+`python3 tools/analyze-profile.py /tmp/frames.csv`. The report gives median,
+95th percentile, worst frame, and peak queued/active/resident chunks. These are
+wall times, including presentation waits, rather than GPU execution timings.
+The first frame has no interval; `--skip 180` can exclude startup.
+
+`cargo run -- --expedition` runs a controlled headless expedition through copper
+gear, combat, food, sleep, forest/cave checks, and reload. It mines fixture
+resources through actual gameplay actions; forest/cave visits use relocations.
+It does not measure how easily a player can find resources in a natural world.
+
+A repeatable windowed streaming tour crosses adjacent chunks and relocates to
+distant terrain every 180 frames, rotating the camera throughout:
+
+```sh
+cargo run --release -- --tour --frames 1800 --profile /tmp/tour.csv --save /tmp/new-tour-world.json
+python3 tools/analyze-profile.py /tmp/tour.csv
+```
+
+The tour requires an explicit save path that does not already exist. Use a fresh
+path for each run. See [playtest results](docs/PLAYTEST.md) for measured results
+and remaining manual checks.

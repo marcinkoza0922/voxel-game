@@ -1,6 +1,10 @@
 mod ecs;
+#[path = "../tools/expedition.rs"]
+mod expedition;
 mod game;
 mod items;
+#[path = "../tools/performance.rs"]
+mod performance;
 mod render;
 mod save;
 mod streaming;
@@ -21,19 +25,26 @@ struct Options {
     seed: u64,
     save: PathBuf,
     smoke: bool,
+    expedition: bool,
+    tour: bool,
     frames: Option<u32>,
     capture: Option<PathBuf>,
     pack: bool,
+    profile: Option<PathBuf>,
 }
 fn options() -> Result<Options, String> {
     let mut o = Options {
         seed: 314159,
         save: PathBuf::from("saves/world.json"),
         smoke: false,
+        expedition: false,
+        tour: false,
         frames: None,
         capture: None,
         pack: false,
+        profile: None,
     };
+    let mut explicit_save = false;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -44,7 +55,17 @@ fn options() -> Result<Options, String> {
                     .parse()
                     .map_err(|_| "Invalid seed")?
             }
-            "--save" => o.save = PathBuf::from(args.next().ok_or("--save needs a path")?),
+            "--save" => {
+                o.save = PathBuf::from(args.next().ok_or("--save needs a path")?);
+                explicit_save = true;
+            }
+            "--profile" => {
+                o.profile = Some(PathBuf::from(
+                    args.next().ok_or("--profile needs a CSV path")?,
+                ))
+            }
+            "--tour" => o.tour = true,
+            "--expedition" => o.expedition = true,
             "--smoke" => o.smoke = true,
             "--capture" => {
                 o.capture = Some(PathBuf::from(
@@ -62,7 +83,7 @@ fn options() -> Result<Options, String> {
             }
             "--help" | "-h" => {
                 println!(
-                    "Voxel Adventure\n  --seed N       seed for a new world (default 314159)\n  --save PATH    world file (default saves/world.json)\n  --smoke        headless gameplay/persistence check; uses a temporary save\n  --frames N     render N frames then save and exit\n  --capture PATH save final frame as PPM (defaults to 240 frames)\n  --pack         start with the inventory open\n\nWASD move; mouse look; Space jump; Shift sprint\nLMB mine/attack; RMB place/eat/use; wheel or 1-9 select\nE inventory/crafting/stats; R sleep near bed; F5 save; Esc menu"
+                    "Voxel Adventure\n  --seed N       seed for a new world (default 314159)\n  --save PATH    world file (default saves/world.json)\n  --smoke        headless gameplay/persistence check; uses a temporary save\n  --frames N     render N frames then save and exit\n  --capture PATH save final frame as PPM (defaults to 240 frames)\n  --tour         scripted camera relocations for streaming measurements\n  --expedition   run controlled headless progression expedition\n  --profile PATH write frame timings and chunk backlog as CSV\n  --pack         start with the inventory open\n\nWASD move; mouse look; Space jump; Shift sprint\nLMB mine/attack; RMB place/eat/use; wheel or 1-9 select\nE inventory/crafting/stats; R sleep near bed; F5 save; Esc menu"
                 );
                 std::process::exit(0);
             }
@@ -71,6 +92,12 @@ fn options() -> Result<Options, String> {
     }
     if o.capture.is_some() && o.frames.is_none() {
         o.frames = Some(240);
+    }
+    if o.tour && (!explicit_save || o.frames.is_none() || o.save.exists()) {
+        return Err(
+            "--tour requires --frames and an explicit --save path that does not already exist"
+                .into(),
+        );
     }
     Ok(o)
 }
@@ -91,6 +118,7 @@ struct App {
     fps: f32,
     frames: u32,
     error: Option<String>,
+    profile: Option<performance::Profile>,
 }
 impl App {
     fn capture(&mut self) {
@@ -295,7 +323,8 @@ impl ApplicationHandler for App {
             }
             WindowEvent::RedrawRequested => {
                 let now = Instant::now();
-                let dt = now.duration_since(self.last).as_secs_f32().min(0.1);
+                let interval = now.duration_since(self.last);
+                let dt = interval.as_secs_f32().min(0.1);
                 self.last = now;
                 self.fps = self.fps * 0.95 + 0.05 / dt.max(0.001);
                 if self.focused && !self.pack && !self.paused {
@@ -323,11 +352,36 @@ impl ApplicationHandler for App {
                     self.accumulator = 0.;
                     self.game.target();
                 }
+                if self.options.tour {
+                    // Diagnostic relocations, intentionally independent of input/focus.
+                    // Adjacent chunks exercise replanning; distant views exercise eviction.
+                    if self.frames.is_multiple_of(180) {
+                        let stage = (self.frames / 180) % 10;
+                        let (x, z) = match stage {
+                            0..=5 => (stage as i32 * 16, 0),
+                            6 => (240, 240),
+                            7 => (1024, 1024),
+                            8 => (1040, 1024),
+                            _ => (0, 0),
+                        };
+                        self.game.player.pos = [
+                            x as f32 + 0.5,
+                            self.game.world.height(x, z) as f32 + 3.,
+                            z as f32 + 0.5,
+                        ];
+                        self.game.velocity = glam::Vec3::ZERO;
+                    }
+                    self.game.player.yaw += 0.003;
+                }
+                let simulation_ms = now.elapsed().as_secs_f64() * 1000.;
+                let stream_start = Instant::now();
                 if let Some(r) = &mut self.renderer {
                     r.update_world(
                         &mut self.game.world,
                         glam::Vec3::from_array(self.game.player.pos),
                     );
+                    let stream_ms = stream_start.elapsed().as_secs_f64() * 1000.;
+                    let draw_start = Instant::now();
                     if let Err(e) = r.draw(
                         &self.game,
                         self.pack,
@@ -342,6 +396,25 @@ impl ApplicationHandler for App {
                         self.error = Some(e);
                         self.exit(event_loop);
                         return;
+                    }
+                    if let Some(profile) = &mut self.profile {
+                        let times = [
+                            interval.as_secs_f64() * 1000.,
+                            simulation_ms,
+                            stream_ms,
+                            draw_start.elapsed().as_secs_f64() * 1000.,
+                        ];
+                        if let Err(e) = profile.record(
+                            self.frames,
+                            times,
+                            self.game.world.stream_counts(),
+                            self.focused,
+                            self.pack || self.paused,
+                        ) {
+                            self.error = Some(format!("Profile write failed: {e}"));
+                            self.exit(event_loop);
+                            return;
+                        }
                     }
                 }
                 self.frames += 1;
@@ -406,12 +479,20 @@ fn smoke() -> Result<(), String> {
 }
 fn run() -> Result<(), String> {
     let options = options()?;
+    if options.expedition {
+        return expedition::run();
+    }
     if options.smoke {
         return smoke();
     }
     let game = save::read(&options.save)?.unwrap_or_else(|| Game::new(options.seed));
     let event_loop = EventLoop::new().map_err(|e| e.to_string())?;
     let pack = options.pack;
+    let profile = options
+        .profile
+        .as_deref()
+        .map(performance::Profile::new)
+        .transpose()?;
     let mut app = App {
         game,
         options,
@@ -429,8 +510,12 @@ fn run() -> Result<(), String> {
         fps: 60.,
         frames: 0,
         error: None,
+        profile,
     };
     event_loop.run_app(&mut app).map_err(|e| e.to_string())?;
+    if let Some(profile) = &mut app.profile {
+        profile.finish()?;
+    }
     if let Some(e) = app.error {
         Err(e)
     } else {

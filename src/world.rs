@@ -99,6 +99,7 @@ pub struct World {
     center: IVec3,
     radius: i32,
     desired: HashSet<IVec3>,
+    surface_bounds: HashMap<(i32, i32), (i32, i32)>,
     workers: Option<crate::streaming::Workers>,
     active: HashSet<IVec3>,
     pub meshes: Vec<(IVec3, Vec<crate::render::Vertex>)>,
@@ -150,6 +151,7 @@ impl World {
             center: IVec3::splat(i32::MAX),
             radius: -1,
             desired: HashSet::new(),
+            surface_bounds: HashMap::new(),
             workers: None,
             active: HashSet::new(),
             meshes: vec![],
@@ -309,18 +311,27 @@ impl World {
             self.center = c;
             self.radius = radius;
             let mut desired = HashSet::new();
+            // Only retain columns in this view: bounded memory even after long travel.
+            self.surface_bounds
+                .retain(|&(x, z), _| (x - c.x).abs() <= radius && (z - c.z).abs() <= radius);
             for x in c.x - radius..=c.x + radius {
                 for z in c.z - radius..=c.z + radius {
-                    // Sample every column: steep slopes and trees can cross chunk
-                    // boundaries even when the column midpoint does not.
-                    let (mut low, mut high) = (MAX_Y, MIN_Y);
-                    for dx in 0..SIZE {
-                        for dz in 0..SIZE {
-                            let h = self.height(x * SIZE + dx, z * SIZE + dz);
-                            low = low.min(h);
-                            high = high.max(h + 6);
+                    // Heights depend only on the seed. Reuse overlapping columns
+                    // across replans, while sampling all 256 heights in new columns.
+                    let (low, high) = if let Some(bounds) = self.surface_bounds.get(&(x, z)) {
+                        *bounds
+                    } else {
+                        let (mut low, mut high) = (MAX_Y, MIN_Y);
+                        for dx in 0..SIZE {
+                            for dz in 0..SIZE {
+                                let h = self.height(x * SIZE + dx, z * SIZE + dz);
+                                low = low.min(h);
+                                high = high.max(h + 6);
+                            }
                         }
-                    }
+                        self.surface_bounds.insert((x, z), (low, high));
+                        (low, high)
+                    };
                     let lo = (low.div_euclid(SIZE) - 1).max(MIN_Y / SIZE);
                     let hi = high.div_euclid(SIZE).min(MAX_Y / SIZE);
                     for y in lo..=hi {
@@ -349,18 +360,21 @@ impl World {
                 .copied()
                 .filter(|k| !self.chunks.contains_key(k))
                 .collect();
+            let mut queued: HashSet<_> = wanted.iter().copied().collect();
             // Keep queued remeshes of resident edited chunks when replanning.
             for key in &self.pending {
-                if self.desired.contains(key) && !wanted.contains(key) {
+                if self.desired.contains(key) && queued.insert(*key) {
                     wanted.push(*key);
                 }
             }
             wanted.sort_by_key(|p| ((*p - c).length_squared(), p.x, p.y, p.z));
             self.pending = wanted.into();
         }
+        let mut priorities_changed = false;
         for key in self.dirty.drain(..) {
             if self.desired.contains(&key) && !self.pending.contains(&key) {
                 self.pending.push_back(key);
+                priorities_changed = true;
             }
         }
         let workers = self
@@ -374,6 +388,7 @@ impl World {
             if result.revision != self.revision {
                 if !self.pending.contains(&result.key) {
                     self.pending.push_back(result.key);
+                    priorities_changed = true;
                 }
                 continue;
             }
@@ -381,9 +396,11 @@ impl World {
             self.chunks.insert(result.key, result.blocks);
             self.meshes.push((result.key, result.mesh));
         }
-        self.pending
-            .make_contiguous()
-            .sort_by_key(|p| ((*p - c).length_squared(), p.x, p.y, p.z));
+        if priorities_changed {
+            self.pending
+                .make_contiguous()
+                .sort_by_key(|p| ((*p - c).length_squared(), p.x, p.y, p.z));
+        }
         // At most two jobs (including completed results) can occupy memory.
         while self.active.len() < crate::streaming::WORKERS {
             let Some(i) = self.pending.iter().position(|k| !self.active.contains(k)) else {
@@ -416,6 +433,9 @@ impl World {
     }
     pub fn loaded(&self, k: IVec3) -> bool {
         self.chunks.contains_key(&k)
+    }
+    pub fn stream_counts(&self) -> [usize; 3] {
+        [self.chunks.len(), self.pending.len(), self.active.len()]
     }
     pub fn chunk_count(&self) -> usize {
         self.chunks.len()
@@ -492,6 +512,25 @@ impl World {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn cached_surface_plans_match_fresh_worlds_and_stay_bounded() {
+        let mut cached = World::new(314159);
+        for pos in [
+            Vec3::new(-32., 50., -16.),
+            Vec3::new(-16., 90., -16.),
+            Vec3::new(-16., -100., -16.),
+            Vec3::new(1024., 500., 1024.),
+        ] {
+            cached.stream(pos, 2);
+            let mut fresh = World::new(314159);
+            fresh.stream(pos, 2);
+            assert_eq!(cached.desired, fresh.desired);
+            assert_eq!(cached.surface_bounds, fresh.surface_bounds);
+            assert_eq!(cached.surface_bounds.len(), 25);
+        }
+        cached.stream(Vec3::ZERO, 0);
+        assert_eq!(cached.surface_bounds.len(), 1);
+    }
     #[test]
     fn cached_halo_matches_queries_with_edits_and_resident_chunks() {
         let mut w = World::new(42);

@@ -58,3 +58,36 @@ Background streaming validation: regression tests exercise edit invalidation whi
 Validation for this change: formatting, Clippy with warnings denied, all 30 quiet nextest tests, and gameplay/persistence smoke passed. A native 180-frame capture was attempted but could not initialize winit because this session has no accessible Wayland compositor; GPU presentation and comparative frame timing remain unverified for this change.
 
 VSync update validation: formatting, short-format Clippy with warnings denied, quiet nextest, and gameplay/persistence smoke passed. The initial sandboxed native run could not connect to the Wayland socket (EPERM). Repeating the 120-frame Vulkan run outside the sandbox connected to the compositor, rendered, saved to a temporary world, and exited successfully. Refresh-rate timing was not measured. The historical 60 FPS capture above used the removed software timer.
+
+## Measured playtest and streaming follow-up
+
+Optional `--profile PATH` diagnostics live in `tools/performance.rs`, included as
+a Rust module. A buffered CSV records unclamped start-to-start frame intervals,
+simulation/autosave, streaming plus GPU uploads, draw/presentation wall times,
+and resident/queued/active chunk counts, plus focus/menu flags. The first frame
+has no interval. Memory use stays bounded; explicit flush errors propagate on
+exit. Draw times include surface waits and final capture readback, not GPU
+execution timestamps. A slow phase in row N typically affects interval N+1.
+`tools/analyze-profile.py` reports nearest-rank median/p95/max and chunk peaks;
+`--skip` and `--limit` select a frame range. Profiling is opt-in.
+
+`--tour` performs deterministic camera relocations every 180 frames, including
+adjacent chunk crossings and distant terrain, repeating after 1,800 frames.
+It requires a frame bound and an explicit unused save path. This is a streaming
+stress route, not a walked gameplay expedition. `tools/expedition.rs` implements
+`--expedition`: fresh inventory, controlled resource arena, DDA mining, recipe
+transactions, station placement, copper gear, combat/loot, eating, sleep blocked
+by enemies and restored after victory, persistent torches, natural forest
+and cave relocations, and full player/edit/torch/time save comparisons. Fixture
+resources and relocation deliberately isolate mechanics from search/navigation.
+The verification helper now runs this expedition as well as the original smoke.
+
+Measured replanning hitches motivated a bounded cache of per-horizontal-chunk
+surface height bounds. New columns still sample all 256 heights; overlapping
+columns reuse exact seed-derived bounds. Cache eviction follows the horizontal
+view, independent of resident voxel chunks. Edits do not affect procedural
+surface heights. Replanning uses hash-set membership for queued remesh merging,
+and queue sorting runs only when priorities change rather than every redraw.
+Regression coverage compares desired chunks and cached bounds to fresh worlds
+across negative coordinates, elevation changes, distant moves and radius changes.
+See PLAYTEST.md for timings, actual checks and limitations.
