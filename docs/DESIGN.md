@@ -571,3 +571,32 @@ regression checks horizon crossings, noon/midnight brightness, unit directions
 and repeatability across days. A native three-frame renderer check could not
 start because no Wayland compositor is available in this session; GPU shader
 validation and visual review require a desktop run.
+
+## Offscreen headless runner
+
+`tools/headless.rs`, included by main as a Rust module, implements `--headless`.
+Main loads/creates the selected world and branches before creating the winit
+event loop or audio. The renderer shares initialization and every world, shadow,
+sky, held-item and UI render pass between surface-backed and offscreen targets.
+The headless adapter request has no compatible surface; its framebuffer is an
+RGBA8 sRGB texture with render-attachment/copy-source usage. Existing padded
+GPU readback writes the final PPM. Both paths drain GPU work before teardown.
+No new dependencies or save-format changes are needed.
+
+Headless execution uses one fixed simulation step per frame, no player input,
+and no realtime pacing; pack mode ticks only furnaces. Existing frame, capture,
+pack, seed/save, tour and profile options apply. The default limit is 240 frames,
+and zero frames are rejected. Terrain workers are polled until their queue and
+active jobs empty at startup, tour relocations and the final frame; each wait
+has a 120-second deadline and a 1ms polling delay. This avoids incomplete final
+terrain from fast offscreen loops, though intermediate streaming is asynchronous.
+CSV fields retain their existing meaning; streaming waits are included and
+headless draw times have no compositor/VSync component. The runner flushes the
+profile and saves on successful completion; render failures propagate to a
+nonzero process exit. README.md documents usage and software Vulkan support.
+
+Headless validation: with DISPLAY and WAYLAND_DISPLAY unset, a two-frame Vulkan
+run completed, wrote a 1280×800 PPM with verified header/pixel count and varied
+color data, flushed CSV timings, and saved the world. All 81 quiet nextest tests,
+short-format Clippy, formatting, and gameplay/persistence smoke passed. Software
+Vulkan and interactive presentation were not separately exercised for this change.

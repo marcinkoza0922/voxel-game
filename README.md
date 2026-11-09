@@ -2,7 +2,7 @@
 
 A Linux voxel adventure built in Rust with an owned engine and GUI. This first playable slice follows [PROPOSAL.md](PROPOSAL.md); architecture, decisions, and current limits are in [docs/DESIGN.md](docs/DESIGN.md).
 
-Requires a Rust toolchain supporting edition 2024, a Linux desktop (Wayland or X11), and a Vulkan-capable GPU/driver. No downloaded game assets are required.
+Requires a Rust toolchain supporting edition 2024, a Vulkan-capable GPU/driver (including software Vulkan), and a Linux desktop (Wayland or X11) for interactive play. No downloaded game assets are required.
 
 ```sh
 cargo run --release
@@ -116,3 +116,33 @@ and remaining manual checks.
 progression expedition. Both also run automatically under `cargo nextest run`.
 They check game rules using controlled fixtures without touching your save;
 see [the playtest guide](docs/PLAYTEST.md) for coverage and limits.
+
+## Headless rendering
+
+Run the actual GPU renderer without a window, display server, or audio:
+
+```sh
+cargo run --release -- --headless --frames 120 --capture /tmp/frame.ppm --save /tmp/render-world.json
+```
+
+This renders at 1280×800, advances simulation by one fixed 1/60-second step per
+frame with no movement input, writes the final image as PPM, saves the world,
+and exits. `--headless` defaults to 240 frames; `--frames` must be positive.
+Use a separate `--save` path for diagnostics: an existing save is loaded and
+updated, just as in interactive play. Add `--seed 42` for a reproducible new
+world or `--new --seed 42` to create a separate save beside the selected path.
+The capture's parent directory must already exist.
+
+Add `--pack` to capture the inventory UI (only furnaces advance while open),
+`--profile /tmp/frames.csv` for timings, or `--tour` for scripted camera
+relocations. Tours require `--frames` and an explicit save path that does not
+exist. Headless runs wait for terrain streaming at startup, after tour
+relocations, and before the final frame, with a 120-second timeout per wait.
+Those waits appear in profile streaming times; these runs do not measure display
+pacing. Simulation uses fixed steps, but asynchronous streaming and hardware
+can affect intermediate images and timings.
+
+Vulkan is still required. A machine without a GPU can use an installed software
+Vulkan implementation such as Mesa lavapipe; no Xvfb is needed. Adapter/device
+errors are reported with a nonzero exit status. For simulation checks requiring
+no graphics driver, use `cargo run -- --smoke` instead.

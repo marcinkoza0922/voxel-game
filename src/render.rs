@@ -45,8 +45,8 @@ struct Mesh {
     count: u32,
 }
 pub struct Renderer {
-    surface: wgpu::Surface<'static>,
-    window: Arc<Window>,
+    surface: Option<wgpu::Surface<'static>>,
+    window: Option<Arc<Window>>,
     device: wgpu::Device,
     queue: wgpu::Queue,
     config: wgpu::SurfaceConfiguration,
@@ -93,17 +93,29 @@ fn depth(device: &wgpu::Device, w: u32, h: u32, label: &str) -> wgpu::TextureVie
 impl Renderer {
     pub async fn new(window: Arc<Window>) -> Result<Self, String> {
         let size = window.inner_size();
+        Self::initialize(Some(window), size.width, size.height).await
+    }
+    pub async fn headless(width: u32, height: u32) -> Result<Self, String> {
+        Self::initialize(None, width, height).await
+    }
+    async fn initialize(
+        window: Option<Arc<Window>>,
+        width: u32,
+        height: u32,
+    ) -> Result<Self, String> {
         let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
             backends: wgpu::Backends::VULKAN,
             ..Default::default()
         });
-        let surface = instance
-            .create_surface(window.clone())
+        let surface = window
+            .as_ref()
+            .map(|w| instance.create_surface(w.clone()))
+            .transpose()
             .map_err(|e| e.to_string())?;
         let adapter = instance
             .request_adapter(&wgpu::RequestAdapterOptions {
                 power_preference: wgpu::PowerPreference::HighPerformance,
-                compatible_surface: Some(&surface),
+                compatible_surface: surface.as_ref(),
                 force_fallback_adapter: false,
             })
             .await
@@ -115,26 +127,31 @@ impl Renderer {
             })
             .await
             .map_err(|e| e.to_string())?;
-        let caps = surface.get_capabilities(&adapter);
+        let caps = surface.as_ref().map(|s| s.get_capabilities(&adapter));
         let format = caps
-            .formats
-            .iter()
-            .copied()
-            .find(|f| f.is_srgb())
-            .unwrap_or(caps.formats[0]);
+            .as_ref()
+            .and_then(|c| c.formats.iter().copied().find(|f| f.is_srgb()))
+            .unwrap_or_else(|| {
+                caps.as_ref()
+                    .map_or(wgpu::TextureFormat::Rgba8UnormSrgb, |c| c.formats[0])
+            });
         let config = wgpu::SurfaceConfiguration {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
             format,
-            width: size.width.max(1),
-            height: size.height.max(1),
+            width: width.max(1),
+            height: height.max(1),
             // Strict VSync: AutoVsync can select relaxed FIFO, which permits
             // immediate presentation when rendering misses a refresh.
             present_mode: wgpu::PresentMode::Fifo,
             desired_maximum_frame_latency: 2,
-            alpha_mode: caps.alpha_modes[0],
+            alpha_mode: caps
+                .as_ref()
+                .map_or(wgpu::CompositeAlphaMode::Auto, |c| c.alpha_modes[0]),
             view_formats: vec![],
         };
-        surface.configure(&device, &config);
+        if let Some(surface) = &surface {
+            surface.configure(&device, &config);
+        }
         let depth = depth(&device, config.width, config.height, "Main depth");
         let shadow = crate::render::depth(&device, 2048, 2048, "Sun shadow");
         let uniform = device.create_buffer(&wgpu::BufferDescriptor {
@@ -466,7 +483,9 @@ impl Renderer {
         self.height = h;
         self.config.width = w;
         self.config.height = h;
-        self.surface.configure(&self.device, &self.config);
+        if let Some(surface) = &self.surface {
+            surface.configure(&self.device, &self.config);
+        }
         self.depth = depth(&self.device, w, h, "Main depth");
     }
     pub fn update_world(&mut self, w: &mut World, pos: Vec3) {
@@ -756,16 +775,41 @@ impl Renderer {
                 contents: bytemuck::cast_slice(&self.ui.vertices),
                 usage: wgpu::BufferUsages::VERTEX,
             });
-        let frame = match self.surface.get_current_texture() {
-            Ok(f) => f,
-            Err(wgpu::SurfaceError::Lost | wgpu::SurfaceError::Outdated) => {
-                self.surface.configure(&self.device, &self.config);
-                return Ok(());
+        let frame = if let Some(surface) = &self.surface {
+            match surface.get_current_texture() {
+                Ok(frame) => Some(frame),
+                Err(wgpu::SurfaceError::Lost | wgpu::SurfaceError::Outdated) => {
+                    surface.configure(&self.device, &self.config);
+                    return Ok(());
+                }
+                Err(wgpu::SurfaceError::Timeout) => return Ok(()),
+                Err(e) => return Err(e.to_string()),
             }
-            Err(wgpu::SurfaceError::Timeout) => return Ok(()),
-            Err(e) => return Err(e.to_string()),
+        } else {
+            None
         };
-        let view = frame.texture.create_view(&Default::default());
+        let offscreen = frame.is_none().then(|| {
+            self.device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("Headless framebuffer"),
+                size: wgpu::Extent3d {
+                    width: self.width,
+                    height: self.height,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: self.config.format,
+                usage: self.config.usage,
+                view_formats: &[],
+            })
+        });
+        let texture = frame
+            .as_ref()
+            .map(|f| &f.texture)
+            .or(offscreen.as_ref())
+            .unwrap();
+        let view = texture.create_view(&Default::default());
         let mut encoder = self
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
@@ -891,7 +935,7 @@ impl Renderer {
                 mapped_at_creation: false,
             });
             encoder.copy_texture_to_buffer(
-                frame.texture.as_image_copy(),
+                texture.as_image_copy(),
                 wgpu::TexelCopyBufferInfo {
                     buffer: &buffer,
                     layout: wgpu::TexelCopyBufferLayout {
@@ -939,8 +983,12 @@ impl Renderer {
             drop(data);
             buffer.unmap();
         }
-        self.window.pre_present_notify();
-        frame.present();
+        if let Some(window) = &self.window {
+            window.pre_present_notify();
+        }
+        if let Some(frame) = frame {
+            frame.present();
+        }
         Ok(())
     }
 }

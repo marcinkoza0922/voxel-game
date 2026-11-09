@@ -5,6 +5,8 @@ mod ecs;
 mod expedition;
 mod feedback;
 mod game;
+#[path = "../tools/headless.rs"]
+mod headless;
 mod items;
 #[path = "../tools/performance.rs"]
 mod performance;
@@ -27,6 +29,7 @@ use winit::{
 };
 
 struct Options {
+    headless: bool,
     seed: u64,
     new: bool,
     save: PathBuf,
@@ -42,6 +45,7 @@ struct Options {
 }
 fn options() -> Result<Options, String> {
     let mut o = Options {
+        headless: false,
         seed: 314159,
         new: false,
         save: PathBuf::from("saves/world.json"),
@@ -60,6 +64,7 @@ fn options() -> Result<Options, String> {
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
+            "--headless" => o.headless = true,
             "--new" => o.new = true,
             "--mute" => o.mute = true,
             "--seed" => {
@@ -99,14 +104,17 @@ fn options() -> Result<Options, String> {
             }
             "--help" | "-h" => {
                 println!(
-                    "Voxel Adventure\n  --new          create a separate fresh save with a random seed\n  --seed N       seed for a new world (default 314159)\n  --save PATH    world file (default saves/world.json)\n  --smoke        headless gameplay/persistence check; uses a temporary save\n  --frames N     render N frames then save and exit\n  --capture PATH save final frame as PPM (defaults to 240 frames)\n  --tour         scripted camera relocations for streaming measurements\n  --playtest     run headless mechanics course and progression expedition\n  --expedition   run controlled headless progression expedition\n  --profile PATH write frame timings and chunk backlog as CSV\n  --mute         disable sound playback\n  --pack         start with the inventory open\n\nWASD move; mouse look; Space jump; Shift sprint\nLMB mine/attack; RMB place/eat/use; wheel or 1-9 select\nE inventory/crafting/stats; R sleep near bed; F5 save; Esc menu"
+                    "Voxel Adventure\n  --headless     render offscreen without display/audio (default 240 frames)\n  --new          create a separate fresh save with a random seed\n  --seed N       seed for a new world (default 314159)\n  --save PATH    world file (default saves/world.json)\n  --smoke        headless gameplay/persistence check; uses a temporary save\n  --frames N     render N frames then save and exit\n  --capture PATH save final frame as PPM (defaults to 240 frames)\n  --tour         scripted camera relocations for streaming measurements\n  --playtest     run headless mechanics course and progression expedition\n  --expedition   run controlled headless progression expedition\n  --profile PATH write frame timings and chunk backlog as CSV\n  --mute         disable sound playback\n  --pack         start with the inventory open\n\nWASD move; mouse look; Space jump; Shift sprint\nLMB mine/attack; RMB place/eat/use; wheel or 1-9 select\nE inventory/crafting/stats; R sleep near bed; F5 save; Esc menu"
                 );
                 std::process::exit(0);
             }
             _ => return Err(format!("Unknown argument: {arg}")),
         }
     }
-    if o.capture.is_some() && o.frames.is_none() {
+    if o.frames == Some(0) {
+        return Err("--frames must be positive".into());
+    }
+    if (o.capture.is_some() || o.headless) && o.frames.is_none() {
         o.frames = Some(240);
     }
     if o.tour && (!explicit_save || o.frames.is_none() || o.save.exists()) {
@@ -664,6 +672,9 @@ fn run() -> Result<(), String> {
     } else {
         save::read(&options.save)?.unwrap_or_else(|| Game::new(options.seed))
     };
+    if options.headless {
+        return headless::run(game, &options);
+    }
     let event_loop = EventLoop::new().map_err(|e| e.to_string())?;
     let pack = options.pack;
     let profile = options
