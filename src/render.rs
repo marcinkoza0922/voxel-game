@@ -37,6 +37,8 @@ struct Camera {
     sun: [f32; 4],
     sky: [f32; 4],
     lights: [[f32; 4]; 16],
+    inverse_view: [[f32; 4]; 4],
+    celestial: [f32; 4],
 }
 struct Mesh {
     buffer: wgpu::Buffer,
@@ -50,6 +52,7 @@ pub struct Renderer {
     config: wgpu::SurfaceConfiguration,
     pipeline: wgpu::RenderPipeline,
     shadow_pipeline: wgpu::RenderPipeline,
+    sky_pipeline: wgpu::RenderPipeline,
     ui_pipeline: wgpu::RenderPipeline,
     uniform: wgpu::Buffer,
     bind: wgpu::BindGroup,
@@ -61,6 +64,14 @@ pub struct Renderer {
     pub width: u32,
     pub height: u32,
 }
+// Phase zero is sunrise, 0.25 noon, 0.5 sunset, 0.75 midnight.
+fn sky_cycle(time: f32) -> (Vec3, f32) {
+    let angle = time.rem_euclid(1.) * std::f32::consts::TAU;
+    let direction = Vec3::new(angle.cos(), angle.sin(), angle.sin() * 0.35).normalize();
+    let t = ((direction.y + 0.08) / 0.28).clamp(0., 1.);
+    (direction, t * t * (3. - 2. * t))
+}
+
 fn depth(device: &wgpu::Device, w: u32, h: u32, label: &str) -> wgpu::TextureView {
     device
         .create_texture(&wgpu::TextureDescriptor {
@@ -320,6 +331,35 @@ impl Renderer {
             multiview: None,
             cache: None,
         });
+        let sky_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("Procedural skybox"),
+            layout: Some(&pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &shader,
+                entry_point: Some("sky_vs"),
+                compilation_options: Default::default(),
+                buffers: &[],
+            },
+            primitive: Default::default(),
+            depth_stencil: Some(wgpu::DepthStencilState {
+                depth_write_enabled: false,
+                depth_compare: wgpu::CompareFunction::Always,
+                ..ds.clone()
+            }),
+            multisample: Default::default(),
+            fragment: Some(wgpu::FragmentState {
+                module: &shader,
+                entry_point: Some("sky_fs"),
+                compilation_options: Default::default(),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format,
+                    blend: None,
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+            }),
+            multiview: None,
+            cache: None,
+        });
         let shadow_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("Sun depth pipeline"),
             layout: Some(&shadow_pipeline_layout),
@@ -399,6 +439,7 @@ impl Renderer {
             config,
             pipeline,
             shadow_pipeline,
+            sky_pipeline,
             ui_pipeline,
             uniform,
             bind,
@@ -463,15 +504,15 @@ impl Renderer {
         fps: f32,
         capture: Option<&std::path::Path>,
     ) -> Result<(), String> {
-        let daylight =
-            ((g.time.fract() * std::f32::consts::TAU).sin() * 0.8 + 0.25).clamp(0.03, 1.);
-        let sun = Vec3::new(0.45, 0.8, 0.3).normalize();
-        let sky = [
-            0.28 * daylight + 0.018,
-            0.45 * daylight + 0.025,
-            0.59 * daylight + 0.045,
-            1.,
-        ];
+        let (celestial, daylight) = sky_cycle(g.time);
+        // Moonlight takes over at night; both lights follow the visible orbit.
+        let sun = if celestial.y >= 0. {
+            celestial
+        } else {
+            -celestial
+        };
+        let strength = daylight + (1. - daylight) * 0.12;
+        let sky = [daylight, 0., 0., 1.];
         let eye = g.player.eye();
         let camera_view = Mat4::perspective_rh(
             75_f32.to_radians(),
@@ -511,9 +552,11 @@ impl Renderer {
             view: camera_view.to_cols_array_2d(),
             light_view: light_view.to_cols_array_2d(),
             eye: [eye.x, eye.y, eye.z, 1.],
-            sun: [sun.x, sun.y, sun.z, daylight],
+            sun: [sun.x, sun.y, sun.z, strength],
             sky,
             lights,
+            inverse_view: camera_view.inverse().to_cols_array_2d(),
+            celestial: [celestial.x, celestial.y, celestial.z, 0.],
         };
         self.queue
             .write_buffer(&self.uniform, 0, bytemuck::bytes_of(&camera));
@@ -763,12 +806,7 @@ impl Renderer {
                     view: &view,
                     resolve_target: None,
                     ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color {
-                            r: sky[0] as f64,
-                            g: sky[1] as f64,
-                            b: sky[2] as f64,
-                            a: 1.,
-                        }),
+                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
                         store: wgpu::StoreOp::Store,
                     },
                     depth_slice: None,
@@ -783,8 +821,10 @@ impl Renderer {
                 }),
                 ..Default::default()
             });
-            pass.set_pipeline(&self.pipeline);
+            pass.set_pipeline(&self.sky_pipeline);
             pass.set_bind_group(0, &self.bind, &[]);
+            pass.draw(0..3, 0..1);
+            pass.set_pipeline(&self.pipeline);
             for (k, m) in &self.meshes {
                 if !chunk_visible(camera_view, *k) {
                     continue;
@@ -1544,5 +1584,25 @@ fn held_model(out: &mut Vec<Vertex>, g: &Game) {
         v.normal = transform
             .transform_vector3(Vec3::from_array(v.normal))
             .to_array();
+    }
+}
+
+#[cfg(test)]
+mod sky_tests {
+    use super::*;
+
+    #[test]
+    fn orbit_and_daylight_repeat_and_track_horizon() {
+        for phase in [0., 0.1, 0.25, 0.5, 0.75] {
+            let (sun, light) = sky_cycle(phase);
+            let (next, next_light) = sky_cycle(phase + 4.);
+            assert!(sun.distance(next) < 0.00001);
+            assert!((light - next_light).abs() < 0.00001);
+            assert!((sun.length() - 1.).abs() < 0.00001);
+        }
+        assert_eq!(sky_cycle(0.25).1, 1.);
+        assert_eq!(sky_cycle(0.75).1, 0.);
+        assert!(sky_cycle(0.).0.y.abs() < 0.00001);
+        assert!(sky_cycle(0.5).0.y.abs() < 0.00001);
     }
 }

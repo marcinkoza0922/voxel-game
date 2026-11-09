@@ -545,3 +545,29 @@ varied length, bend, shade and highlighted tips, replacing broad two-pixel green
 clusters. The same blade material extends through the uneven grassy cliff lip;
 step sides continue to use the full turf texture. Other materials retain their
 existing clustered grain and all tiles retain their generated mipmaps.
+
+
+## Procedural skybox and day/night lighting
+
+The existing saved clock drives a full-screen procedural skybox rendered before
+world geometry without writing depth. Inverse camera projection reconstructs
+world-space viewing directions; translation does not move the sky. No authored
+cubemap assets are required. The sky blends horizon and zenith colors through
+day, twilight and night, with a warm glow toward the rising/setting sun, visible
+sun and moon discs, and fixed spherical star cells that fade in at night.
+Distance fog samples the same atmosphere so terrain blends into the horizon.
+
+One day remains 900 active simulation seconds. Phase zero is sunrise, 0.25 noon,
+0.5 sunset and 0.75 midnight; new games and sleep retain their existing 0.28
+phase. Saving/loading retains the clock, and pausing stops it. The sun moves
+along a tilted orbit; the opposite moon provides weaker cool light at night.
+The shadow camera follows the active celestial light, while ambient brightness
+and directional color transition with daylight. Torch lighting stays additive,
+so it becomes more prominent at night. This is raster lighting with one shadow
+map, without atmospheric scattering or moon phases.
+
+Validation: all 81 quiet nextest tests and short-format Clippy passed. The orbit
+regression checks horizon crossings, noon/midnight brightness, unit directions
+and repeatability across days. A native three-frame renderer check could not
+start because no Wayland compositor is available in this session; GPU shader
+validation and visual review require a desktop run.
