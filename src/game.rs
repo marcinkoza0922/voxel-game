@@ -165,24 +165,37 @@ impl Game {
         let (table, furnace) = self.stations();
         match items::craft(&mut self.player.inventory, index, table, furnace) {
             Ok(()) => {
-                let r = &RECIPES[index];
-                let count = self.player.crafts[index];
-                let xp = items::craft_xp(r.xp, count);
-                self.player.crafts[index] = count.saturating_add(1);
-                let ingenuity = self.player.stats[6];
-                if ingenuity > 0 && count.saturating_add(1).is_multiple_of(24 - ingenuity) {
-                    self.player.inventory.add(r.output, 1);
-                }
-                self.player.gain(xp);
-                self.say(format!(
-                    "Crafted {} x{} (+{} XP)",
-                    r.output.name(),
-                    r.amount,
-                    xp
-                ));
+                self.reward_craft(index);
             }
             Err(e) => self.say(e),
         }
+    }
+    pub fn craft_grid(&mut self, mode: u8) {
+        let (table, furnace) = self.stations();
+        if mode == 1 && !table || mode == 2 && !furnace {
+            self.say("Required station is out of reach");
+            return;
+        }
+        if let Some(index) = items::take_output(&mut self.player.inventory, mode) {
+            self.reward_craft(index);
+        }
+    }
+    fn reward_craft(&mut self, index: usize) {
+        let r = &RECIPES[index];
+        let count = self.player.crafts[index];
+        let xp = items::craft_xp(r.xp, count);
+        self.player.crafts[index] = count.saturating_add(1);
+        let ingenuity = self.player.stats[6];
+        if ingenuity > 0 && count.saturating_add(1).is_multiple_of(24 - ingenuity) {
+            self.player.inventory.add(r.output, 1);
+        }
+        self.player.gain(xp);
+        self.say(format!(
+            "Crafted {} x{} (+{} XP)",
+            r.output.name(),
+            r.amount,
+            xp
+        ));
     }
     pub fn allocate(&mut self, index: usize) {
         if index < 7
@@ -198,12 +211,12 @@ impl Game {
     }
     pub fn use_selected(&mut self) {
         let i = self.player.inventory.selected();
-        if self.player.inventory.count(i) == 0 {
+        if self.player.inventory.selected_count() == 0 {
             self.say("That slot is empty");
             return;
         }
         if matches!(i, Item::Berries | Item::CookedMeat | Item::Meat) {
-            self.player.inventory.take(i, 1);
+            self.player.inventory.take_selected();
             let food = if i == Item::CookedMeat {
                 40.
             } else if i == Item::Berries {
@@ -239,7 +252,7 @@ impl Game {
                     return;
                 }
                 if self.world.set(adjacent, block) {
-                    self.player.inventory.take(i, 1);
+                    self.player.inventory.take_selected();
                     if block == Block::Torch {
                         self.torch_life.insert(adjacent.to_array(), 600.);
                     }
@@ -396,7 +409,7 @@ impl Game {
             }
             self.attack_timer = 0.5 / (1. + self.player.stats[2] as f32 * 0.015);
             let selected = self.player.inventory.selected();
-            let equipped = self.player.inventory.count(selected) > 0;
+            let equipped = self.player.inventory.selected_count() > 0;
             let damage = (if equipped && selected == Item::Sword {
                 14.
             } else if equipped && selected.axe() > 0 {
@@ -435,7 +448,7 @@ impl Game {
         };
         let b = self.world.get(p);
         let tool = self.player.inventory.selected();
-        let has = self.player.inventory.count(tool) > 0;
+        let has = self.player.inventory.selected_count() > 0;
         let pick = if has { tool.pick() } else { 0 };
         let axe = if has { tool.axe() } else { 0 };
         let hard = matches!(
@@ -467,7 +480,7 @@ impl Game {
             0.35
         };
         self.mining_progress += dt / seconds;
-        if self.mining_progress >= 1. && self.world.set(p, Block::Air) {
+        if self.mining_progress >= 1. && p.y > crate::world::MIN_Y && p.y <= crate::world::MAX_Y {
             let drop = match b {
                 Block::Log => Some(Item::Log),
                 Block::Stone | Block::Cobble => Some(Item::Cobble),
@@ -483,9 +496,13 @@ impl Game {
                 _ => None,
             };
             if let Some(i) = drop {
-                self.player.inventory.add(i, 1);
+                if !self.player.inventory.add(i, 1) {
+                    self.say("Inventory full: make room before mining");
+                    return;
+                }
                 self.player.discover(format!("resource:{}", i.name()), 15);
             }
+            self.world.set(p, Block::Air);
             self.torch_life.remove(&p.to_array());
             self.player.inventory.damage_tool(tool);
             self.mining_progress = 0.;
@@ -673,7 +690,7 @@ mod tests {
         assert_eq!(g.world.get(p), Block::Copper);
         assert_eq!(g.player.inventory.count(Item::CopperOre), 0);
         g.player.inventory.add(Item::StonePick, 1);
-        g.player.inventory.hotbar[1] = Item::StonePick;
+        g.player.inventory.equip(Item::StonePick, 1);
         g.attack(5.);
         assert_eq!(g.world.get(p), Block::Air);
         assert_eq!(g.player.inventory.count(Item::CopperOre), 1);

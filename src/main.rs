@@ -112,6 +112,7 @@ struct App {
     paused: bool,
     focused: bool,
     cursor: (f32, f32),
+    drag_origin: Option<usize>,
     last: Instant,
     accumulator: f32,
     autosave: f32,
@@ -133,6 +134,7 @@ impl App {
             }
             w.set_cursor_visible(!grab);
         }
+        self.drag_origin = None;
         self.attack = false;
         self.keys.clear();
     }
@@ -164,14 +166,37 @@ impl App {
     }
     fn action(&mut self, a: ui::Action, event_loop: &ActiveEventLoop) {
         match a {
-            ui::Action::Craft(n) => self.game.craft(n),
-            ui::Action::Equip(n) => {
-                let i = items::ITEMS[n];
-                if self.game.player.inventory.count(i) > 0 {
-                    let slot = self.game.player.inventory.selected;
-                    self.game.player.inventory.hotbar[slot] = i;
-                    self.game
-                        .say(format!("{} equipped in slot {}", i.name(), slot + 1));
+            ui::Action::Recipe(delta) => {
+                if let Some(r) = &mut self.renderer {
+                    loop {
+                        r.ui.recipe = (r.ui.recipe as i32 + delta)
+                            .rem_euclid(items::RECIPES.len() as i32)
+                            as usize;
+                        if items::RECIPES[r.ui.recipe].station != items::Station::Furnace {
+                            break;
+                        }
+                    }
+                }
+            }
+            ui::Action::Output => {
+                let mut mode = self.renderer.as_ref().map_or(0, |r| r.ui.mode);
+                let (table, furnace) = self.game.stations();
+                if mode == 1 && !table || mode == 2 && !furnace {
+                    mode = 0;
+                }
+                let empty = self.game.player.inventory.cursor.is_none();
+                self.game.craft_grid(mode);
+                if empty && self.game.player.inventory.cursor.is_some() {
+                    self.drag_origin = Some(usize::MAX);
+                }
+            }
+            ui::Action::Slot(n) => self.game.player.inventory.transfer(n, false),
+            ui::Action::Tab(mode) => {
+                let (table, furnace) = self.game.stations();
+                if ((mode == 0) || (mode == 1 && table) || (mode == 2 && furnace))
+                    && let Some(r) = &mut self.renderer
+                {
+                    r.ui.mode = mode;
                 }
             }
             ui::Action::Stat(n) => self.game.allocate(n),
@@ -246,7 +271,10 @@ impl ApplicationHandler for App {
                 self.capture();
             }
             WindowEvent::CursorMoved { position, .. } => {
-                self.cursor = (position.x as f32, position.y as f32)
+                self.cursor = (position.x as f32, position.y as f32);
+                if let Some(r) = &mut self.renderer {
+                    r.ui.pointer = self.cursor;
+                }
             }
             WindowEvent::KeyboardInput { event, .. } => {
                 if let PhysicalKey::Code(code) = event.physical_key {
@@ -268,6 +296,11 @@ impl ApplicationHandler for App {
                             KeyCode::KeyE => {
                                 if !self.paused {
                                     self.pack = !self.pack;
+                                    if self.pack
+                                        && let Some(r) = &mut self.renderer
+                                    {
+                                        r.ui.mode = 0;
+                                    }
                                     self.capture();
                                 }
                             }
@@ -302,20 +335,63 @@ impl ApplicationHandler for App {
             }
             WindowEvent::MouseInput { state, button, .. } => {
                 if self.pack || self.paused {
-                    if state == ElementState::Pressed
+                    if state == ElementState::Released
                         && button == MouseButton::Left
+                        && let Some(origin) = self.drag_origin.take()
+                        && let Some(ui::Action::Slot(n)) = self
+                            .renderer
+                            .as_ref()
+                            .and_then(|r| r.ui.click(self.cursor.0, self.cursor.1))
+                        && n != origin
+                    {
+                        self.game.player.inventory.transfer(n, false);
+                    }
+
+                    if state == ElementState::Pressed
+                        && matches!(button, MouseButton::Left | MouseButton::Right)
                         && let Some(a) = self
                             .renderer
                             .as_ref()
                             .and_then(|r| r.ui.click(self.cursor.0, self.cursor.1))
                     {
-                        self.action(a, event_loop);
+                        if let ui::Action::Slot(n) = a {
+                            self.drag_origin = if self.game.player.inventory.cursor.is_none()
+                                && button == MouseButton::Left
+                            {
+                                Some(n)
+                            } else {
+                                None
+                            };
+                            self.game
+                                .player
+                                .inventory
+                                .transfer(n, button == MouseButton::Right);
+                        } else {
+                            self.action(a, event_loop);
+                        }
                     }
                 } else if self.focused {
                     match button {
                         MouseButton::Left => self.attack = state == ElementState::Pressed,
                         MouseButton::Right if state == ElementState::Pressed => {
-                            self.game.use_selected()
+                            self.game.target();
+                            let station =
+                                self.game
+                                    .target
+                                    .and_then(|(p, _)| match self.game.world.get(p) {
+                                        world::Block::Table => Some(1),
+                                        world::Block::Furnace => Some(2),
+                                        _ => None,
+                                    });
+                            if let Some(mode) = station {
+                                self.pack = true;
+                                if let Some(r) = &mut self.renderer {
+                                    r.ui.mode = mode;
+                                }
+                                self.capture();
+                            } else {
+                                self.game.use_selected();
+                            }
                         }
                         _ => (),
                     }
@@ -468,9 +544,7 @@ fn smoke() -> Result<(), String> {
     let path = std::env::temp_dir().join(format!("voxel-smoke-{}.json", std::process::id()));
     save::write(&g, &path)?;
     let loaded = save::read(&path)?.ok_or("Save not created")?;
-    if loaded.world.edits != g.world.edits
-        || loaded.player.inventory.counts != g.player.inventory.counts
-    {
+    if loaded.world.edits != g.world.edits || loaded.player.inventory != g.player.inventory {
         return Err("Save roundtrip mismatch".into());
     }
     std::fs::remove_file(path).map_err(|e| e.to_string())?;
@@ -504,6 +578,7 @@ fn run() -> Result<(), String> {
         paused: false,
         focused: true,
         cursor: (0., 0.),
+        drag_origin: None,
         last: Instant::now(),
         accumulator: 0.,
         autosave: 0.,

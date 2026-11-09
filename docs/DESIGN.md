@@ -11,9 +11,9 @@ The player approved deterministic seeded chunk streaming and persistent player s
 - `world`: deterministic integer-hashed multi-octave terrain, broad mountain ridges, grassland/forest climate, caves, ore and trees. 16-cube chunks are streamed near the camera; generated terrain can be queried without resident chunks. Save edits override generation. CPU face meshing culls hidden faces, including across chunk boundaries; vertex corner AO and sunlight shadows supplement directional lighting. Shader fog hides the view boundary. No authored raster, sound, or 3D assets are needed for these code-native cubes.
 - `ecs`: bespoke generational entity IDs and component slots, initially used by hostile creatures. Simulation owns entities, fixed-step movement/collision, combat, mining, crafting, progression, hunger and fatigue. Rendering consumes state without owning gameplay rules.
 - `game`: 60 Hz simulation with a bounded catch-up accumulator. Walking, gravity, jumps, voxel collision, fall damage, reach-limited DDA selection, resource drops, durable tools, placement, hostile pursuit and melee. Player starts with axe and pickaxe. Death respawns at the original spawn and retains inventory to keep the slice forgiving.
-- `items`: typed items, stack inventory, explicit recipes and station requirements. Crafting GUI initially exposes recipes instead of spatial grid matching; the recipe model will support 2x2/3x3/6x6 dimensions later. Wood/stone/copper tools and furnace processing form the initial loop. First crafts award diminishing XP (quartering each repetition); biome/resource discoveries and level-adjusted kills also award XP. Stats give modest bounded bonuses.
+- `items`: typed items, stack inventory, explicit recipes and station requirements. Crafting uses shaped 2x2/3x3 grids with a read-only recipe guide; 6x6 crafting remains future work. Wood/stone/copper tools and furnace processing form the initial loop. First crafts award diminishing XP (quartering each repetition); biome/resource discoveries and level-adjusted kills also award XP. Stats give modest bounded bonuses.
 - `render`: winit event loop and wgpu raster pipeline with own camera and geometry buffers. Lit vertex-colored voxel faces, shadow sampling, fog, torch point lights, a day/night cycle and a separate unlit GUI pass. Rebuild only changed or newly resident chunk meshes. GPU resources are isolated from simulation.
-- `ui`: owned immediate-mode rectangle/text geometry, tiny embedded bitmap glyphs, panels, click hit testing and keyboard navigation. HUD displays vitals, selected item, target, biome and progression. Inventory contains crafting and stat allocation. Menus release the pointer; gameplay captures it.
+- `ui`: owned immediate-mode rectangle/text geometry, tiny embedded bitmap glyphs, panels, click hit testing and keyboard navigation. HUD displays vitals, selected item, target, biome and progression. Inventory contains icon slots, drag-and-drop crafting and stat allocation. Menus release the pointer; gameplay captures it.
 - `save`: versioned serde JSON with seed, player, inventory, progression, clock, and sparse edits. Atomic temp-file rename, explicit errors, periodic autosave and save on exit. Generated chunks are reconstructible and not serialized. Default save under `saves/`; CLI supports alternate path/seed and a headless smoke mode.
 
 ## Slice boundaries and evolution
@@ -34,11 +34,11 @@ The initial ECS is a small, single-archetype component store: generational entit
 
 Terrain chunks are 16x16x16. Stream radius is ten chunks horizontally (160 blocks along each axis). Each horizontal chunk column samples all 256 terrain heights and streams from one chunk below its lowest surface through its highest surface plus tree canopy, without clamping mountains to player elevation. A five-by-five horizontal area additionally streams two chunks above/below the player for cave exploration. Streaming replans on player chunk or radius changes and evicts chunks outside the desired set. Jobs are ordered by distance with deterministic ties; obsolete mesh jobs are discarded and remaining mesh jobs reprioritized near the player. Two persistent CPU workers generate chunk blocks and meshes together from a shared one-block halo. At most two jobs, including completed results, are outstanding per world; thus a redraw accepts/uploads at most two meshes. Workers receive immutable seed/local-edit snapshots and never access authoritative state or GPU resources. The main thread polls without waiting, accepts only still-desired results matching the current edit revision, and retries invalidated jobs. Revision checks are conservatively world-wide: unrelated edits can also trigger retries. Evicted results are discarded. Pending resident remeshes survive stream replanning; boundary edits invalidate diagonal neighbors for AO. Worker channels close and threads join on world destruction, bounded by outstanding jobs. Stream planning, priority sorting, edit snapshot copying and GPU uploads remain synchronous. Sampling is deterministic whether or not a chunk is resident. Surface heights are roughly 24–800, with mountain growth suppressed near spawn. The full legal range is -512..1535. Mountain surfaces within the view radius can render at any generated elevation. Horizontal fog fades between 112 and 160 blocks; the camera far plane is 1,024 blocks to include tall nearby peaks. Conservative chunk AABB tests independently cull camera and sun-shadow draws. CPU meshing uses a one-block halo with shared column height/tree data (324 column evaluations instead of up to 5,832 for an unloaded halo), shared-face culling and diagonal-aware corner AO. LOD and greedy meshing remain future performance work; this iteration retains exact voxel geometry and existing terrain generation/save compatibility. Rendering uses a 2048-square sun depth map with 3x3 comparison filtering, a day/night intensity cycle, fog, and the nearest sixteen warm torch lights. Held torches occupy one light slot. Placed torches expire after 600 simulation seconds, and placement is capped at 256 active torches.
 
-The owned GUI is an immediate-mode triangle builder with rectangle buttons, pointer hit regions, a built-in 5x7 font and resolution-aware scaling. The pack has inventory/equipment assignment, a recipe list showing station/ingredients, and attribute allocation. Menus and lost focus pause simulation. Recipes are instant transactional operations; furnace recipes consume ore and coal directly rather than having processing queues. Tables and furnaces must be within three blocks. A wood bedroll recipe substitutes for the later wool economy. Leaves supply berries as a renewable slice food source. Husks provide combat and meat; animals and audio are deferred. All visuals are code-native voxel geometry and glyphs, so no asset authoring tools or generated raster assets were used.
+The owned GUI is an immediate-mode triangle builder with rectangle buttons, pointer hit regions, a built-in 5x7 font and resolution-aware scaling. The pack has a 27-slot backpack, nine real hotbar slots, shaped crafting, a recipe pattern guide, a furnace view and attribute allocation. Menus and lost focus pause simulation. Recipes are instant transactional operations; furnace recipes consume ore and coal directly rather than having processing queues. Tables and furnaces must be within three blocks. A wood bedroll recipe substitutes for the later wool economy. Leaves supply berries as a renewable slice food source. Husks provide combat and meat; animals and audio are deferred. All visuals are code-native voxel geometry and glyphs, so no asset authoring tools or generated raster assets were used.
 
 Vigor adds 3 health per point; Strength adds 2.5% melee damage; Dexterity reduces the attack interval through a 1.5%-per-point speed multiplier; Agility modestly improves walking/jumping and reduces falls. Ingenuity grants one bonus output every `24 - points` crafts (only when allocated). All stats cap at 20. Wisdom and Willpower remain visible but cannot consume points before magic is implemented. First recipe XP is quartered per repeat to zero. First biome/resource discoveries grant XP once. Kill XP falls with player level and reaches zero for sufficiently weak enemies. Death restores the player at spawn and retains inventory. Temperature and magic are deferred.
 
-Saves use a synced temporary file followed by atomic rename. Unsupported versions, malformed JSON, invalid positions, inventory selection/count/wear, stat bounds and torch timer inconsistencies are rejected. Load failures preserve existing files. A failed save keeps the quit action from closing the window. Save format v1 currently requires the current recipe count; migrating changed registries will require an explicit version migration. Concurrent writers to the same save are not supported.
+Saves use a synced temporary file followed by atomic rename. Unsupported versions, malformed JSON, invalid positions, inventory selection/count/wear, stat bounds and torch timer inconsistencies are rejected. Load failures preserve existing files. A failed save keeps the quit action from closing the window. Save format v2 requires the current recipe count. Version 1 aggregate inventories migrate to real stacks on load; changed recipe registries will still require explicit migration. Concurrent writers to the same save are not supported.
 
 ## Developer tools and validation results
 
@@ -91,3 +91,54 @@ and queue sorting runs only when priorities change rather than every redraw.
 Regression coverage compares desired chunks and cached bounds to fresh worlds
 across negative coordinates, elevation changes, distant moves and radius changes.
 See PLAYTEST.md for timings, actual checks and limitations.
+
+## Slot inventory and shaped crafting
+
+Inventory now owns 36 actual slots: indices 0–8 are the hotbar and 9–35 are
+the backpack. Materials stack to 64; tools occupy individual slots and retain
+independent wear. All item icons are original 16x16 pixel shapes built directly
+as colored UI geometry, with material shading and details. No external assets
+or rendering dependencies are needed. Slot counts, durability bars, hover names,
+and a carried stack replace abbreviated item buttons. The HUD uses the same icons.
+
+Left-click picks up, places, merges or swaps a stack; pressing on a stack and
+releasing on another slot also moves it. Right-click picks up half (rounded up)
+or places one. Crafting outputs support click pickup and dragging to inventory.
+E opens/closes the pack; using a placed table/furnace opens its tab. Nearby-station
+tabs remain available within the existing station detection volume. The personal
+grid is 2x2, and a table exposes a separate 3x3 grid. Both use a fixed row stride
+of three; personal cells outside its 2x2 area must remain empty. Closing menus or changing tabs retains all inputs
+and the carried stack; these are serialized, including when saving from gameplay.
+
+Shaped matching requires empty cells around the pattern, permits translation
+within the grid and horizontal mirroring, and ignores stack sizes above one per
+occupied cell. Planks, sticks, tables, tools, torches, furnaces and swords use
+familiar arrangements. Wooden tools now require a table. Copper substitutes for
+other tool materials. The existing bedroll is custom: six planks across the top
+two rows, and logs in the bottom corners. The read-only recipe guide displays
+patterns and yields without inserting ingredients. Taking a valid output consumes
+one item per occupied cell, checks carried-stack compatibility/capacity first,
+and grants existing craft XP and Ingenuity rewards.
+
+Furnace input and fuel slots are separate from crafting. Copper ore or raw meat
+plus coal previews an ingot or cooked meat. Processing stays instant and consumes
+one input and one coal when output is taken; timed queues and persistent
+per-world-block furnace inventories remain future work. These input slots belong
+to the player, shared across furnace screens, rather than each placed furnace.
+
+Save v2 validates slot count, stack sizes and individual wear, including grid,
+furnace and carried stacks. V1 counts split into stacks, old hotbar preferences
+are mapped onto real items, and old wear is attached to the first matching tool.
+If the old inventory exceeds 36 slots, migration returns an explicit error and
+preserves the source file. Mining refuses to remove a resource when its drop
+cannot fit. Craft transactions refuse full output inventories without consumption.
+
+Validation: formatting, short Clippy with warnings denied, quiet nextest, smoke,
+and the expedition. The expedition now arranges actual crafting/furnace inputs
+and takes outputs through the same transaction as the UI. Regression coverage
+includes every recipe pattern/yield, offsets/mirroring/extra ingredients,
+stack splitting/merging/swapping, independent tool wear, full-output atomicity,
+furnace fuel validation, legacy migration and overflow preservation, held/input
+save roundtrips, invalid stacks, and scaled UI hit regions. A bounded native
+Vulkan pack capture rendered and exited cleanly; its layout was inspected.
+Live mouse ergonomics and prolonged play remain manual validation.

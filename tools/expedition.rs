@@ -17,7 +17,7 @@ fn aim(g: &mut Game, point: Vec3) {
     g.player.pitch = d.y.asin();
 }
 fn equip(g: &mut Game, item: Item) {
-    g.player.inventory.hotbar[0] = item;
+    g.player.inventory.equip(item, 0);
     g.player.inventory.selected = 0;
 }
 fn mine(g: &mut Game, block: Block, tool: Item, count: usize) -> Result<(), String> {
@@ -52,7 +52,43 @@ fn craft(g: &mut Game, output: Item, count: usize) -> Result<(), String> {
         .ok_or("Missing recipe")?;
     for _ in 0..count {
         let before = g.player.inventory.count(output);
-        g.craft(index);
+        let r = &RECIPES[index];
+        if r.station == crate::items::Station::Furnace {
+            for (n, &(item, count)) in r.inputs.iter().enumerate() {
+                require(
+                    g.player.inventory.take(item, count),
+                    "Missing furnace fixture ingredient",
+                )?;
+                g.player.inventory.furnace[n] = Some(crate::items::Stack::new(item, count));
+            }
+            g.craft_grid(2);
+        } else {
+            let grid = crate::items::recipe_grid(index);
+            for (n, s) in grid.into_iter().enumerate() {
+                if let Some(s) = s {
+                    require(
+                        g.player.inventory.take(s.item, 1),
+                        "Missing crafting fixture ingredient",
+                    )?;
+                    if r.station == crate::items::Station::Hand {
+                        g.player.inventory.hand[n] = Some(s);
+                    } else {
+                        g.player.inventory.grid[n] = Some(s);
+                    }
+                }
+            }
+            g.craft_grid(if r.station == crate::items::Station::Table {
+                1
+            } else {
+                0
+            });
+        }
+        if let Some(stack) = g.player.inventory.cursor.take() {
+            require(
+                g.player.inventory.add(stack.item, stack.count),
+                "Output did not fit inventory",
+            )?;
+        }
         require(
             g.player.inventory.count(output) > before,
             &format!("Craft failed: {}: {}", output.name(), g.message),

@@ -410,7 +410,7 @@ impl Renderer {
             .collect();
         torches.sort_by(|a, b| a.distance_squared(eye).total_cmp(&b.distance_squared(eye)));
         let held = g.player.inventory.selected() == crate::items::Item::Torch
-            && g.player.inventory.count(crate::items::Item::Torch) > 0;
+            && g.player.inventory.selected_count() > 0;
         let mut n = 0;
         if held {
             lights[0] = [eye.x, eye.y, eye.z, 1.];
