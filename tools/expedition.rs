@@ -55,11 +55,20 @@ fn craft(g: &mut Game, output: Item, count: usize) -> Result<(), String> {
         let r = &RECIPES[index];
         if r.station == crate::items::Station::Furnace {
             for (n, &(item, count)) in r.inputs.iter().enumerate() {
+                if item == Item::Coal
+                    && (g.player.inventory.furnace_joules >= crate::items::SMELT_JOULES
+                        || g.player.inventory.furnace[1].is_some())
+                {
+                    continue;
+                }
                 require(
                     g.player.inventory.take(item, count),
                     "Missing furnace fixture ingredient",
                 )?;
                 g.player.inventory.furnace[n] = Some(crate::items::Stack::new(item, count));
+            }
+            for _ in 0..crate::items::SMELT_TICKS {
+                g.tick_furnace();
             }
             g.craft_grid(2);
         } else {

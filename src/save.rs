@@ -232,9 +232,50 @@ mod inventory_migration_tests {
         g.player.inventory.grid[8] = Some(Stack::new(Item::Stick, 4));
         g.player.inventory.hand[3] = Some(Stack::new(Item::Coal, 2));
         g.player.inventory.furnace[0] = Some(Stack::new(Item::CopperOre, 5));
+        g.player.inventory.furnace_joules = 3_000;
+        for _ in 0..crate::items::SMELT_TICKS / 2 {
+            g.tick_furnace();
+        }
+        g.player.inventory.furnace_output = Some(Stack::new(Item::CopperIngot, 2));
         write(&g, &path).unwrap();
         let restored = read(&path).unwrap().unwrap();
         assert_eq!(restored.player.inventory, g.player.inventory);
+        let mut resumed = restored;
+        for _ in 0..crate::items::SMELT_TICKS / 2 {
+            resumed.tick_furnace();
+        }
+        assert_eq!(resumed.player.inventory.furnace_output.unwrap().count, 3);
+        assert_eq!(resumed.player.inventory.furnace_joules, 2_000);
+        let mut legacy: serde_json::Value =
+            serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        for field in [
+            "furnace_joules",
+            "furnace_progress",
+            "furnace_input",
+            "furnace_output",
+        ] {
+            legacy["player"]["inventory"]
+                .as_object_mut()
+                .unwrap()
+                .remove(field);
+        }
+        fs::write(&path, serde_json::to_vec(&legacy).unwrap()).unwrap();
+        assert_eq!(
+            read(&path)
+                .unwrap()
+                .unwrap()
+                .player
+                .inventory
+                .furnace_joules,
+            0
+        );
+        let legacy_inventory = read(&path).unwrap().unwrap().player.inventory;
+        assert_eq!(legacy_inventory.furnace_progress, 0);
+        assert_eq!(legacy_inventory.furnace_output, None);
+        g.player.inventory.furnace_joules = crate::items::COAL_JOULES + 1;
+        write(&g, &path).unwrap();
+        assert!(read(&path).is_err());
+        g.player.inventory.furnace_joules = 3_000;
         g.player.inventory.cursor.as_mut().unwrap().count = 65;
         write(&g, &path).unwrap();
         assert!(read(&path).is_err());

@@ -34,7 +34,7 @@ The initial ECS is a small, single-archetype component store: generational entit
 
 Terrain chunks are 16x16x16. Stream radius is ten chunks horizontally (160 blocks along each axis). Each horizontal chunk column samples all 256 terrain heights and streams from one chunk below its lowest surface through its highest surface plus tree canopy, without clamping mountains to player elevation. A five-by-five horizontal area additionally streams two chunks above/below the player for cave exploration. Streaming replans on player chunk or radius changes and evicts chunks outside the desired set. Jobs are ordered by distance with deterministic ties; obsolete mesh jobs are discarded and remaining mesh jobs reprioritized near the player. Two persistent CPU workers generate chunk blocks and meshes together from a shared one-block halo. At most two jobs, including completed results, are outstanding per world; thus a redraw accepts/uploads at most two meshes. Workers receive immutable seed/local-edit snapshots and never access authoritative state or GPU resources. The main thread polls without waiting, accepts only still-desired results matching the current edit revision, and retries invalidated jobs. Revision checks are conservatively world-wide: unrelated edits can also trigger retries. Evicted results are discarded. Pending resident remeshes survive stream replanning; boundary edits invalidate diagonal neighbors for AO. Worker channels close and threads join on world destruction, bounded by outstanding jobs. Stream planning, priority sorting, edit snapshot copying and GPU uploads remain synchronous. Sampling is deterministic whether or not a chunk is resident. Surface heights are roughly 24–800, with mountain growth suppressed near spawn. The full legal range is -512..1535. Mountain surfaces within the view radius can render at any generated elevation. Horizontal fog fades between 112 and 160 blocks; the camera far plane is 1,024 blocks to include tall nearby peaks. Conservative chunk AABB tests independently cull camera and sun-shadow draws. CPU meshing uses a one-block halo with shared column height/tree data (324 column evaluations instead of up to 5,832 for an unloaded halo), shared-face culling and diagonal-aware corner AO. LOD and greedy meshing remain future performance work; this iteration retains exact voxel geometry and existing terrain generation/save compatibility. Rendering uses a 2048-square sun depth map with 3x3 comparison filtering, a day/night intensity cycle, fog, and the nearest sixteen warm torch lights. Held torches occupy one light slot. Placed torches expire after 600 simulation seconds, and placement is capped at 256 active torches.
 
-The owned GUI is an immediate-mode triangle builder with rectangle buttons, pointer hit regions, a built-in 5x7 font and resolution-aware scaling. The pack has a 27-slot backpack, nine real hotbar slots, shaped crafting, a recipe pattern guide, a furnace view and attribute allocation. Menus and lost focus pause simulation. Recipes are instant transactional operations; furnace recipes consume ore and coal directly rather than having processing queues. Tables and furnaces must be within three blocks. A wood bedroll recipe substitutes for the later wool economy. Leaves supply berries as a renewable slice food source. Husks provide combat and meat; animals and audio are deferred. All visuals are code-native voxel geometry and glyphs, so no asset authoring tools or generated raster assets were used.
+The owned GUI is an immediate-mode triangle builder with rectangle buttons, pointer hit regions, a built-in 5x7 font and resolution-aware scaling. The pack has a 27-slot backpack, nine real hotbar slots, shaped crafting, a recipe pattern guide, a furnace view and attribute allocation. Escape menus and lost focus pause simulation. Opening the pack pauses movement and survival while furnace processing continues. Crafting recipes are instant transactions; furnaces process automatically over five seconds per item. Tables and furnaces must be within three blocks. A wood bedroll recipe substitutes for the later wool economy. Leaves supply berries as a renewable slice food source. Husks provide combat and meat; animals and audio are deferred. All visuals are code-native voxel geometry and glyphs, so no asset authoring tools or generated raster assets were used.
 
 Vigor adds 3 health per point; Strength adds 2.5% melee damage; Dexterity reduces the attack interval through a 1.5%-per-point speed multiplier; Agility modestly improves walking/jumping and reduces falls. Ingenuity grants one bonus output every `24 - points` crafts (only when allocated). All stats cap at 20. Wisdom and Willpower remain visible but cannot consume points before magic is implemented. First recipe XP is quartered per repeat to zero. First biome/resource discoveries grant XP once. Kill XP falls with player level and reaches zero for sufficiently weak enemies. Death restores the player at spawn and retains inventory. Temperature and magic are deferred.
 
@@ -121,10 +121,28 @@ one item per occupied cell, checks carried-stack compatibility/capacity first,
 and grants existing craft XP and Ingenuity rewards.
 
 Furnace input and fuel slots are separate from crafting. Copper ore or raw meat
-plus coal previews an ingot or cooked meat. Processing stays instant and consumes
-one input and one coal when output is taken; timed queues and persistent
-per-world-block furnace inventories remain future work. These input slots belong
-to the player, shared across furnace screens, rather than each placed furnace.
+smelts automatically in five seconds (300 fixed 60 Hz ticks) into a separate
+output stack. Taking output collects finished goods; it never starts a smelt.
+Output stacks to 64; a full or incompatible output pauses work without consuming
+fuel or energy. Input is consumed only on completion. Changing or removing the
+input type resets progress; fuel energy already used is not refunded. Replacing
+the same input type preserves progress.
+
+Coal adds 4,000 internal joules only when active work needs energy, powering four
+copper ingots or cooked meat at 1,000 joules each. Integer cumulative energy
+costs drain exactly 1,000 joules over each 300-tick smelt without rounding drift.
+Fuel insertion alone consumes nothing; idle furnaces retain their energy. The UI
+shows a loaded-fuel/remaining-energy bar, a smelting progress bar, and completed
+output. Escape menus and lost focus pause furnace processing too; opening the
+pack allows furnace-only fixed steps while the rest of gameplay remains paused.
+
+Input, fuel, output, energy, progress and tracked input type belong to the player,
+shared across furnace screens, rather than each placed furnace. Per-world-block
+furnace inventories remain future work. All processing state persists in saves;
+old v2 saves default the new fields to empty/zero. Stored energy is validated in
+0..=4,000 and progress below 300 ticks. Direct instant furnace crafting is disabled
+so it cannot bypass processing; the expedition advances the same furnace steps
+as gameplay. Craft XP is awarded once on completion, not on output collection.
 
 Save v2 validates slot count, stack sizes and individual wear, including grid,
 furnace and carried stacks. V1 counts split into stacks, old hotbar preferences
@@ -142,3 +160,10 @@ furnace fuel validation, legacy migration and overflow preservation, held/input
 save roundtrips, invalid stacks, and scaled UI hit regions. A bounded native
 Vulkan pack capture rendered and exited cleanly; its layout was inspected.
 Live mouse ergonomics and prolonged play remain manual validation.
+
+Timed furnace validation: formatting, short Clippy with warnings denied, quiet
+nextest, gameplay smoke, and expedition passed. Regression tests cover elapsed
+smelting time, four ingots per coal, blocked-output pause and collection atomicity,
+idle energy retention, input-type changes, cooking, saved progress/output/energy,
+old v2 defaults, and invalid energy. The updated furnace UI has not been checked
+in a native window for this change.

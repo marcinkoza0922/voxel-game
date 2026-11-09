@@ -176,7 +176,9 @@ impl Game {
             self.say("Required station is out of reach");
             return;
         }
-        if let Some(index) = items::take_output(&mut self.player.inventory, mode) {
+        if let Some(index) = items::take_output(&mut self.player.inventory, mode)
+            && mode != 2
+        {
             self.reward_craft(index);
         }
     }
@@ -288,7 +290,13 @@ impl Game {
             self.say("Place a bedroll nearby to sleep");
         }
     }
+    pub fn tick_furnace(&mut self) {
+        if let Some(index) = items::tick_furnace(&mut self.player.inventory) {
+            self.reward_craft(index);
+        }
+    }
     pub fn tick(&mut self, input: &Input, dt: f32) {
+        self.tick_furnace();
         self.time += dt / 900.;
         self.message_time = (self.message_time - dt).max(0.);
         self.attack_timer = (self.attack_timer - dt).max(0.);
@@ -721,9 +729,18 @@ mod tests {
         assert_eq!(g.player.inventory.count(Item::CopperIngot), 0);
         g.world.set(IVec3::new(-2, 100, 0), Block::Furnace);
         g.player.inventory.take(Item::Furnace, 1);
-        for _ in 0..3 {
-            g.craft(10);
+        g.player.inventory.furnace = [
+            Some(items::Stack::new(Item::CopperOre, 3)),
+            Some(items::Stack::new(Item::Coal, 1)),
+        ];
+        g.player.inventory.take(Item::CopperOre, 3);
+        g.player.inventory.take(Item::Coal, 1);
+        for _ in 0..3 * items::SMELT_TICKS {
+            g.tick_furnace();
         }
+        g.craft_grid(2);
+        let output = g.player.inventory.cursor.take().unwrap();
+        g.player.inventory.add(output.item, output.count);
         g.craft(13);
         assert_eq!(g.player.inventory.count(Item::CopperPick), 1);
         assert_eq!(g.player.inventory.count(Item::CopperOre), 0);

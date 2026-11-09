@@ -403,7 +403,7 @@ impl ApplicationHandler for App {
                 let dt = interval.as_secs_f32().min(0.1);
                 self.last = now;
                 self.fps = self.fps * 0.95 + 0.05 / dt.max(0.001);
-                if self.focused && !self.pack && !self.paused {
+                if self.focused && !self.paused {
                     self.accumulator += dt;
                     let pressed = |key| self.keys.contains(&key);
                     let input = Input {
@@ -416,7 +416,11 @@ impl ApplicationHandler for App {
                         attack: self.attack,
                     };
                     while self.accumulator >= STEP {
-                        self.game.tick(&input, STEP);
+                        if self.pack {
+                            self.game.tick_furnace();
+                        } else {
+                            self.game.tick(&input, STEP);
+                        }
                         self.accumulator -= STEP;
                     }
                     self.autosave += dt;

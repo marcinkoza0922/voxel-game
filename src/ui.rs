@@ -493,17 +493,59 @@ impl Ui {
                 Some(Action::Slot(46)),
                 false,
             );
-            self.text(x + 174., y + 191., ">", 2.5, INK);
-            let output = crate::items::furnace_recipe(inv)
-                .map(|n| Stack::new(RECIPES[n].output, RECIPES[n].amount));
+            self.rect(x + 150., y + 193., 65., 12., MUTED);
+            self.rect(
+                x + 150.,
+                y + 193.,
+                65. * inv.furnace_progress as f32 / crate::items::SMELT_TICKS as f32,
+                12.,
+                [0.95, 0.65, 0.2, 1.],
+            );
+            self.rect(x + 87., y + 279., 80., 8., MUTED);
+            let energy = inv.furnace_joules as f32 / crate::items::COAL_JOULES as f32;
+            let loaded = inv.furnace[1].is_some_and(|s| s.item == Item::Coal);
+            self.rect(
+                x + 87.,
+                y + 279.,
+                80. * if energy > 0. {
+                    energy
+                } else if loaded {
+                    1.
+                } else {
+                    0.
+                },
+                8.,
+                [0.95, 0.4, 0.12, 1.],
+            );
+            self.text(
+                x + 150.,
+                y + 215.,
+                &format!(
+                    "{}%",
+                    inv.furnace_progress * 100 / crate::items::SMELT_TICKS
+                ),
+                1.0,
+                MUTED,
+            );
+            let output = inv.furnace_output;
             self.stack_slot(
                 [x + 230., y + 179., 56., 56.],
                 output,
                 Some(Action::Output),
                 true,
             );
-            self.text(x + 322., y + 185., "Coal + ore or raw meat", 1.2, MUTED);
-            self.text(x + 322., y + 209., "Take output to process", 1.2, MUTED);
+            self.text(x + 322., y + 185., "1 coal fuels 4 smelts", 1.2, MUTED);
+            self.text(x + 322., y + 209., "5 seconds per item", 1.2, MUTED);
+            self.text(
+                x + 322.,
+                y + 233.,
+                &format!(
+                    "Energy: {}%",
+                    inv.furnace_joules * 100 / crate::items::COAL_JOULES
+                ),
+                1.2,
+                MUTED,
+            );
         }
         self.text(x + 24., y + 313., "INVENTORY", 1.6, INK);
         for row in 0..3 {

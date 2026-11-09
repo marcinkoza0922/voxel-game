@@ -142,6 +142,14 @@ pub struct Inventory {
     #[serde(default)]
     pub hand: [Option<Stack>; 9],
     pub furnace: [Option<Stack>; 2],
+    #[serde(default)]
+    pub furnace_joules: u32,
+    #[serde(default)]
+    pub furnace_output: Option<Stack>,
+    #[serde(default)]
+    pub furnace_progress: u32,
+    #[serde(default)]
+    pub furnace_input: Option<Item>,
     pub cursor: Option<Stack>,
 }
 impl Default for Inventory {
@@ -161,6 +169,10 @@ impl Inventory {
             grid: [None; 9],
             hand: [None; 9],
             furnace: [None; 2],
+            furnace_joules: 0,
+            furnace_output: None,
+            furnace_progress: 0,
+            furnace_input: None,
             cursor: None,
         }
     }
@@ -310,7 +322,14 @@ impl Inventory {
         self.set_slot(n, target);
     }
     pub fn valid(&self) -> bool {
-        self.selected < 9
+        self.furnace_joules <= COAL_JOULES
+            && self.furnace_progress < SMELT_TICKS
+            && (self.furnace_progress == 0
+                || matches!(self.furnace_input, Some(Item::CopperOre | Item::Meat)))
+            && self
+                .furnace_output
+                .is_none_or(|s| matches!(s.item, Item::CopperIngot | Item::CookedMeat))
+            && self.selected < 9
             && self.slots.len() == 36
             && [2, 5, 6, 7, 8].into_iter().all(|n| self.hand[n].is_none())
             && self
@@ -320,6 +339,7 @@ impl Inventory {
                 .chain(self.hand.iter())
                 .chain(self.furnace.iter())
                 .chain(std::iter::once(&self.cursor))
+                .chain(std::iter::once(&self.furnace_output))
                 .flatten()
                 .all(|s| {
                     s.count > 0
@@ -459,6 +479,9 @@ pub fn craft(
     if (r.station == Station::Table && !table) || (r.station == Station::Furnace && !furnace) {
         return Err("Place the required station nearby");
     }
+    if r.station == Station::Furnace {
+        return Err("Put input and fuel in the furnace to smelt");
+    }
     if r.inputs.iter().any(|(i, n)| inv.count(*i) < *n) {
         return Err("Missing ingredients");
     }
@@ -577,19 +600,71 @@ pub fn grid_recipe(grid: &[Option<Stack>; 9], size: usize) -> Option<usize> {
         })
     })
 }
+pub const COAL_JOULES: u32 = 4_000;
+pub const SMELT_JOULES: u32 = 1_000;
+pub const SMELT_TICKS: u32 = 5 * 60;
+
 pub fn furnace_recipe(inv: &Inventory) -> Option<usize> {
-    if inv.furnace[1]?.item != Item::Coal {
-        return None;
-    }
     match inv.furnace[0]?.item {
         Item::CopperOre => Some(10),
         Item::Meat => Some(11),
         _ => None,
     }
 }
+/// Advance one 60 Hz simulation step. Energy drains only while work advances.
+pub fn tick_furnace(inv: &mut Inventory) -> Option<usize> {
+    let input = inv.furnace[0].map(|s| s.item);
+    if inv.furnace_input != input {
+        inv.furnace_progress = 0;
+        inv.furnace_input = input;
+    }
+    let index = furnace_recipe(inv)?;
+    let r = &RECIPES[index];
+    if inv
+        .furnace_output
+        .is_some_and(|s| s.item != r.output || s.count + r.amount > Stack::limit(s.item))
+    {
+        return None;
+    }
+    let next = inv.furnace_progress + 1;
+    let cost =
+        next * SMELT_JOULES / SMELT_TICKS - inv.furnace_progress * SMELT_JOULES / SMELT_TICKS;
+    if inv.furnace_joules < cost {
+        let fuel = inv.furnace[1].as_mut()?;
+        if fuel.item != Item::Coal {
+            return None;
+        }
+        fuel.count -= 1;
+        if fuel.count == 0 {
+            inv.furnace[1] = None;
+        }
+        inv.furnace_joules += COAL_JOULES;
+    }
+    inv.furnace_joules -= cost;
+    inv.furnace_progress = next;
+    if next < SMELT_TICKS {
+        return None;
+    }
+    let input = inv.furnace[0].as_mut().expect("valid recipe has input");
+    input.count -= 1;
+    if input.count == 0 {
+        inv.furnace[0] = None;
+    }
+    if let Some(output) = &mut inv.furnace_output {
+        output.count += r.amount;
+    } else {
+        inv.furnace_output = Some(Stack::new(r.output, r.amount));
+    }
+    inv.furnace_progress = 0;
+    Some(index)
+}
 pub fn take_output(inv: &mut Inventory, mode: u8) -> Option<usize> {
     let index = if mode == 2 {
-        furnace_recipe(inv)?
+        match inv.furnace_output?.item {
+            Item::CopperIngot => 10,
+            Item::CookedMeat => 11,
+            _ => return None,
+        }
     } else {
         grid_recipe(
             if mode == 0 { &inv.hand } else { &inv.grid },
@@ -597,19 +672,26 @@ pub fn take_output(inv: &mut Inventory, mode: u8) -> Option<usize> {
         )?
     };
     let r = &RECIPES[index];
+    let amount = if mode == 2 {
+        inv.furnace_output?.count
+    } else {
+        r.amount
+    };
     if let Some(c) = inv.cursor
-        && (c.item != r.output || c.wear != 0 || c.count + r.amount > Stack::limit(c.item))
+        && (c.item != r.output || c.wear != 0 || c.count + amount > Stack::limit(c.item))
     {
         return None;
     }
     if let Some(c) = &mut inv.cursor {
-        c.count += r.amount;
+        c.count += amount;
     } else {
-        inv.cursor = Some(Stack::new(r.output, r.amount));
+        inv.cursor = Some(Stack::new(r.output, amount));
     }
-    let slots: &mut [Option<Stack>] = if mode == 2 {
-        &mut inv.furnace
-    } else if mode == 0 {
+    if mode == 2 {
+        inv.furnace_output = None;
+        return Some(index);
+    }
+    let slots: &mut [Option<Stack>] = if mode == 0 {
         &mut inv.hand
     } else {
         &mut inv.grid
@@ -718,20 +800,86 @@ mod slot_tests {
         assert_eq!(inv, before);
     }
     #[test]
-    fn furnace_consumes_only_valid_input_and_fuel_when_output_taken() {
+    fn timed_furnace_uses_one_coal_for_four_ingots() {
+        let mut inv = Inventory::empty();
+        inv.furnace = [
+            Some(Stack::new(Item::CopperOre, 5)),
+            Some(Stack::new(Item::Coal, 1)),
+        ];
+        assert_eq!(take_output(&mut inv, 2), None);
+        assert_eq!(inv.furnace[1].unwrap().count, 1);
+        for count in 1..=4 {
+            for _ in 0..SMELT_TICKS - 1 {
+                assert_eq!(tick_furnace(&mut inv), None);
+            }
+            assert_eq!(inv.furnace_output.map(|s| s.count).unwrap_or(0), count - 1);
+            assert_eq!(tick_furnace(&mut inv), Some(10));
+            assert_eq!(inv.furnace_joules, (4 - count) * SMELT_JOULES);
+        }
+        assert_eq!(inv.furnace_output, Some(Stack::new(Item::CopperIngot, 4)));
+        let before = inv.clone();
+        for _ in 0..SMELT_TICKS {
+            assert_eq!(tick_furnace(&mut inv), None);
+        }
+        assert_eq!(inv, before);
+        assert_eq!(take_output(&mut inv, 2), Some(10));
+        assert_eq!(inv.cursor, Some(Stack::new(Item::CopperIngot, 4)));
+        assert_eq!(inv.furnace_output, None);
+    }
+    #[test]
+    fn furnace_pauses_for_full_output_and_preserves_collection_failures() {
         let mut inv = Inventory::empty();
         inv.furnace = [
             Some(Stack::new(Item::CopperOre, 2)),
-            Some(Stack::new(Item::Log, 2)),
+            Some(Stack::new(Item::Coal, 1)),
         ];
+        for _ in 0..SMELT_TICKS / 2 {
+            tick_furnace(&mut inv);
+        }
+        assert!(inv.furnace_joules > 3_000 && inv.furnace_joules < 4_000);
+        inv.furnace_output = Some(Stack::new(Item::CopperIngot, 64));
         let before = inv.clone();
-        assert_eq!(take_output(&mut inv, 2), None);
+        for _ in 0..SMELT_TICKS {
+            tick_furnace(&mut inv);
+        }
         assert_eq!(inv, before);
-        inv.furnace[1] = Some(Stack::new(Item::Coal, 2));
+        inv.cursor = Some(Stack::new(Item::Log, 1));
+        assert_eq!(take_output(&mut inv, 2), None);
+        inv.cursor = None;
         assert_eq!(take_output(&mut inv, 2), Some(10));
-        assert_eq!(inv.furnace[0].unwrap().count, 1);
-        assert_eq!(inv.furnace[1].unwrap().count, 1);
-        assert_eq!(inv.cursor, Some(Stack::new(Item::CopperIngot, 1)));
+        for _ in 0..SMELT_TICKS / 2 {
+            tick_furnace(&mut inv);
+        }
+        assert_eq!(inv.furnace_output, Some(Stack::new(Item::CopperIngot, 1)));
+        assert_eq!(inv.furnace_joules, 3_000);
+    }
+    #[test]
+    fn idle_furnace_and_changed_inputs_do_not_waste_fuel_or_transfer_progress() {
+        let mut inv = Inventory::empty();
+        inv.furnace[1] = Some(Stack::new(Item::Coal, 1));
+        let before = inv.clone();
+        for _ in 0..SMELT_TICKS {
+            tick_furnace(&mut inv);
+        }
+        assert_eq!(inv, before);
+        inv.furnace[0] = Some(Stack::new(Item::CopperOre, 1));
+        for _ in 0..SMELT_TICKS / 2 {
+            tick_furnace(&mut inv);
+        }
+        let energy = inv.furnace_joules;
+        inv.furnace[0] = Some(Stack::new(Item::Meat, 1));
+        tick_furnace(&mut inv);
+        assert_eq!(inv.furnace_progress, 1);
+        assert!(inv.furnace_joules <= energy);
+        for _ in 1..SMELT_TICKS {
+            tick_furnace(&mut inv);
+        }
+        assert_eq!(inv.furnace_output, Some(Stack::new(Item::CookedMeat, 1)));
+        let energy = inv.furnace_joules;
+        for _ in 0..SMELT_TICKS {
+            tick_furnace(&mut inv);
+        }
+        assert_eq!(inv.furnace_joules, energy);
     }
     #[test]
     fn personal_and_table_inputs_are_independent() {
