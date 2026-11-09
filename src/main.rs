@@ -3,6 +3,7 @@ mod game;
 mod items;
 mod render;
 mod save;
+mod streaming;
 mod ui;
 mod world;
 

@@ -5,10 +5,7 @@ use crate::{
 };
 use bytemuck::{Pod, Zeroable};
 use glam::{IVec3, Mat4, Vec3};
-use std::{
-    collections::{HashMap, HashSet, VecDeque},
-    sync::Arc,
-};
+use std::{collections::HashMap, sync::Arc};
 use wgpu::util::DeviceExt;
 use winit::window::Window;
 
@@ -58,8 +55,6 @@ pub struct Renderer {
     depth: wgpu::TextureView,
     shadow: wgpu::TextureView,
     meshes: HashMap<IVec3, Mesh>,
-    pending: VecDeque<IVec3>,
-    queued: HashSet<IVec3>,
     pub ui: Ui,
     pub width: u32,
     pub height: u32,
@@ -331,8 +326,6 @@ impl Renderer {
             depth,
             shadow,
             meshes: HashMap::new(),
-            pending: VecDeque::new(),
-            queued: HashSet::new(),
             ui: Ui::new(),
         })
     }
@@ -355,46 +348,26 @@ impl Renderer {
         for k in w.stream(pos, VIEW_RADIUS) {
             self.meshes.remove(&k);
         }
-        for k in w.dirty.drain(..) {
-            if self.queued.insert(k) {
-                self.pending.push_back(k);
+        for (k, data) in std::mem::take(&mut w.meshes) {
+            if !w.loaded(k) {
+                continue;
             }
-        }
-        self.pending.retain(|k| w.loaded(*k));
-        self.queued.retain(|k| w.loaded(*k));
-        self.pending.make_contiguous().sort_by_key(|k| {
-            (*k * SIZE + IVec3::splat(SIZE / 2))
-                .as_vec3()
-                .distance_squared(pos) as i64
-        });
-        let started = std::time::Instant::now();
-        for job in 0..3 {
-            if job > 0 && started.elapsed() >= std::time::Duration::from_millis(3) {
-                break;
-            }
-            if let Some(k) = self.pending.pop_front() {
-                self.queued.remove(&k);
-                if !w.loaded(k) {
-                    continue;
-                }
-                let data = mesh_chunk(w, k);
-                if data.is_empty() {
-                    self.meshes.remove(&k);
-                } else {
-                    self.meshes.insert(
-                        k,
-                        Mesh {
-                            buffer: self.device.create_buffer_init(
-                                &wgpu::util::BufferInitDescriptor {
-                                    label: Some("Chunk mesh"),
-                                    contents: bytemuck::cast_slice(&data),
-                                    usage: wgpu::BufferUsages::VERTEX,
-                                },
-                            ),
-                            count: data.len() as u32,
-                        },
-                    );
-                }
+            if data.is_empty() {
+                self.meshes.remove(&k);
+            } else {
+                self.meshes.insert(
+                    k,
+                    Mesh {
+                        buffer: self
+                            .device
+                            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                                label: Some("Chunk mesh"),
+                                contents: bytemuck::cast_slice(&data),
+                                usage: wgpu::BufferUsages::VERTEX,
+                            }),
+                        count: data.len() as u32,
+                    },
+                );
             }
         }
     }
@@ -710,10 +683,12 @@ fn chunk_visible(view: Mat4, key: IVec3) -> bool {
         })
     })
 }
+#[cfg(test)]
 pub fn mesh_chunk(w: &World, k: IVec3) -> Vec<Vertex> {
+    mesh_halo(w.seed, k, &w.halo(k))
+}
+pub fn mesh_halo(seed: u64, k: IVec3, halo: &[Block]) -> Vec<Vertex> {
     let base = k * SIZE;
-    // One-block halo avoids repeated terrain queries during face and AO lookup.
-    let halo = w.halo(k);
     let idx = |p: IVec3| ((p.x + 1) + 18 * ((p.z + 1) + 18 * (p.y + 1))) as usize;
     let get = |p: IVec3| halo[idx(p)];
     let mut out = vec![];
@@ -765,7 +740,7 @@ pub fn mesh_chunk(w: &World, k: IVec3) -> Vec<Vertex> {
                             color = Block::Dirt.color();
                         }
                         let variation = 0.94
-                            + (crate::world::hash(w.seed, base.x + x, base.y + y, base.z + z) % 11)
+                            + (crate::world::hash(seed, base.x + x, base.y + y, base.z + z) % 11)
                                 as f32
                                 * 0.01;
                         vertices[i].color = color.map(|c| c * (1. - ao as f32 * 0.16) * variation);
