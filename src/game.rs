@@ -98,7 +98,16 @@ pub struct Input {
     pub sprint: bool,
     pub attack: bool,
 }
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct WorldDrop {
+    #[serde(default)]
+    pub velocity: [f32; 3],
+    pub pos: [f32; 3],
+    pub item: Item,
+    pub count: u32,
+}
 pub struct Game {
+    pub drops: Vec<WorldDrop>,
     pub feedback: crate::feedback::Feedback,
     pub world: World,
     pub player: Player,
@@ -122,6 +131,7 @@ impl Game {
         let world = World::new(seed);
         let player = Player::new(&world);
         Self {
+            drops: Vec::new(),
             feedback: Default::default(),
             world,
             player,
@@ -379,6 +389,94 @@ impl Game {
         }
     }
 
+    fn tick_drops(&mut self, dt: f32) {
+        let player = Vec3::from_array(self.player.pos);
+        // Short sweeps keep fast falls from crossing an entire voxel.
+        for drop in &mut self.drops {
+            let mut pos = Vec3::from_array(drop.pos);
+            let mut velocity = Vec3::from_array(drop.velocity);
+            let nearest = Vec3::new(player.x, pos.y.clamp(player.y, player.y + 1.8), player.z);
+            let target = Vec3::new(
+                player.x,
+                pos.y.clamp(player.y + 0.45, player.y + 1.35),
+                player.z,
+            );
+            let mut capacity = self.player.inventory.clone();
+            if pos.distance_squared(nearest) <= 1.4 * 1.4 && capacity.add(drop.item, drop.count) {
+                // Steer toward the body quickly, with a capped final step so
+                // the drop cannot overshoot the pickup region.
+                let offset = target - pos;
+                let desired = offset.normalize_or_zero() * 7.;
+                velocity = velocity.lerp(desired, (dt * 18.).min(1.));
+                velocity = velocity.clamp_length_max(offset.length() / dt.max(0.0001));
+            } else {
+                velocity.y = (velocity.y - 18. * dt).max(-24.);
+            }
+            let steps = ((velocity.length() * dt / 0.1).ceil() as usize).max(1);
+            for _ in 0..steps {
+                for axis in [0, 2, 1] {
+                    let delta = velocity[axis] * dt / steps as f32;
+                    let mut next = pos;
+                    next[axis] += delta;
+                    if drop_collides(&self.world, next) {
+                        // Resolve to the surface so resting drops do not hover
+                        // at a distance determined by their last fall speed.
+                        let mut low = 0.;
+                        let mut high = 1.;
+                        for _ in 0..12 {
+                            let fraction = (low + high) * 0.5;
+                            let mut probe = pos;
+                            probe[axis] += delta * fraction;
+                            if drop_collides(&self.world, probe) {
+                                high = fraction;
+                            } else {
+                                low = fraction;
+                            }
+                        }
+                        pos[axis] += delta * low;
+                        if axis == 1 && velocity.y < -1.5 {
+                            velocity.y *= -0.28;
+                            velocity.x *= 0.55;
+                            velocity.z *= 0.55;
+                        } else {
+                            velocity[axis] = 0.;
+                            if axis == 1 {
+                                velocity.x *= 0.8;
+                                velocity.z *= 0.8;
+                            }
+                        }
+                    } else {
+                        pos = next;
+                    }
+                }
+            }
+            drop.pos = pos.to_array();
+            drop.velocity = velocity.to_array();
+        }
+    }
+
+    pub fn collect_drops(&mut self) {
+        let player = Vec3::from_array(self.player.pos);
+        let mut collected = false;
+        self.drops.retain(|drop| {
+            let p = Vec3::from_array(drop.pos);
+            let nearest = Vec3::new(player.x, p.y.clamp(player.y, player.y + 1.8), player.z);
+            if p.distance_squared(nearest) <= 0.35 * 0.35
+                && self.player.inventory.add(drop.item, drop.count)
+            {
+                collected = true;
+                self.player
+                    .discover(format!("resource:{}", drop.item.name()), 15);
+                false
+            } else {
+                true
+            }
+        });
+        if collected {
+            self.feedback.sound(crate::feedback::Cue::Pickup);
+        }
+    }
+
     pub fn tick(&mut self, input: &Input, dt: f32) {
         let previous_health = self.player.health;
         self.feedback.tick(dt);
@@ -444,6 +542,8 @@ impl Game {
             }
         }
         self.player.pos = pos.to_array();
+        self.tick_drops(dt);
+        self.collect_drops();
         self.player.hunger =
             (self.player.hunger - dt * if input.sprint { 0.12 } else { 0.055 }).max(0.);
         self.player.rest = (self.player.rest - dt * 0.035).max(0.);
@@ -524,7 +624,7 @@ impl Game {
                 m.health -= damage;
                 m.pos += Vec3::new(dir.x, 0., dir.z) * 0.4;
                 if m.health <= 0. {
-                    killed = Some(m.level);
+                    killed = Some((m.level, m.pos));
                 }
             }
             self.feedback.hit = 0.18;
@@ -533,7 +633,7 @@ impl Game {
             if equipped {
                 self.player.inventory.damage_tool(selected);
             }
-            if let Some(level) = killed {
+            if let Some((level, pos)) = killed {
                 self.entities.despawn(id);
                 let xp = if self.player.level > level + 5 {
                     0
@@ -541,7 +641,12 @@ impl Game {
                     25 / (1 + self.player.level.saturating_sub(level))
                 };
                 self.player.gain(xp);
-                self.player.inventory.add(Item::Meat, 2);
+                self.drops.push(WorldDrop {
+                    velocity: [0.6, 2.5, -0.4],
+                    pos: (pos + Vec3::Y * 0.6).to_array(),
+                    item: Item::Meat,
+                    count: 2,
+                });
                 self.say(format!("Husk defeated (+{xp} XP)"));
             }
             return;
@@ -627,11 +732,12 @@ impl Game {
                 _ => None,
             };
             if let Some(i) = drop {
-                if !self.player.inventory.add(i, 1) {
-                    self.say("Inventory full: make room before mining");
-                    return;
-                }
-                self.player.discover(format!("resource:{}", i.name()), 15);
+                self.drops.push(WorldDrop {
+                    velocity: [0.6, 2.5, -0.4],
+                    pos: (p.as_vec3() + Vec3::splat(0.5)).to_array(),
+                    item: i,
+                    count: 1,
+                });
             }
             self.feedback.sound(crate::feedback::Cue::Break);
             self.feedback
@@ -719,6 +825,21 @@ impl Game {
         self.world.biome(p.x as i32, p.z as i32)
     }
 }
+fn drop_collides(world: &World, pos: Vec3) -> bool {
+    let min = (pos - Vec3::splat(0.2)).floor().as_ivec3();
+    let max = (pos + Vec3::splat(0.2)).floor().as_ivec3();
+    for x in min.x..=max.x {
+        for y in min.y..=max.y {
+            for z in min.z..=max.z {
+                if world.get(IVec3::new(x, y, z)).solid() {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
 pub fn overlaps(pos: Vec3, b: IVec3) -> bool {
     pos.x + 0.29 > b.x as f32
         && pos.x - 0.29 < (b.x + 1) as f32
@@ -815,6 +936,136 @@ mod tests {
         assert!(!collides(&g.world, Vec3::from_array(g.player.pos)));
     }
     #[test]
+    fn drops_fall_bounce_settle_and_land_again_when_support_is_removed() {
+        let mut g = sky_fixture();
+        g.player.pos = [20., 100., 20.];
+        for x in -3..=3 {
+            for z in -3..=3 {
+                g.world.set(IVec3::new(x, 100, z), Block::Stone);
+            }
+        }
+        g.drops.push(WorldDrop {
+            pos: [0.5, 104., 0.5],
+            velocity: [0., 0., 0.],
+            item: Item::Log,
+            count: 1,
+        });
+        let mut bounced = false;
+        for _ in 0..240 {
+            g.tick_drops(STEP);
+            bounced |= g.drops[0].velocity[1] > 0.;
+            assert!(!drop_collides(&g.world, Vec3::from_array(g.drops[0].pos)));
+        }
+        assert!(bounced);
+        assert!((g.drops[0].pos[1] - 101.2).abs() < 0.002);
+        assert_eq!(g.drops[0].velocity[1], 0.);
+        g.world.set(IVec3::new(0, 100, 0), Block::Air);
+        for _ in 0..20 {
+            g.tick_drops(STEP);
+        }
+        assert!(g.drops[0].pos[1] < 101.);
+    }
+
+    #[test]
+    fn fast_drops_collide_with_walls_without_tunneling() {
+        let mut g = sky_fixture();
+        g.world.set(IVec3::new(1, 103, 0), Block::Stone);
+        g.drops.push(WorldDrop {
+            pos: [0.5, 103.5, 0.5],
+            velocity: [24., 0., 0.],
+            item: Item::Log,
+            count: 1,
+        });
+        g.tick_drops(0.1);
+        assert!(g.drops[0].pos[0] <= 0.8);
+        assert_eq!(g.drops[0].velocity[0], 0.);
+    }
+
+    #[test]
+    fn nearby_drops_pull_in_before_collection_and_sound() {
+        let mut g = sky_fixture();
+        g.player.pos = [0.5, 100., 0.5];
+        g.drops.push(WorldDrop {
+            pos: [1.7, 101., 0.5],
+            velocity: [0.; 3],
+            item: Item::Log,
+            count: 1,
+        });
+        g.collect_drops();
+        assert_eq!(g.drops.len(), 1);
+        assert!(g.feedback.sounds.is_empty());
+        g.tick_drops(STEP);
+        assert!(g.drops[0].pos[0] < 1.7);
+        assert!(g.drops[0].pos[0] > 0.85);
+        for _ in 0..60 {
+            g.tick_drops(STEP);
+            g.collect_drops();
+            if g.drops.is_empty() {
+                break;
+            }
+        }
+        assert!(g.drops.is_empty());
+        assert_eq!(g.player.inventory.count(Item::Log), 1);
+        assert_eq!(
+            g.feedback
+                .sounds
+                .iter()
+                .filter(|c| matches!(c, crate::feedback::Cue::Pickup))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn full_inventory_disables_drop_attraction() {
+        let mut g = sky_fixture();
+        g.player.pos = [0.5, 100., 0.5];
+        g.player
+            .inventory
+            .slots
+            .fill(Some(items::Stack::new(Item::Dirt, 64)));
+        g.drops.push(WorldDrop {
+            pos: [1.7, 101., 0.5],
+            velocity: [0.; 3],
+            item: Item::Log,
+            count: 1,
+        });
+        g.tick_drops(STEP);
+        g.collect_drops();
+        assert_eq!(g.drops[0].pos[0], 1.7);
+        assert!(g.drops[0].velocity[1] < 0.);
+        assert!(g.feedback.sounds.is_empty());
+    }
+
+    #[test]
+    fn drops_wait_for_proximity_and_inventory_space() {
+        let mut g = sky_fixture();
+        let p = IVec3::new(0, 101, -2);
+        g.world.set(p, Block::Dirt);
+        for slot in &mut g.player.inventory.slots {
+            *slot = Some(items::Stack::new(Item::Dirt, 64));
+        }
+        g.target = Some((p, p + IVec3::Z));
+        g.attack(5.);
+        assert_eq!(g.world.get(p), Block::Air);
+        assert_eq!(g.drops.len(), 1);
+        g.collect_drops();
+        assert_eq!(g.drops.len(), 1);
+        g.player.inventory.slots[0] = None;
+        g.collect_drops();
+        assert_eq!(g.drops.len(), 1);
+        g.player.pos = [0.5, 100., -1.5];
+        g.collect_drops();
+        assert!(g.drops.is_empty());
+        assert_eq!(g.player.inventory.count(Item::Dirt), 35 * 64 + 1);
+        assert!(
+            g.player
+                .discoveries
+                .contains(&format!("resource:{}", Item::Dirt.name()))
+        );
+    }
+
+    #[test]
     fn copper_requires_stone_pick_and_yields_ore() {
         let mut g = sky_fixture();
         let p = IVec3::new(0, 101, -2);
@@ -830,7 +1081,8 @@ mod tests {
         g.player.inventory.equip(Item::StonePick, 1);
         g.attack(5.);
         assert_eq!(g.world.get(p), Block::Air);
-        assert_eq!(g.player.inventory.count(Item::CopperOre), 1);
+        assert_eq!(g.player.inventory.count(Item::CopperOre), 0);
+        assert_eq!(g.drops[0].item, Item::CopperOre);
         assert!(!g.feedback.particles.is_empty());
         assert!(
             g.feedback
@@ -999,7 +1251,8 @@ mod placed_furnace_tests {
         g.attack(10.);
         assert_eq!(g.world.get(p), Block::Air);
         assert!(!g.furnaces.contains_key(&p.to_array()));
-        assert_eq!(g.player.inventory.count(Item::Furnace), 1);
+        assert_eq!(g.player.inventory.count(Item::Furnace), 0);
+        assert_eq!(g.drops[0].item, Item::Furnace);
     }
 
     #[test]

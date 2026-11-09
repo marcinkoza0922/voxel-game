@@ -9,6 +9,7 @@ pub enum Cue {
     Hit,
     Hurt,
     Swing,
+    Pickup,
 }
 pub struct Particle {
     pub pos: Vec3,

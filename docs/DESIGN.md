@@ -150,8 +150,7 @@ Save v2 validates slot count, stack sizes and individual wear, including grid,
 furnace and carried stacks. V1 counts split into stacks, old hotbar preferences
 are mapped onto real items, and old wear is attached to the first matching tool.
 If the old inventory exceeds 36 slots, migration returns an explicit error and
-preserves the source file. Mining refuses to remove a resource when its drop
-cannot fit. Craft transactions refuse full output inventories without consumption.
+preserves the source file. Mining leaves resource drops in the world until collected. Craft transactions refuse full output inventories without consumption.
 
 Validation: formatting, short Clippy with warnings denied, quiet nextest, smoke,
 and the expedition. The expedition now arranges actual crafting/furnace inputs
@@ -283,3 +282,28 @@ active save path. Resume a selected file with the existing --save option.
 provided. --save chooses its parent directory; it never overwrites that path.
 Regression coverage checks distinct new saves, seeds on reload and preservation
 of existing files. Native menu interaction still requires a desktop playtest.
+
+
+## Floating world drops
+
+Breaking blocks and defeating creatures creates persistent item drops at the
+source position. Drops render as camera-facing versions of the inventory icons,
+with a gentle bob, terrain depth testing and an 80-block draw limit. Drops launch with a small upward and sideways impulse, fall under gravity,
+and collide with solid voxels using a 0.4-block box. Substeps prevent tunneling;
+impacts lose energy, giving a small bounce before settling. Removing support
+makes settled drops fall again. Icons retain a subtle hover bob above their
+physical position. Drops have no expiry. Within 1.4 blocks of the player body,
+drops that fit in inventory steer toward the player at up to seven blocks per
+second, retaining voxel collisions. They enter inventory only within 0.35 blocks
+of the body, so attraction is visible before collection. Attraction replaces
+gravity while in range; leaving range or filling the inventory restores gravity.
+Resource discovery XP is awarded on collection. Full inventories leave drops
+untouched and do not prevent mining; each drop transfers atomically.
+World drops are stored in saves with validated positions, velocities and stack counts.
+Older drops without velocity load at rest.
+Existing saves default to an empty drop list. Pausing freezes animation and pickup.
+Smoke and expedition helpers explicitly approach their fixture loot.
+
+Successful world-item collection queues a short, bright rising pickup tone through
+the existing audio worker. Multiple drops collected in one step share one cue;
+out-of-range drops and pickups blocked by a full inventory remain silent.

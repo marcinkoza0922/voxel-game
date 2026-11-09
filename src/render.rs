@@ -466,6 +466,27 @@ impl Renderer {
                 );
             }
         }
+        let mut icon = Ui::new();
+        icon.width = 16.;
+        icon.height = 16.;
+        let right = Vec3::new(g.player.yaw.cos(), 0., g.player.yaw.sin());
+        let normal = right.cross(Vec3::Y);
+        for drop in &g.drops {
+            let pos = Vec3::from_array(drop.pos);
+            if pos.distance_squared(eye) > 80. * 80. {
+                continue;
+            }
+            icon.vertices.clear();
+            icon.icon(0., 0., drop.item, 1.);
+            let center = pos + Vec3::Y * (0.14 + 0.04 * (g.feedback.clock * 2.5 + pos.x).sin());
+            for v in &icon.vertices {
+                dynamic.push(Vertex {
+                    pos: (center + right * v.pos[0] * 0.3 + Vec3::Y * v.pos[1] * 0.3).to_array(),
+                    normal: normal.to_array(),
+                    color: [v.color[0], v.color[1], v.color[2]],
+                });
+            }
+        }
         for particle in &g.feedback.particles {
             let size = 0.045 * (particle.life / 0.15).min(1.);
             box_mesh(

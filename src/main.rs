@@ -613,6 +613,10 @@ fn smoke() -> Result<(), String> {
             STEP,
         );
     }
+    if let Some(drop) = g.drops.first() {
+        g.player.pos = (glam::Vec3::from_array(drop.pos) - glam::Vec3::Y).to_array();
+    }
+    g.collect_drops();
     if g.player.inventory.count(items::Item::Log) == 0 {
         return Err("Mining did not yield a log".into());
     }

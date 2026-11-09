@@ -38,6 +38,10 @@ fn mine(g: &mut Game, block: Block, tool: Item, count: usize) -> Result<(), Stri
                 break;
             }
         }
+        let origin = g.player.pos;
+        g.player.pos = (p.as_vec3() + Vec3::new(0.5, -1., 0.5)).to_array();
+        g.collect_drops();
+        g.player.pos = origin;
         require(
             g.world.get(p) == Block::Air,
             "Could not mine fixture resource",
@@ -176,6 +180,12 @@ pub fn run() -> Result<(), String> {
             },
             STEP,
         );
+        if let Some(drop) = g.drops.iter().find(|d| d.item == Item::Meat) {
+            let origin = g.player.pos;
+            g.player.pos = (Vec3::from_array(drop.pos) - Vec3::Y * 0.6).to_array();
+            g.collect_drops();
+            g.player.pos = origin;
+        }
         if g.player.inventory.count(Item::Meat) > before {
             break;
         }

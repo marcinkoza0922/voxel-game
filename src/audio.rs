@@ -82,6 +82,7 @@ fn stream_audio(receiver: mpsc::Receiver<(Cue, Instant)>, output: &mut impl Writ
                     Cue::Hit => (130., 25., 0.55),
                     Cue::Hurt => (65., 14., 0.3),
                     Cue::Swing => (420., 40., 1.),
+                    Cue::Pickup => (1050. + 3500. * t.min(0.08), 32., 0.02),
                 };
                 noise = noise.wrapping_mul(1664525).wrapping_add(1013904223);
                 let random = (noise >> 8) as f32 / 8388608. - 1.;

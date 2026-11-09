@@ -17,6 +17,8 @@ struct Save {
     player: Player,
     time: f32,
     edits: Vec<Edit>,
+    #[serde(default)]
+    drops: Vec<crate::game::WorldDrop>,
     torches: Vec<([i32; 3], f32)>,
     #[serde(default)]
     furnaces: Vec<([i32; 3], crate::items::Furnace)>,
@@ -68,6 +70,7 @@ pub fn create(game: &Game, beside: &Path) -> Result<PathBuf, String> {
 fn encode(game: &Game) -> Result<Vec<u8>, String> {
     let save = Save {
         version: 3,
+        drops: game.drops.clone(),
         seed: game.world.seed,
         player: game.player.clone(),
         time: game.time,
@@ -177,6 +180,15 @@ pub fn read(path: &Path) -> Result<Option<Game>, String> {
     }
     let mut g = Game::new(save.seed);
     g.player = save.player;
+    if save.drops.iter().any(|d| {
+        !valid_pos(&d.pos)
+            || d.velocity.iter().any(|v| !v.is_finite() || v.abs() > 100.)
+            || d.count == 0
+            || d.count > crate::items::Stack::limit(d.item)
+    }) {
+        return Err("Invalid world drop".into());
+    }
+    g.drops = save.drops;
     g.time = save.time;
     g.world.edits = save.edits.into_iter().map(|e| (e.pos, e.block)).collect();
     if save.version < 3 && !save.furnaces.is_empty() {
@@ -249,9 +261,16 @@ mod tests {
         g.world
             .set(glam::IVec3::new(-16, 100, 16), crate::world::Block::Planks);
         g.player.inventory.add(crate::items::Item::CopperIngot, 3);
+        g.drops.push(crate::game::WorldDrop {
+            velocity: [0.6, 2.5, -0.4],
+            pos: [0.5, 100.5, 0.5],
+            item: crate::items::Item::Log,
+            count: 1,
+        });
         write(&g, &path).unwrap();
         let restored = read(&path).unwrap().unwrap();
         assert_eq!(restored.world.seed, 89);
+        assert_eq!(restored.drops, g.drops);
         assert_eq!(restored.world.edits, g.world.edits);
         assert_eq!(restored.player.inventory, g.player.inventory);
         assert_eq!(restored.furnaces, g.furnaces);
