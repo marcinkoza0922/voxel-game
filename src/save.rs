@@ -21,6 +21,8 @@ struct Save {
     drops: Vec<crate::game::WorldDrop>,
     torches: Vec<([i32; 3], f32)>,
     #[serde(default)]
+    torch_mounts: Vec<([i32; 3], [i32; 3])>,
+    #[serde(default)]
     furnaces: Vec<([i32; 3], crate::items::Furnace)>,
 }
 pub fn write(game: &Game, path: &Path) -> Result<(), String> {
@@ -84,6 +86,12 @@ fn encode(game: &Game) -> Result<Vec<u8>, String> {
             })
             .collect(),
         torches: game.torch_life.iter().map(|(p, t)| (*p, *t)).collect(),
+        torch_mounts: game
+            .world
+            .torch_mounts
+            .iter()
+            .map(|(p, n)| (*p, *n))
+            .collect(),
         furnaces: game.furnaces.iter().map(|(p, f)| (*p, f.clone())).collect(),
     };
     serde_json::to_vec(&save).map_err(|e| e.to_string())
@@ -233,6 +241,14 @@ pub fn read(path: &Path) -> Result<Option<Game>, String> {
     {
         return Err("Torch timers do not match placed torches".into());
     }
+    for (p, n) in save.torch_mounts {
+        if !g.torch_life.contains_key(&p)
+            || ![[1, 0, 0], [-1, 0, 0], [0, 0, 1], [0, 0, -1], [0, -1, 0]].contains(&n)
+            || g.world.torch_mounts.insert(p, n).is_some()
+        {
+            return Err("Invalid torch attachment".into());
+        }
+    }
     g.say("World loaded. E opens your pack.");
     Ok(Some(g))
 }
@@ -273,9 +289,14 @@ mod tests {
             item: crate::items::Item::Log,
             count: 1,
         });
+        let torch = glam::IVec3::new(-15, 100, 16);
+        g.world.set(torch, crate::world::Block::Torch);
+        g.torch_life.insert(torch.to_array(), 600.);
+        g.world.torch_mounts.insert(torch.to_array(), [-1, 0, 0]);
         write(&g, &path).unwrap();
         let restored = read(&path).unwrap().unwrap();
         assert_eq!(restored.world.seed, 89);
+        assert_eq!(restored.world.torch_mounts, g.world.torch_mounts);
         assert_eq!(restored.drops, g.drops);
         assert_eq!(restored.world.edits, g.world.edits);
         assert_eq!(restored.player.inventory, g.player.inventory);

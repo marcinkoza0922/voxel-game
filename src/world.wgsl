@@ -33,7 +33,7 @@ struct Out { @builtin(position) clip: vec4<f32>, @location(0) world: vec3<f32>, 
     }
     let tile_color=textureSample(tiles,tile_sampler,v.tile.xy,i32(round(max(v.tile.z,0.0)))).rgb;
     let surface=select(vec3(1.0),tile_color,v.tile.z>=0.0);
-    let color=v.color*surface*light;
+    let color=select(v.color*surface*light,v.color,v.tile.z < -1.5);
     let fog=smoothstep(112.0,160.0,distance(v.world.xz,camera.eye.xz));
     return vec4(mix(color,camera.sky.xyz,fog),1.0);
 }

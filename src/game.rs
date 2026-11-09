@@ -330,6 +330,10 @@ impl Game {
                     self.say("A creature is in the way");
                     return;
                 }
+                if block == Block::Torch && (!self.world.get(hit).solid() || adjacent.y < hit.y) {
+                    self.say("Torches need a solid wall or floor");
+                    return;
+                }
                 if block == Block::Torch && self.torch_life.len() >= 256 {
                     self.say("Torch limit reached (256)");
                     return;
@@ -344,6 +348,9 @@ impl Game {
                     }
                     if block == Block::Torch {
                         self.torch_life.insert(adjacent.to_array(), 600.);
+                        self.world
+                            .torch_mounts
+                            .insert(adjacent.to_array(), (hit - adjacent).to_array());
                     }
                 }
             }
@@ -491,7 +498,13 @@ impl Game {
         let mut expired = vec![];
         for (p, t) in &mut self.torch_life {
             *t -= dt;
-            if *t <= 0. {
+            let unsupported = self.world.torch_mounts.get(p).is_some_and(|n| {
+                !self
+                    .world
+                    .get(IVec3::from_array(*p) + IVec3::from_array(*n))
+                    .solid()
+            });
+            if *t <= 0. || unsupported {
                 expired.push(*p);
             }
         }
@@ -988,6 +1001,28 @@ mod tests {
         }
         g
     }
+    #[test]
+    fn wall_torches_attach_reject_stacking_and_lose_support() {
+        let mut g = sky_fixture();
+        let support = IVec3::new(0, 101, -2);
+        let torch = IVec3::new(0, 101, -1);
+        g.world.set(support, Block::Stone);
+        g.player.inventory.add(Item::Torch, 4);
+        g.player.inventory.equip(Item::Torch, 0);
+        g.player.inventory.selected = 0;
+        g.use_selected();
+        assert_eq!(g.world.get(torch), Block::Torch);
+        assert_eq!(g.world.torch_mounts[&torch.to_array()], [0, 0, -1]);
+        let count = g.player.inventory.count(Item::Torch);
+        g.use_selected();
+        assert_eq!(g.player.inventory.count(Item::Torch), count);
+        assert_eq!(g.torch_life.len(), 1);
+        g.world.set(support, Block::Air);
+        g.tick(&Input::default(), 0.01);
+        assert_eq!(g.world.get(torch), Block::Air);
+        assert!(g.world.torch_mounts.is_empty());
+    }
+
     #[test]
     fn walking_cannot_tunnel_through_wall() {
         let mut g = sky_fixture();

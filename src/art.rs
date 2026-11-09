@@ -239,10 +239,19 @@ pub fn texel(block: Block, face: usize, x: i32, y: i32) -> [f32; 3] {
             }
         }
         Torch => {
-            if y < 5 {
-                tint([1., 0.69, 0.17], grain)
+            // Charred end grain and twisted linen on the head; long split wood grain below.
+            if face == 1 {
+                tint([0.22, 0.13, 0.065], grain)
+            } else if y < 5 {
+                tint(
+                    [0.55, 0.37, 0.18],
+                    if (x + y * 2) % 5 == 0 { 0.55 } else { grain },
+                )
             } else {
-                tint([0.40, 0.26, 0.13], grain)
+                tint(
+                    [0.38, 0.22, 0.10],
+                    if (x + (y / 7)) % 4 == 0 { 0.65 } else { grain },
+                )
             }
         }
     };

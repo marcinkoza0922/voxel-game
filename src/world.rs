@@ -112,6 +112,7 @@ pub struct Edit {
 pub struct World {
     pub seed: u64,
     pub edits: BTreeMap<[i32; 3], Block>,
+    pub torch_mounts: BTreeMap<[i32; 3], [i32; 3]>,
     chunks: HashMap<IVec3, Box<[Block]>>,
     pending: VecDeque<IVec3>,
     pub dirty: Vec<IVec3>,
@@ -164,6 +165,7 @@ impl World {
         Self {
             seed,
             edits: BTreeMap::new(),
+            torch_mounts: BTreeMap::new(),
             chunks: HashMap::new(),
             pending: VecDeque::new(),
             dirty: vec![],
@@ -376,6 +378,9 @@ impl World {
             return false;
         }
         self.edits.insert(p.to_array(), b);
+        if b != Block::Torch {
+            self.torch_mounts.remove(&p.to_array());
+        }
         let key = chunk(p);
         if let Some(c) = self.chunks.get_mut(&key) {
             c[index(p)] = b;
@@ -505,6 +510,7 @@ impl World {
             }
             let base = key * SIZE;
             let mut snapshot = World::new(self.seed);
+            snapshot.torch_mounts = self.torch_mounts.clone();
             // Copy only edits intersecting the chunk and its one-block AO halo.
             snapshot.edits = self
                 .edits

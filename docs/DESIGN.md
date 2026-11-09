@@ -432,3 +432,19 @@ caught and corrected float-to-layer truncation artifacts by rounding the tile
 layer before integer conversion. The smoke gameplay/save round trip also passed.
 Creature details and all crafted materials have not been individually inspected
 in native views.
+
+Torch appearance and mounting: placed and held torches share a procedural mesh
+with a split-grain wood handle, linen head, dark binding and stepped amber flame.
+The flame uses an unlit material marker so it stays visible at night. Wall torches
+lean outward from the clicked support face; floor torches stand upright. Torches
+require a solid wall or floor, reject other torches as supports, and disappear
+when their support is removed. Support offsets persist in an optional
+`torch_mounts` save field (older saves retain upright torches), and worker snapshots
+carry these offsets so streamed meshes preserve orientation. Torch light positions
+follow the flame head; held and placed light strength is 0.8, reduced from 1.0,
+with the existing nine-block falloff radius retained.
+
+Torch validation: all 69 quiet nextest tests, short-format Clippy, formatting and
+headless gameplay/save smoke passed. Regressions cover wall placement, rejection
+of torch supports, support removal, and saved attachment round trips. The updated
+appearance has not been checked in a live GPU window.

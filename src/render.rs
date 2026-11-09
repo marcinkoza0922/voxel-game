@@ -478,18 +478,25 @@ impl Renderer {
         let mut torches: Vec<_> = g
             .torch_life
             .keys()
-            .map(|p| Vec3::from_array(p.map(|n| n as f32)) + Vec3::splat(0.5))
+            .map(|p| {
+                let mount = g.world.torch_mounts.get(p).copied().unwrap_or([0, -1, 0]);
+                let wall = Vec3::new(mount[0] as f32, 0., mount[2] as f32);
+                Vec3::from_array(p.map(|n| n as f32))
+                    + Vec3::new(0.5, 0.04, 0.5)
+                    + wall * 0.43
+                    + (Vec3::Y - wall * 0.42).normalize() * 0.73
+            })
             .collect();
         torches.sort_by(|a, b| a.distance_squared(eye).total_cmp(&b.distance_squared(eye)));
         let held = g.player.inventory.selected() == crate::items::Item::Torch
             && g.player.inventory.selected_count() > 0;
         let mut n = 0;
         if held {
-            lights[0] = [eye.x, eye.y, eye.z, 1.];
+            lights[0] = [eye.x, eye.y, eye.z, 0.8];
             n = 1;
         }
         for p in torches.into_iter().take(16 - n) {
-            lights[n] = [p.x, p.y, p.z, 1.];
+            lights[n] = [p.x, p.y, p.z, 0.8];
             n += 1;
         }
         let camera = Camera {
@@ -919,9 +926,14 @@ fn chunk_visible(view: Mat4, key: IVec3) -> bool {
 }
 #[cfg(test)]
 pub fn mesh_chunk(w: &World, k: IVec3) -> Vec<Vertex> {
-    mesh_halo(w.seed, k, &w.halo(k))
+    mesh_halo(w.seed, k, &w.halo(k), &w.torch_mounts)
 }
-pub fn mesh_halo(seed: u64, k: IVec3, halo: &[Block]) -> Vec<Vertex> {
+pub fn mesh_halo(
+    seed: u64,
+    k: IVec3,
+    halo: &[Block],
+    mounts: &std::collections::BTreeMap<[i32; 3], [i32; 3]>,
+) -> Vec<Vertex> {
     let base = k * SIZE;
     let idx = |p: IVec3| ((p.x + 1) + 18 * ((p.z + 1) + 18 * (p.y + 1))) as usize;
     let get = |p: IVec3| halo[idx(p)];
@@ -935,12 +947,11 @@ pub fn mesh_halo(seed: u64, k: IVec3, halo: &[Block]) -> Vec<Vertex> {
                     continue;
                 }
                 if block == Block::Torch {
-                    box_mesh(
-                        &mut out,
-                        (base + p).as_vec3() + Vec3::new(0.41, 0., 0.41),
-                        Vec3::new(0.18, 0.8, 0.18),
-                        block.color(),
-                    );
+                    let mount = mounts
+                        .get(&(base + p).to_array())
+                        .copied()
+                        .unwrap_or([0, -1, 0]);
+                    torch_model(&mut out, (base + p).as_vec3(), IVec3::from_array(mount));
                     continue;
                 }
                 for (normal, u, v) in FACES {
@@ -1002,6 +1013,66 @@ pub fn mesh_halo(seed: u64, k: IVec3, halo: &[Block]) -> Vec<Vertex> {
     }
     out
 }
+// Shared held/placed model. Wall mounts lean away from the supporting face.
+fn torch_model(out: &mut Vec<Vertex>, origin: Vec3, mount: IVec3) {
+    let start = out.len();
+    textured_box(
+        out,
+        Vec3::new(0.445, 0.04, 0.445),
+        Vec3::new(0.11, 0.55, 0.11),
+        Block::Torch,
+    );
+    textured_box(
+        out,
+        Vec3::new(0.415, 0.49, 0.415),
+        Vec3::new(0.17, 0.15, 0.17),
+        Block::Torch,
+    );
+    // Iron binding and layered, asymmetric flame silhouette.
+    box_mesh(
+        out,
+        Vec3::new(0.405, 0.48, 0.405),
+        Vec3::new(0.19, 0.035, 0.19),
+        [0.20, 0.17, 0.13],
+    );
+    let flame_start = out.len();
+    box_mesh(
+        out,
+        Vec3::new(0.41, 0.64, 0.42),
+        Vec3::new(0.18, 0.13, 0.16),
+        [1., 0.35, 0.055],
+    );
+    box_mesh(
+        out,
+        Vec3::new(0.44, 0.74, 0.445),
+        Vec3::new(0.115, 0.13, 0.11),
+        [1., 0.65, 0.12],
+    );
+    box_mesh(
+        out,
+        Vec3::new(0.475, 0.85, 0.46),
+        Vec3::new(0.055, 0.10, 0.055),
+        [1., 0.83, 0.32],
+    );
+    box_mesh(
+        out,
+        Vec3::new(0.46, 0.65, 0.405),
+        Vec3::new(0.07, 0.13, 0.025),
+        [1., 0.87, 0.42],
+    );
+    for vertex in &mut out[flame_start..] {
+        vertex.tile[2] = -2.;
+    }
+    let wall = Vec3::new(mount.x as f32, 0., mount.z as f32);
+    let rotation = glam::Quat::from_rotation_arc(Vec3::Y, (Vec3::Y - wall * 0.42).normalize());
+    for vertex in &mut out[start..] {
+        let local = Vec3::from_array(vertex.pos) - Vec3::new(0.5, 0.04, 0.5);
+        vertex.pos =
+            (origin + Vec3::new(0.5, 0.04, 0.5) + wall * 0.43 + rotation * local).to_array();
+        vertex.normal = (rotation * Vec3::from_array(vertex.normal)).to_array();
+    }
+}
+
 fn textured_box(out: &mut Vec<Vertex>, pos: Vec3, size: Vec3, block: Block) {
     let start = out.len();
     box_mesh(out, pos, size, [1.; 3]);
@@ -1194,6 +1265,13 @@ fn held_model(out: &mut Vec<Vertex>, g: &Game) {
                 Vec3::splat(0.07),
                 material,
             );
+        }
+    } else if equipped && item == Item::Torch {
+        let start = out.len();
+        torch_model(out, Vec3::ZERO, IVec3::NEG_Y);
+        for vertex in &mut out[start..] {
+            vertex.pos =
+                ((Vec3::from_array(vertex.pos) - Vec3::new(0.5, 0.1, 0.5)) * 0.55).to_array();
         }
     } else if equipped {
         textured_box(
