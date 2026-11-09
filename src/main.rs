@@ -221,7 +221,10 @@ impl App {
                         r.ui.recipe = (r.ui.recipe as i32 + delta)
                             .rem_euclid(items::RECIPES.len() as i32)
                             as usize;
-                        if items::RECIPES[r.ui.recipe].station != items::Station::Furnace {
+                        if !matches!(
+                            items::RECIPES[r.ui.recipe].station,
+                            items::Station::Furnace | items::Station::Smelter
+                        ) {
                             break;
                         }
                     }
@@ -447,7 +450,7 @@ impl ApplicationHandler for App {
                                     .target
                                     .and_then(|(p, _)| match self.game.world.get(p) {
                                         world::Block::Table => Some(1),
-                                        world::Block::Furnace => Some(2),
+                                        world::Block::Furnace | world::Block::Smelter => Some(2),
                                         _ => None,
                                     });
                             if let Some(mode) = station {

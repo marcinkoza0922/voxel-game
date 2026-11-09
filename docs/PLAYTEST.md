@@ -88,3 +88,25 @@ forest travel, cave entry, combat, sleep, quit and reload. Note places where the
 next action is unclear or a resource is hard to find. The automated expedition
 checks the mechanics; this session will establish whether finding and using them
 feels good. Further rendering work should follow a repeatable measured hitch.
+
+## Iron/tundra expansion validation — 2026-11-09
+
+- Formatting, short Clippy with warnings denied, 65 quiet nextest tests, gameplay
+  smoke and expanded expedition passed.
+- Expedition now mines iron with copper tools, builds a crude smelter, processes
+  iron and crafts all three iron tools/weapons. It relocates to a naturally
+  generated tundra ruin, defeats the guardian through normal combat, mines and
+  collects the six-ingot cache, then verifies player, edits and all station
+  states after reload. Seed 314159's tested ruin is at (-1951, 174, -1902).
+- A native release Vulkan run rendered 900 frames from a temporary tundra ruin
+  save and exited cleanly. The inspected capture shows ruin walls/pillars,
+  the blue-gray guardian, held iron sword, iron tool/ore/ingot hotbar icons,
+  tundra HUD and combat damage feedback. It also shows the guardian pursuing
+  the stationary player to melee range. Sound was muted for this capture.
+- After excluding 180 startup frames, this static ruin view recorded frame
+  interval median/p95/worst of 6.059/6.332/9.483 ms, streaming/upload p95/worst
+  of 0.167/1.604 ms, and peak resident/queued/active chunks of 1295/933/2.
+  This is one native check, not a comparison with the earlier streaming tour.
+- Natural ruin search, full travel, smelter mouse ergonomics, combat balance and
+  extended play remain human evaluation work. Tundra temperature/clothing are
+  outside this content pass.

@@ -245,7 +245,7 @@ impl Ui {
             self.text(
                 w / 2. - 90.,
                 h / 2. - 40.,
-                &format!("HUSK  LV {}  HP {:.0}", m.level, m.health),
+                &format!("{}  LV {}  HP {:.0}", m.kind.name(), m.level, m.health),
                 1.5,
                 [0.94, 0.5, 0.4, 1.],
             );
@@ -266,7 +266,7 @@ impl Ui {
         use Item::*;
         let block = matches!(
             item,
-            Log | Planks | Dirt | Cobble | CopperOre | Table | Furnace | Bed
+            Log | Planks | Dirt | Cobble | CopperOre | IronOre | Table | Furnace | Smelter | Bed
         );
         let color: [f32; 4] = match item {
             Log => [0.43, 0.27, 0.12, 1.],
@@ -274,6 +274,9 @@ impl Ui {
             Dirt => [0.48, 0.30, 0.19, 1.],
             Cobble | CopperOre | Furnace | StoneAxe | StonePick => [0.57, 0.61, 0.62, 1.],
             CopperIngot | CopperAxe | CopperPick | Sword => [0.84, 0.45, 0.25, 1.],
+            IronOre | IronIngot | IronAxe | IronPick | IronSword | Smelter => {
+                [0.72, 0.77, 0.81, 1.]
+            }
             Coal => [0.18, 0.20, 0.24, 1.],
             Berries => [0.85, 0.22, 0.34, 1.],
             Meat => [0.84, 0.41, 0.37, 1.],
@@ -284,9 +287,9 @@ impl Ui {
         let tool = item.durability() > 0;
         for py in 0..16 {
             for px in 0_i32..16 {
-                let head = if matches!(item, WoodPick | StonePick | CopperPick) {
+                let head = if matches!(item, WoodPick | StonePick | CopperPick | IronPick) {
                     (2..14).contains(&px) && (2..5).contains(&py)
-                } else if item == Sword {
+                } else if matches!(item, Sword | IronSword) {
                     (7..10).contains(&px) && (1..11).contains(&py)
                 } else {
                     (3..10).contains(&px) && (2..7).contains(&py)
@@ -300,7 +303,7 @@ impl Ui {
                     head || handle
                 } else if matches!(item, Stick | Torch) {
                     (7..10).contains(&px) && (2..15).contains(&py)
-                } else if item == CopperIngot {
+                } else if matches!(item, CopperIngot | IronIngot) {
                     (3..14).contains(&px) && (5..12).contains(&py) && px + py > 9 && px + py < 23
                 } else {
                     let dx = px - 8;
@@ -318,12 +321,18 @@ impl Ui {
                 if item == Torch && py < 6 {
                     c = [1., 0.73, 0.20, 1.];
                 }
-                if matches!(item, Table | Furnace) && (5..11).contains(&px) && (6..11).contains(&py)
+                if matches!(item, Table | Furnace | Smelter)
+                    && (5..11).contains(&px)
+                    && (6..11).contains(&py)
                 {
                     c = [0.20, 0.19, 0.17, 1.];
                 }
-                if item == CopperOre && (px + py * 3) % 7 < 2 {
-                    c = [0.90, 0.49, 0.26, 1.];
+                if matches!(item, CopperOre | IronOre) && (px + py * 3) % 7 < 2 {
+                    c = if item == IronOre {
+                        [0.56, 0.38, 0.28, 1.]
+                    } else {
+                        [0.90, 0.49, 0.26, 1.]
+                    };
                 }
                 if item == Planks && py % 4 == 0 {
                     for v in &mut c[..3] {
@@ -507,7 +516,27 @@ impl Ui {
             );
             self.button([x + 425., y + 258., 60., 28.], ">", Action::Recipe(1), true);
         } else {
-            self.text(x + 24., y + 112., "FURNACE", 1.6, INK);
+            let smelter = g.furnace_position().is_some_and(|p| {
+                g.world.get(glam::IVec3::from_array(p)) == crate::world::Block::Smelter
+            });
+            self.text(
+                x + 24.,
+                y + 112.,
+                if smelter { "CRUDE SMELTER" } else { "FURNACE" },
+                1.6,
+                INK,
+            );
+            self.text(
+                x + 322.,
+                y + 257.,
+                if smelter {
+                    "Copper / iron / food"
+                } else {
+                    "Iron needs a smelter"
+                },
+                1.1,
+                MUTED,
+            );
             self.text(x + 24., y + 139., "INPUT", 1.2, MUTED);
             self.text(x + 24., y + 224., "FUEL", 1.2, MUTED);
             self.stack_slot(

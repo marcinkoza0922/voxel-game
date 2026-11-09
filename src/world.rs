@@ -25,10 +25,18 @@ pub enum Block {
     Torch,
     Sand,
     Bed,
+    Iron,
+    Smelter,
+    Snow,
+    RuinStone,
+    Reliquary,
 }
 impl Block {
     pub fn solid(self) -> bool {
         !matches!(self, Self::Air | Self::Torch)
+    }
+    pub fn processor(self) -> bool {
+        matches!(self, Self::Furnace | Self::Smelter)
     }
     pub fn color(self) -> [f32; 3] {
         match self {
@@ -47,6 +55,11 @@ impl Block {
             Self::Torch => [1., 0.65, 0.18],
             Self::Sand => [0.76, 0.69, 0.47],
             Self::Bed => [0.63, 0.24, 0.20],
+            Self::Iron => [0.59, 0.54, 0.49],
+            Self::Smelter => [0.24, 0.27, 0.30],
+            Self::Snow => [0.85, 0.91, 0.95],
+            Self::RuinStone => [0.35, 0.43, 0.48],
+            Self::Reliquary => [0.45, 0.72, 0.86],
         }
     }
     pub fn name(self) -> &'static str {
@@ -66,6 +79,11 @@ impl Block {
             Self::Torch => "Torch",
             Self::Sand => "Sand",
             Self::Bed => "Bedroll",
+            Self::Iron => "Iron ore",
+            Self::Smelter => "Crude smelter",
+            Self::Snow => "Snow",
+            Self::RuinStone => "Ancient masonry",
+            Self::Reliquary => "Sealed iron cache",
         }
     }
 }
@@ -73,12 +91,14 @@ impl Block {
 pub enum Biome {
     Grassland,
     Forest,
+    Tundra,
 }
 impl Biome {
     pub fn name(self) -> &'static str {
         match self {
             Self::Grassland => "Grasslands",
             Self::Forest => "Oak forest",
+            Self::Tundra => "Tundra",
         }
     }
 }
@@ -158,6 +178,11 @@ impl World {
         }
     }
     pub fn biome(&self, x: i32, z: i32) -> Biome {
+        if (x as f64).hypot(z as f64) > 240.
+            && noise(self.seed ^ 7621, x as f32 / 320., z as f32 / 320.) > 0.52
+        {
+            return Biome::Tundra;
+        }
         if noise(self.seed ^ 456, x as f32 / 110., z as f32 / 110.) > 0.53 {
             Biome::Forest
         } else {
@@ -174,7 +199,31 @@ impl World {
         let distance = (x * x + z * z).sqrt();
         (24. + hills + ridge.powf(1.7) * 750. * ((distance - 100.).max(0.) / 500.).min(1.)) as i32
     }
+    /// One stable candidate per 256-block cell; only gentle tundra sites survive.
+    pub fn ruin_in_cell(&self, x: i32, z: i32) -> Option<IVec3> {
+        let h = hash(self.seed ^ 91283, x, 0, z);
+        let cx = x * 256 + 48 + (h % 160) as i32;
+        let cz = z * 256 + 48 + ((h >> 16) % 160) as i32;
+        if self.biome(cx, cz) != Biome::Tundra {
+            return None;
+        }
+        let y = self.height(cx, cz);
+        if [-6, 6].into_iter().any(|dx| {
+            [-6, 6]
+                .into_iter()
+                .any(|dz| (self.height(cx + dx, cz + dz) - y).abs() > 4)
+        }) {
+            return None;
+        }
+        Some(IVec3::new(cx, y, cz))
+    }
+    pub fn nearby_ruin(&self, x: i32, z: i32) -> Option<IVec3> {
+        self.ruin_in_cell(x.div_euclid(256), z.div_euclid(256))
+    }
     fn tree(&self, x: i32, z: i32) -> Option<(i32, i32, i32)> {
+        if self.biome(x, z) == Biome::Tundra {
+            return None;
+        }
         let tx = x.div_euclid(7);
         let tz = z.div_euclid(7);
         for a in tx - 1..=tx + 1 {
@@ -194,13 +243,45 @@ impl World {
         }
         None
     }
-    fn natural_column(&self, p: IVec3, height: i32, tree: Option<(i32, i32, i32)>) -> Block {
+    fn natural_column(
+        &self,
+        p: IVec3,
+        height: i32,
+        tree: Option<(i32, i32, i32)>,
+        ruin: Option<IVec3>,
+    ) -> Block {
         if !(MIN_Y..=MAX_Y).contains(&p.y) {
             return if p.y < MIN_Y {
                 Block::Stone
             } else {
                 Block::Air
             };
+        }
+        if let Some(c) = ruin {
+            let d = p - c;
+            if d.x.abs() <= 6 && d.z.abs() <= 6 && p.y >= c.y - 6 && p.y <= height.max(c.y) + 6 {
+                if d.y <= 0 {
+                    return Block::RuinStone;
+                }
+                if d.x == 0 && d.z == 0 && d.y == 1 {
+                    return Block::Reliquary;
+                }
+                let wall = (d.x.abs() == 5 && d.z.abs() <= 5) || (d.z.abs() == 5 && d.x.abs() <= 5);
+                let doorway = d.z == 5 && d.x.abs() <= 1;
+                let pillar = d.x.abs() == 5 && d.z.abs() == 5;
+                if wall
+                    && !doorway
+                    && d.y
+                        <= if pillar {
+                            5
+                        } else {
+                            2 + (hash(self.seed, p.x, 0, p.z) % 2) as i32
+                        }
+                {
+                    return Block::RuinStone;
+                }
+                return Block::Air;
+            }
         }
         if p.y > height {
             if let Some((tx, ty, tz)) = tree {
@@ -226,7 +307,11 @@ impl World {
             }
         }
         if p.y == height {
-            Block::Grass
+            if self.biome(p.x, p.z) == Biome::Tundra {
+                Block::Snow
+            } else {
+                Block::Grass
+            }
         } else if p.y > height - 4 {
             Block::Dirt
         } else {
@@ -240,6 +325,8 @@ impl World {
                 Block::Copper
             } else if vein < 10 {
                 Block::Coal
+            } else if vein < 13 && p.y < height - 12 {
+                Block::Iron
             } else {
                 Block::Stone
             }
@@ -252,7 +339,12 @@ impl World {
         if let Some(c) = self.chunks.get(&chunk(p)) {
             return c[index(p)];
         }
-        self.natural_column(p, self.height(p.x, p.z), self.tree(p.x, p.z))
+        self.natural_column(
+            p,
+            self.height(p.x, p.z),
+            self.tree(p.x, p.z),
+            self.nearby_ruin(p.x, p.z),
+        )
     }
     /// Sample a chunk and its AO halo, reusing generation data for each column.
     pub fn halo(&self, key: IVec3) -> Vec<Block> {
@@ -264,6 +356,7 @@ impl World {
                 let wz = base.z + z;
                 let h = self.height(wx, wz);
                 let t = self.tree(wx, wz);
+                let ruin = self.nearby_ruin(wx, wz);
                 for y in -1..=SIZE {
                     let p = IVec3::new(wx, base.y + y, wz);
                     let block = self
@@ -271,7 +364,7 @@ impl World {
                         .get(&p.to_array())
                         .copied()
                         .or_else(|| self.chunks.get(&chunk(p)).map(|c| c[index(p)]))
-                        .unwrap_or_else(|| self.natural_column(p, h, t));
+                        .unwrap_or_else(|| self.natural_column(p, h, t, ruin));
                     blocks[((x + 1) + 18 * ((z + 1) + 18 * (y + 1))) as usize] = block;
                 }
             }
@@ -702,5 +795,44 @@ mod tests {
         wait_for_chunk(&mut w, Vec3::new(0., 100., 0.), chunk(p));
         assert!(w.loaded(chunk(p)));
         assert_eq!(w.get(p), Block::Planks);
+    }
+}
+
+#[cfg(test)]
+mod expansion_tests {
+    use super::*;
+    #[test]
+    fn tundra_ruin_is_deterministic_accessible_and_matches_chunk_halo() {
+        for seed in [1, 42, 314159] {
+            let world = World::new(seed);
+            assert_ne!(world.biome(2, 2), Biome::Tundra);
+            let home = (-8..=8)
+                .find_map(|x| (-8..=8).find_map(|z| world.ruin_in_cell(x, z)))
+                .unwrap();
+            let other = World::new(seed);
+            assert_eq!(world.biome(home.x, home.z), Biome::Tundra);
+            assert_eq!(other.nearby_ruin(home.x, home.z), Some(home));
+            assert_eq!(world.get(home + IVec3::Y), Block::Reliquary);
+            assert_eq!(world.get(home + IVec3::new(0, 1, 5)), Block::Air);
+            assert_eq!(world.get(home + IVec3::new(0, 0, 5)), Block::RuinStone);
+            assert_eq!(world.get(home + IVec3::new(5, 5, 5)), Block::RuinStone);
+            for dx in -7..=7 {
+                let p = home + IVec3::new(dx, 1, 0);
+                let key = chunk(p);
+                let local = p - key * SIZE + IVec3::ONE;
+                let halo = world.halo(key);
+                assert_eq!(
+                    halo[(local.x + 18 * (local.z + 18 * local.y)) as usize],
+                    world.get(p)
+                );
+            }
+            let mut iron = false;
+            for y in home.y - 45..home.y - 12 {
+                for dx in -12..=12 {
+                    iron |= world.get(IVec3::new(home.x + dx, y, home.z + 12)) == Block::Iron;
+                }
+            }
+            assert!(iron, "Iron must occur naturally below the surface");
+        }
     }
 }

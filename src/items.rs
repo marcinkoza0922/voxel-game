@@ -26,8 +26,14 @@ pub enum Item {
     CopperAxe,
     CopperPick,
     Sword,
+    IronOre,
+    IronIngot,
+    Smelter,
+    IronAxe,
+    IronPick,
+    IronSword,
 }
-pub const ITEMS: [Item; 22] = [
+pub const ITEMS: [Item; 28] = [
     Item::Log,
     Item::Planks,
     Item::Stick,
@@ -50,6 +56,12 @@ pub const ITEMS: [Item; 22] = [
     Item::CopperAxe,
     Item::CopperPick,
     Item::Sword,
+    Item::IronOre,
+    Item::IronIngot,
+    Item::Smelter,
+    Item::IronAxe,
+    Item::IronPick,
+    Item::IronSword,
 ];
 impl Item {
     pub fn name(self) -> &'static str {
@@ -76,6 +88,12 @@ impl Item {
             Self::CopperAxe => "Copper axe",
             Self::CopperPick => "Copper pickaxe",
             Self::Sword => "Copper sword",
+            Self::IronOre => "Iron ore",
+            Self::IronIngot => "Iron ingot",
+            Self::Smelter => "Crude smelter",
+            Self::IronAxe => "Iron axe",
+            Self::IronPick => "Iron pickaxe",
+            Self::IronSword => "Iron sword",
         }
     }
     pub fn block(self) -> Option<Block> {
@@ -86,6 +104,7 @@ impl Item {
             Self::Cobble => Block::Cobble,
             Self::Table => Block::Table,
             Self::Furnace => Block::Furnace,
+            Self::Smelter => Block::Smelter,
             Self::Torch => Block::Torch,
             Self::Bed => Block::Bed,
             _ => return None,
@@ -96,6 +115,7 @@ impl Item {
             Self::WoodAxe | Self::WoodPick => 60,
             Self::StoneAxe | Self::StonePick => 160,
             Self::CopperAxe | Self::CopperPick | Self::Sword => 360,
+            Self::IronAxe | Self::IronPick | Self::IronSword => 600,
             _ => 0,
         }
     }
@@ -104,6 +124,7 @@ impl Item {
             Self::WoodPick => 1,
             Self::StonePick => 2,
             Self::CopperPick => 3,
+            Self::IronPick => 4,
             _ => 0,
         }
     }
@@ -112,6 +133,7 @@ impl Item {
             Self::WoodAxe => 1,
             Self::StoneAxe => 2,
             Self::CopperAxe => 3,
+            Self::IronAxe => 4,
             _ => 0,
         }
     }
@@ -151,10 +173,16 @@ impl Furnace {
         self.furnace_joules <= COAL_JOULES
             && self.furnace_progress < SMELT_TICKS
             && (self.furnace_progress == 0
-                || matches!(self.furnace_input, Some(Item::CopperOre | Item::Meat)))
-            && self
-                .furnace_output
-                .is_none_or(|s| matches!(s.item, Item::CopperIngot | Item::CookedMeat))
+                || matches!(
+                    self.furnace_input,
+                    Some(Item::CopperOre | Item::Meat | Item::IronOre)
+                ))
+            && self.furnace_output.is_none_or(|s| {
+                matches!(
+                    s.item,
+                    Item::CopperIngot | Item::CookedMeat | Item::IronIngot
+                )
+            })
             && self
                 .furnace
                 .iter()
@@ -380,7 +408,7 @@ impl Inventory {
             match mode {
                 2 => match stack.item {
                     Item::Coal => vec![46],
-                    Item::CopperOre | Item::Meat => vec![45],
+                    Item::CopperOre | Item::Meat | Item::IronOre => vec![45],
                     _ => vec![],
                 },
                 1 => (36..45).collect(),
@@ -428,6 +456,7 @@ pub enum Station {
     Hand,
     Table,
     Furnace,
+    Smelter,
 }
 pub struct Recipe {
     pub output: Item,
@@ -543,6 +572,41 @@ pub const RECIPES: &[Recipe] = &[
         station: Station::Table,
         xp: 50,
     },
+    Recipe {
+        output: Smelter,
+        amount: 1,
+        inputs: &[(Cobble, 6), (CopperIngot, 2)],
+        station: Station::Table,
+        xp: 70,
+    },
+    Recipe {
+        output: IronIngot,
+        amount: 1,
+        inputs: &[(IronOre, 1), (Coal, 1)],
+        station: Station::Smelter,
+        xp: 36,
+    },
+    Recipe {
+        output: IronAxe,
+        amount: 1,
+        inputs: &[(IronIngot, 3), (Stick, 2)],
+        station: Station::Table,
+        xp: 70,
+    },
+    Recipe {
+        output: IronPick,
+        amount: 1,
+        inputs: &[(IronIngot, 3), (Stick, 2)],
+        station: Station::Table,
+        xp: 70,
+    },
+    Recipe {
+        output: IronSword,
+        amount: 1,
+        inputs: &[(IronIngot, 2), (Stick, 1)],
+        station: Station::Table,
+        xp: 70,
+    },
 ];
 pub fn craft(
     inv: &mut Inventory,
@@ -551,10 +615,12 @@ pub fn craft(
     furnace: bool,
 ) -> Result<(), &'static str> {
     let r = RECIPES.get(index).ok_or("Unknown recipe")?;
-    if (r.station == Station::Table && !table) || (r.station == Station::Furnace && !furnace) {
+    if (r.station == Station::Table && !table)
+        || (matches!(r.station, Station::Furnace | Station::Smelter) && !furnace)
+    {
         return Err("Place the required station nearby");
     }
-    if r.station == Station::Furnace {
+    if matches!(r.station, Station::Furnace | Station::Smelter) {
         return Err("Put input and fuel in the furnace to smelt");
     }
     if r.inputs.iter().any(|(i, n)| inv.count(*i) < *n) {
@@ -619,12 +685,13 @@ pub fn pattern(index: usize) -> (&'static str, usize) {
         0 => ("L", 1),
         1 => ("PP", 1),
         2 => ("PPPP", 2),
-        3 | 7 | 12 => ("MM MS  S ", 3),
-        4 | 8 | 13 => ("MMM S  S ", 3),
+        3 | 7 | 12 | 17 => ("MM MS  S ", 3),
+        4 | 8 | 13 | 18 => ("MMM S  S ", 3),
         5 => ("CS", 1),
         6 => ("PPPPPPL L", 3),
         9 => ("MMMM MMMM", 3),
-        14 => ("MMS", 1),
+        14 | 19 => ("MMS", 1),
+        15 => ("MCMM MMCM", 3),
         _ => ("", 1),
     }
 }
@@ -633,10 +700,15 @@ fn ingredient(index: usize, c: char) -> Option<Item> {
         'L' => Some(Item::Log),
         'P' => Some(Item::Planks),
         'S' => Some(Item::Stick),
-        'C' => Some(Item::Coal),
+        'C' => Some(if index == 15 {
+            Item::CopperIngot
+        } else {
+            Item::Coal
+        }),
         'M' => Some(match index {
             3 | 4 => Item::Planks,
-            7..=9 => Item::Cobble,
+            7..=9 | 15 => Item::Cobble,
+            17..=19 => Item::IronIngot,
             _ => Item::CopperIngot,
         }),
         _ => None,
@@ -683,15 +755,22 @@ pub fn furnace_recipe(inv: &Furnace) -> Option<usize> {
     match inv.furnace[0]?.item {
         Item::CopperOre => Some(10),
         Item::Meat => Some(11),
+        Item::IronOre => Some(16),
         _ => None,
     }
 }
 /// Advance one 60 Hz simulation step. Energy drains only while work advances.
 pub fn tick_furnace(inv: &mut Furnace) -> Option<usize> {
+    tick_processor(inv, false)
+}
+pub fn tick_processor(inv: &mut Furnace, smelter: bool) -> Option<usize> {
     let input = inv.furnace[0].map(|s| s.item);
     if inv.furnace_input != input {
         inv.furnace_progress = 0;
         inv.furnace_input = input;
+    }
+    if !smelter && input == Some(Item::IronOre) {
+        return None;
     }
     let index = furnace_recipe(inv)?;
     let r = &RECIPES[index];
@@ -738,6 +817,7 @@ pub fn take_output(inv: &mut Inventory, mode: u8) -> Option<usize> {
         match inv.processing.furnace_output?.item {
             Item::CopperIngot => 10,
             Item::CookedMeat => 11,
+            Item::IronIngot => 16,
             _ => return None,
         }
     } else {
@@ -841,7 +921,7 @@ mod slot_tests {
         for (index, r) in RECIPES
             .iter()
             .enumerate()
-            .filter(|(_, r)| r.station != Station::Furnace)
+            .filter(|(_, r)| !matches!(r.station, Station::Furnace | Station::Smelter))
         {
             let grid = recipe_grid(index);
             for &(item, count) in r.inputs {
@@ -1034,5 +1114,58 @@ mod slot_tests {
         inv.damage_tool(Item::WoodPick);
         assert_eq!(inv.slots[0].unwrap().wear, 1);
         assert_eq!(inv.slots[1].unwrap().wear, 0);
+    }
+}
+
+#[cfg(test)]
+mod iron_tests {
+    use super::*;
+    #[test]
+    fn iron_requires_smelter_and_resumes_saved_progress() {
+        let mut f = Furnace::default();
+        f.furnace = [
+            Some(Stack::new(Item::IronOre, 4)),
+            Some(Stack::new(Item::Coal, 1)),
+        ];
+        let before = f.clone();
+        for _ in 0..SMELT_TICKS {
+            assert_eq!(tick_furnace(&mut f), None);
+        }
+        assert_eq!(f.furnace, before.furnace);
+        assert_eq!(f.furnace_joules, 0);
+        for _ in 0..SMELT_TICKS / 2 {
+            tick_processor(&mut f, true);
+        }
+        let mut restored: Furnace =
+            serde_json::from_str(&serde_json::to_string(&f).unwrap()).unwrap();
+        assert!(restored.valid());
+        let mut completed = 0;
+        for _ in SMELT_TICKS / 2..SMELT_TICKS * 4 {
+            completed += u32::from(tick_processor(&mut restored, true).is_some());
+        }
+        assert_eq!(completed, 4);
+        assert_eq!(
+            restored.furnace_output,
+            Some(Stack::new(Item::IronIngot, 4))
+        );
+        assert_eq!(restored.furnace_joules, 0);
+        assert!(restored.furnace.iter().all(Option::is_none));
+        let mut inv = Inventory::empty();
+        inv.processing = restored;
+        assert_eq!(inv.quick_output(2), Some(16));
+        assert_eq!(inv.count(Item::IronIngot), 4);
+    }
+    #[test]
+    fn unsupported_iron_input_still_resets_copper_progress() {
+        let mut f = Furnace::default();
+        f.furnace = [
+            Some(Stack::new(Item::CopperOre, 1)),
+            Some(Stack::new(Item::Coal, 1)),
+        ];
+        tick_furnace(&mut f);
+        assert!(f.furnace_progress > 0);
+        f.furnace[0] = Some(Stack::new(Item::IronOre, 1));
+        tick_furnace(&mut f);
+        assert_eq!(f.furnace_progress, 0);
     }
 }

@@ -437,17 +437,26 @@ impl Renderer {
         let mut dynamic = vec![];
         for (_, m) in g.entities.iter() {
             let p = m.pos;
+            let guardian = matches!(m.kind, crate::ecs::MobKind::Guardian(_));
             box_mesh(
                 &mut dynamic,
                 p + Vec3::new(-0.27, 0.65, -0.19),
                 Vec3::new(0.54, 0.73, 0.38),
-                [0.27, 0.33, 0.24],
+                if guardian {
+                    [0.30, 0.43, 0.56]
+                } else {
+                    [0.27, 0.33, 0.24]
+                },
             );
             box_mesh(
                 &mut dynamic,
                 p + Vec3::new(-0.23, 1.38, -0.23),
                 Vec3::splat(0.46),
-                [0.48, 0.49, 0.33],
+                if guardian {
+                    [0.60, 0.78, 0.87]
+                } else {
+                    [0.48, 0.49, 0.33]
+                },
             );
             for x in [-0.25, 0.05] {
                 box_mesh(
@@ -462,7 +471,11 @@ impl Renderer {
                     &mut dynamic,
                     p + Vec3::new(x, 0.8, -0.12),
                     Vec3::new(0.14, 0.55, 0.25),
-                    [0.36, 0.41, 0.29],
+                    if guardian {
+                        [0.42, 0.54, 0.64]
+                    } else {
+                        [0.36, 0.41, 0.29]
+                    },
                 );
             }
         }
@@ -908,10 +921,13 @@ fn held_model(out: &mut Vec<Vertex>, g: &Game) {
         Vec3::new(0.13, 0.25, 0.12),
         [0.65, 0.43, 0.29],
     );
-    if equipped && (item.pick() > 0 || item.axe() > 0 || item == Item::Sword) {
+    if equipped
+        && (item.pick() > 0 || item.axe() > 0 || matches!(item, Item::Sword | Item::IronSword))
+    {
         let material = match item {
             Item::WoodAxe | Item::WoodPick => [0.55, 0.35, 0.17],
             Item::StoneAxe | Item::StonePick => [0.53, 0.55, 0.57],
+            Item::IronAxe | Item::IronPick | Item::IronSword => [0.72, 0.77, 0.81],
             _ => [0.77, 0.43, 0.24],
         };
         box_mesh(

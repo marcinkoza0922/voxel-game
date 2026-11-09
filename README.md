@@ -46,6 +46,21 @@ The pack has 27 backpack slots, nine hotbar slots, and a 2x2 personal crafting g
 
 Mine through the dirt to granite with the pickaxe. Make sticks and stone tools at the table. Stone pickaxes can harvest copper ore. Craft a furnace from eight cobblestone at the table, place it, and use coal plus copper ore to smelt ingots. Make copper tools and a sword at the table. In the furnace tab, put ore or raw meat in INPUT and coal in FUEL, then take the output. Each item takes five seconds to smelt; one coal fuels four items. Furnaces continue working while you explore, including outside loaded terrain, and resume from saved progress after loading. Empty all item slots before mining a furnace; breaking it discards any remaining heat.
 
+After copper, mine iron ore with a copper pickaxe. Iron occurs deeper than
+copper, beneath at least twelve blocks of surface cover. At a crafting table,
+make a **crude smelter** from six cobblestone and two copper ingots (see the recipe
+guide). Place and right-click it like a furnace. It smelts iron as well as copper
+and food; ordinary furnaces cannot smelt iron. Craft iron axes, pickaxes and
+swords with the same patterns as copper tools. Iron tools last longer and work
+faster, and the sword deals more damage.
+
+Explore beyond the starting region for **tundra**: snowy ground, open hills and
+mountains with scattered ancient ruins. Bring food, torches, a bedroll and a
+good weapon. Blue-gray ruin guardians are tougher and faster than husks. Defeat
+a ruin's guardian to unseal its blue cache, then mine the cache with a pickaxe
+for six iron ingots. Discovery and guardian victory award XP. Defeated guardians
+and collected caches stay completed after saving and reloading.
+
 Existing saves migrate automatically and retain your inventory and tools. Old shared furnace contents move to the placed furnace nearest your saved position. If none remains, those contents are preserved for the next furnace you place.
 
 Leaves yield berries; eat them with right mouse while selected. Husks pursue and attack, and drop meat that can be cooked in the furnace. Bedrolls restore rest and advance to dawn; nearby enemies prevent sleep. Torches provide warm light while held or placed; placed torches burn out after ten minutes of active gameplay. Death returns you to spawn with your inventory.
@@ -57,7 +72,7 @@ material-colored mining chips, block-break bursts, melee hit markers and a damag
 flash. Sound effects use optional `paplay` (PulseAudio/PipeWire); install your
 distribution's PulseAudio utilities for playback, or use `--mute` to disable it.
 
-The terrain streams in chunks and supports a vertical range from **-512 to 1535**. Terrain streams up to 160 blocks horizontally, with full-height mountain surfaces, refresh-synchronized presentation, and camera/shadow chunk culling. Venture far from spawn for large mountains. Grasslands, oak forests, caves, coal and copper are implemented; the broader biomes, metallurgy, magic, and automation remain future milestones.
+The terrain streams in chunks and supports a vertical range from **-512 to 1535**. Terrain streams up to 160 blocks horizontally, with full-height mountain surfaces, refresh-synchronized presentation, and camera/shadow chunk culling. Venture far from spawn for large mountains. Grasslands, oak forests, tundra, caves, coal, copper, iron and guarded ruins are implemented; the broader biomes, metallurgy, magic, and automation remain future milestones.
 
 ## Development
 
@@ -79,8 +94,9 @@ For frame-time diagnostics, add `--profile /tmp/frames.csv`, then run
 wall times, including presentation waits, rather than GPU execution timings.
 The first frame has no interval; `--skip 180` can exclude startup.
 
-`cargo run -- --expedition` runs a controlled headless expedition through copper
-gear, combat, food, sleep, forest/cave checks, and reload. It mines fixture
+`cargo run -- --expedition` runs a controlled headless expedition through copper and iron
+gear, combat, food, sleep, forest/cave checks, a natural tundra ruin and guardian,
+cache rewards, and reload. It mines fixture
 resources through actual gameplay actions; forest/cave visits use relocations.
 It does not measure how easily a player can find resources in a natural world.
 

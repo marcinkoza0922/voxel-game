@@ -1,5 +1,5 @@
 use crate::{
-    ecs::{Entities, Mob},
+    ecs::{Entities, Mob, MobKind},
     items::{self, Inventory, Item, RECIPES},
     world::{Biome, Block, World},
 };
@@ -181,7 +181,7 @@ impl Game {
             d.x.abs() <= 3
                 && d.y.abs() <= 2
                 && d.z.abs() <= 3
-                && self.world.get(IVec3::from_array(q)) == Block::Furnace
+                && self.world.get(IVec3::from_array(q)).processor()
         };
         if let Some(q) = self.active_furnace {
             return reachable(q).then_some(q);
@@ -336,7 +336,7 @@ impl Game {
                 }
                 if self.world.set(adjacent, block) {
                     self.player.inventory.take_selected();
-                    if block == Block::Furnace {
+                    if block.processor() {
                         self.furnaces.insert(
                             adjacent.to_array(),
                             std::mem::take(&mut self.player.inventory.processing),
@@ -379,8 +379,12 @@ impl Game {
     }
     pub fn tick_furnace(&mut self) {
         let mut rewards = Vec::new();
-        for state in self.furnaces.values_mut() {
-            if let Some(index) = items::tick_furnace(state) {
+        for (pos, state) in &mut self.furnaces {
+            if let Some(index) = if self.world.get(IVec3::from_array(*pos)) == Block::Smelter {
+                items::tick_processor(state, true)
+            } else {
+                items::tick_furnace(state)
+            } {
                 rewards.push(index);
             }
         }
@@ -612,8 +616,12 @@ impl Game {
             self.attack_timer = 0.5 / (1. + self.player.stats[2] as f32 * 0.015);
             let selected = self.player.inventory.selected();
             let equipped = self.player.inventory.selected_count() > 0;
-            let damage = (if equipped && selected == Item::Sword {
-                14.
+            let damage = (if equipped && matches!(selected, Item::Sword | Item::IronSword) {
+                if selected == Item::IronSword {
+                    19.
+                } else {
+                    14.
+                }
             } else if equipped && selected.axe() > 0 {
                 7.
             } else {
@@ -624,7 +632,7 @@ impl Game {
                 m.health -= damage;
                 m.pos += Vec3::new(dir.x, 0., dir.z) * 0.4;
                 if m.health <= 0. {
-                    killed = Some((m.level, m.pos));
+                    killed = Some((m.level, m.pos, m.kind));
                 }
             }
             self.feedback.hit = 0.18;
@@ -633,7 +641,7 @@ impl Game {
             if equipped {
                 self.player.inventory.damage_tool(selected);
             }
-            if let Some((level, pos)) = killed {
+            if let Some((level, pos, kind)) = killed {
                 self.entities.despawn(id);
                 let xp = if self.player.level > level + 5 {
                     0
@@ -644,10 +652,17 @@ impl Game {
                 self.drops.push(WorldDrop {
                     velocity: [0.6, 2.5, -0.4],
                     pos: (pos + Vec3::Y * 0.6).to_array(),
-                    item: Item::Meat,
+                    item: if matches!(kind, MobKind::Guardian(_)) {
+                        Item::Coal
+                    } else {
+                        Item::Meat
+                    },
                     count: 2,
                 });
-                self.say(format!("Husk defeated (+{xp} XP)"));
+                if let MobKind::Guardian(home) = kind {
+                    self.player.discover(format!("guardian:{home:?}"), 60);
+                }
+                self.say(format!("{} defeated (+{xp} XP)", kind.name()));
             }
             return;
         }
@@ -663,12 +678,25 @@ impl Game {
         let axe = if has { tool.axe() } else { 0 };
         let hard = matches!(
             b,
-            Block::Stone | Block::Copper | Block::Coal | Block::Cobble | Block::Furnace
+            Block::Stone
+                | Block::Copper
+                | Block::Coal
+                | Block::Cobble
+                | Block::Furnace
+                | Block::Iron
+                | Block::Smelter
+                | Block::RuinStone
+                | Block::Reliquary
         );
-        if (hard && pick == 0) || (b == Block::Copper && pick < 2) || (b == Block::Log && axe == 0)
+        if (hard && pick == 0)
+            || (b == Block::Copper && pick < 2)
+            || (b == Block::Iron && pick < 3)
+            || (b == Block::Log && axe == 0)
         {
             if self.message_time < 1. {
-                self.say(if b == Block::Copper {
+                self.say(if b == Block::Iron {
+                    "Iron ore needs a copper pickaxe"
+                } else if b == Block::Copper {
                     "Copper ore needs a stone pickaxe"
                 } else if b == Block::Log {
                     "Use an axe to harvest logs"
@@ -676,6 +704,17 @@ impl Game {
                     "Use a pickaxe to harvest stone"
                 });
             }
+            return;
+        }
+        if b == Block::Reliquary
+            && self.world.nearby_ruin(p.x, p.z).is_some_and(|home| {
+                !self
+                    .player
+                    .discoveries
+                    .contains(&format!("guardian:{:?}", home.to_array()))
+            })
+        {
+            self.say("Defeat the ruin guardian to open this cache");
             return;
         }
         if self.mining != Some(p) {
@@ -709,7 +748,7 @@ impl Game {
                 .burst(p.as_vec3() + Vec3::splat(0.5) + face * 0.53, b.color(), 4);
         }
         if self.mining_progress >= 1. && p.y > crate::world::MIN_Y && p.y <= crate::world::MAX_Y {
-            if b == Block::Furnace
+            if b.processor()
                 && self.furnaces.get(&p.to_array()).is_some_and(|f| {
                     f.furnace.iter().any(Option::is_some) || f.furnace_output.is_some()
                 })
@@ -719,10 +758,13 @@ impl Game {
             }
             let drop = match b {
                 Block::Log => Some(Item::Log),
-                Block::Stone | Block::Cobble => Some(Item::Cobble),
+                Block::Stone | Block::Cobble | Block::RuinStone => Some(Item::Cobble),
+                Block::Iron => Some(Item::IronOre),
+                Block::Reliquary => Some(Item::IronIngot),
+                Block::Smelter => Some(Item::Smelter),
                 Block::Copper => Some(Item::CopperOre),
                 Block::Coal => Some(Item::Coal),
-                Block::Dirt | Block::Grass | Block::Sand => Some(Item::Dirt),
+                Block::Dirt | Block::Grass | Block::Sand | Block::Snow => Some(Item::Dirt),
                 Block::Planks => Some(Item::Planks),
                 Block::Table => Some(Item::Table),
                 Block::Furnace => Some(Item::Furnace),
@@ -736,7 +778,7 @@ impl Game {
                     velocity: [0.6, 2.5, -0.4],
                     pos: (p.as_vec3() + Vec3::splat(0.5)).to_array(),
                     item: i,
-                    count: 1,
+                    count: if b == Block::Reliquary { 6 } else { 1 },
                 });
             }
             self.feedback.sound(crate::feedback::Cue::Break);
@@ -752,6 +794,28 @@ impl Game {
     }
     fn update_mobs(&mut self, dt: f32) {
         let player = Vec3::from_array(self.player.pos);
+        if let Some(home) = self.world.nearby_ruin(player.x as i32, player.z as i32) {
+            let key = format!("guardian:{:?}", home.to_array());
+            if player.distance(home.as_vec3()) < 28.
+                && self.world.get(home + IVec3::Y) == Block::Reliquary
+                && !self.player.discoveries.contains(&key)
+                && !self
+                    .entities
+                    .iter()
+                    .any(|(_, m)| m.kind == MobKind::Guardian(home.to_array()))
+            {
+                self.entities.spawn(Mob {
+                    kind: MobKind::Guardian(home.to_array()),
+                    pos: home.as_vec3() + Vec3::new(0.5, 1.01, 3.5),
+                    health: 65.,
+                    cooldown: 0.8,
+                    level: 4,
+                });
+                self.player
+                    .discover(format!("ruin:{:?}", home.to_array()), 50);
+                self.say("Ancient ruin: defeat its guardian to unseal the iron cache");
+            }
+        }
         self.spawn_timer -= dt;
         if self.spawn_timer <= 0. {
             self.spawn_timer = 18.;
@@ -765,6 +829,7 @@ impl Game {
                 let pos = Vec3::new(x, y, z);
                 if !collides(&self.world, pos) {
                     self.entities.spawn(Mob {
+                        kind: MobKind::Husk,
                         pos,
                         health: 30.,
                         cooldown: 0.,
@@ -787,7 +852,12 @@ impl Game {
             let diff = player - mob.pos;
             let dist = diff.length();
             if dist < 18. && dist > 1.4 {
-                let movement = Vec3::new(diff.x, 0., diff.z).normalize_or_zero() * dt * 1.7;
+                let speed = if matches!(mob.kind, MobKind::Guardian(_)) {
+                    2.2
+                } else {
+                    1.7
+                };
+                let movement = Vec3::new(diff.x, 0., diff.z).normalize_or_zero() * dt * speed;
                 for axis in [0, 2] {
                     let mut p = mob.pos;
                     p[axis] += movement[axis];
@@ -815,7 +885,11 @@ impl Game {
                     )
                     .is_none()
             {
-                self.player.health -= 7.;
+                self.player.health -= if matches!(mob.kind, MobKind::Guardian(_)) {
+                    12.
+                } else {
+                    7.
+                };
                 mob.cooldown = 1.2;
             }
         }
@@ -1281,5 +1355,67 @@ mod placed_furnace_tests {
         assert_eq!(g.player.inventory.processing, Furnace::default());
         g.use_selected();
         assert_eq!(g.furnaces[&[0, 101, -1]], Furnace::default());
+    }
+}
+
+#[cfg(test)]
+mod expansion_tests {
+    use super::*;
+    #[test]
+    fn iron_rejects_stone_pick_and_cache_requires_guardian_victory() {
+        let mut g = Game::new(314159);
+        let p = IVec3::new(0, 101, -2);
+        g.world.set(p, Block::Iron);
+        g.player.inventory.add(Item::StonePick, 1);
+        g.player.inventory.equip(Item::StonePick, 0);
+        g.player.inventory.selected = 0;
+        g.target = Some((p, p + IVec3::Z));
+        g.attack(10.);
+        assert_eq!(g.world.get(p), Block::Iron);
+        assert!(g.drops.is_empty());
+        g.player.inventory.add(Item::CopperPick, 1);
+        g.player.inventory.equip(Item::CopperPick, 0);
+        g.attack(10.);
+        assert_eq!(g.world.get(p), Block::Air);
+        assert_eq!(g.drops[0].item, Item::IronOre);
+
+        let home = (-8..=8)
+            .find_map(|x| (-8..=8).find_map(|z| g.world.ruin_in_cell(x, z)))
+            .unwrap();
+        g.player.pos = (home.as_vec3() + Vec3::new(0.5, 1.01, 4.5)).to_array();
+        g.update_mobs(0.);
+        g.update_mobs(0.);
+        assert_eq!(
+            g.entities
+                .iter()
+                .filter(|(_, m)| matches!(m.kind, MobKind::Guardian(_)))
+                .count(),
+            1
+        );
+        g.target = Some((home + IVec3::Y, home + IVec3::Y + IVec3::Z));
+        // Look away from the guardian so the test targets mining only.
+        g.player.yaw = std::f32::consts::PI;
+        g.attack(10.);
+        assert_eq!(g.world.get(home + IVec3::Y), Block::Reliquary);
+        g.player
+            .discoveries
+            .insert(format!("guardian:{:?}", home.to_array()));
+        g.attack(10.);
+        assert_eq!(g.world.get(home + IVec3::Y), Block::Air);
+        assert!(
+            g.drops
+                .iter()
+                .any(|d| d.item == Item::IronIngot && d.count == 6)
+        );
+        let ids: Vec<_> = g.entities.iter().map(|(id, _)| id).collect();
+        for id in ids {
+            g.entities.despawn(id);
+        }
+        g.update_mobs(0.);
+        assert!(
+            !g.entities
+                .iter()
+                .any(|(_, m)| matches!(m.kind, MobKind::Guardian(_)))
+        );
     }
 }

@@ -307,3 +307,64 @@ Smoke and expedition helpers explicitly approach their fixture loot.
 Successful world-item collection queues a short, bright rising pickup tone through
 the existing audio worker. Multiple drops collected in one step share one cue;
 out-of-range drops and pickups blocked by a full inventory remain silent.
+
+## Iron expeditions and tundra ruins
+
+The second tier extends the existing registries without changing earlier item
+discriminants or recipe indices. Iron veins occur in every biome, below twelve
+blocks of cover, and require a copper pickaxe. A table crafts a crude smelter
+from six cobblestone and two copper ingots. It shares placed-furnace inventory,
+reach, transfer, fuel, XP, mining protection and persistence rules, but can also
+process iron. Basic furnaces cannot process iron and consume no fuel trying.
+Both processors take five seconds and 1,000 joules per item. Iron axes, picks and
+swords use the existing tool patterns; durability is 600, harvesting tier four,
+and sword damage 19 before stat bonuses (copper: 360, tier three, damage 14).
+
+Tundra uses a separate smooth climate field outside a 240-block spawn exclusion.
+It has snow-colored solid surface blocks, no oak trees, and the existing hill,
+mountain, cave and ore generation. Temperature, clothing and snow accumulation
+remain future systems; current expedition preparation consists of food, lights,
+a bed/camp and better weapons. Natural generation now includes the new biome
+and ores in existing worlds too: generated terrain is reconstructed from seed,
+so untouched terrain can change, while saved block edits remain authoritative.
+This is an intentional content-generation change, not a save reset.
+
+Each 256-block horizontal cell has one seeded ruin candidate. Only tundra sites
+with gentle corner elevations qualify. A 13-block square foundation, broken
+walls, four taller pillars and a south entrance surround a blue iron cache.
+Foundation fill and interior clearing make the ruin traversable. Column halo
+generation and direct sampling use the same structure rules; normal chunk bounds
+include the structures. Ruins use code-native colored voxels and require no assets.
+
+Approaching within 28 blocks summons one ruin guardian. It has 65 health,
+level four, 2.2-block/second pursuit and 12 melee damage, compared with the husk's
+30 health, level one, 1.7 speed and seven damage. Blue-gray body/head colors and
+the target label distinguish it. The guardian uses existing collision, line of
+sight, melee, hit feedback and loot systems. Defeat drops coal and grants a
+one-time 60-XP completion discovery in addition to normal kill XP. Initial ruin
+discovery grants 50 XP. The cache refuses mining until that ruin's guardian has
+been defeated, then drops six iron ingots. Its removed block persists, so the
+reward cannot be farmed by reloading. Guardian completion is keyed by coordinates
+in existing player discoveries. Living guardians remain transient and respawn
+when revisiting/reloading an unfinished ruin; defeated ones do not.
+
+Save v3 retains its existing structure. New items/blocks serialize by enum name,
+placed smelters use the furnace-state list, and 15-entry craft histories expand
+to twenty entries with zero counts for new recipes. Legacy v1 inventory migration
+only indexes the original 22 items. Unknown/malformed recipe-history lengths
+still fail validation. No user save is rewritten during migration alone.
+
+Validation includes all recipe patterns, basic-furnace iron rejection, saved
+half-finished iron processing, exact fuel accounting, copper-pick gating,
+deterministic tundra/ruin sampling and cross-chunk halos, sealed-cache rewards,
+single guardian spawning/completion, legacy craft history expansion, placed
+smelter persistence and reload without guardian/reward regeneration.
+The expanded tools/expedition.rs mines and crafts through iron using normal
+transactions, then relocates to a natural tundra ruin, fights its guardian and
+collects the cache. It retains controlled resources and diagnostic travel;
+natural discovery difficulty and combat balance still need human play.
+
+Native validation: a bounded 900-frame release Vulkan session using a temporary
+ruin save rendered and exited cleanly. Capture inspection confirmed ruin geometry,
+the guardian, held iron sword, new hotbar icons and damage feedback. The session
+was muted. See docs/PLAYTEST.md for measured frame times and remaining manual checks.

@@ -5,7 +5,21 @@ pub struct Entity {
     index: usize,
     generation: u32,
 }
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MobKind {
+    Husk,
+    Guardian([i32; 3]),
+}
+impl MobKind {
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Husk => "Husk",
+            Self::Guardian(_) => "Ruin guardian",
+        }
+    }
+}
 pub struct Mob {
+    pub kind: MobKind,
     pub pos: Vec3,
     pub health: f32,
     pub cooldown: f32,
@@ -76,6 +90,7 @@ mod tests {
     fn stale_entity_cannot_access_reused_slot() {
         let mut e = Entities::default();
         let a = e.spawn(Mob {
+            kind: MobKind::Husk,
             pos: Vec3::ZERO,
             health: 10.,
             cooldown: 0.,
@@ -83,6 +98,7 @@ mod tests {
         });
         e.despawn(a);
         let b = e.spawn(Mob {
+            kind: MobKind::Husk,
             pos: Vec3::ONE,
             health: 10.,
             cooldown: 0.,
