@@ -7,6 +7,8 @@ mod game;
 mod items;
 #[path = "../tools/performance.rs"]
 mod performance;
+#[path = "../tools/playtest.rs"]
+mod playtest;
 mod render;
 mod save;
 mod streaming;
@@ -29,6 +31,7 @@ struct Options {
     save: PathBuf,
     smoke: bool,
     expedition: bool,
+    playtest: bool,
     tour: bool,
     mute: bool,
     frames: Option<u32>,
@@ -43,6 +46,7 @@ fn options() -> Result<Options, String> {
         save: PathBuf::from("saves/world.json"),
         smoke: false,
         expedition: false,
+        playtest: false,
         tour: false,
         mute: false,
         frames: None,
@@ -75,6 +79,7 @@ fn options() -> Result<Options, String> {
                 ))
             }
             "--tour" => o.tour = true,
+            "--playtest" => o.playtest = true,
             "--expedition" => o.expedition = true,
             "--smoke" => o.smoke = true,
             "--capture" => {
@@ -93,7 +98,7 @@ fn options() -> Result<Options, String> {
             }
             "--help" | "-h" => {
                 println!(
-                    "Voxel Adventure\n  --new          create a separate fresh save with a random seed\n  --seed N       seed for a new world (default 314159)\n  --save PATH    world file (default saves/world.json)\n  --smoke        headless gameplay/persistence check; uses a temporary save\n  --frames N     render N frames then save and exit\n  --capture PATH save final frame as PPM (defaults to 240 frames)\n  --tour         scripted camera relocations for streaming measurements\n  --expedition   run controlled headless progression expedition\n  --profile PATH write frame timings and chunk backlog as CSV\n  --mute         disable sound playback\n  --pack         start with the inventory open\n\nWASD move; mouse look; Space jump; Shift sprint\nLMB mine/attack; RMB place/eat/use; wheel or 1-9 select\nE inventory/crafting/stats; R sleep near bed; F5 save; Esc menu"
+                    "Voxel Adventure\n  --new          create a separate fresh save with a random seed\n  --seed N       seed for a new world (default 314159)\n  --save PATH    world file (default saves/world.json)\n  --smoke        headless gameplay/persistence check; uses a temporary save\n  --frames N     render N frames then save and exit\n  --capture PATH save final frame as PPM (defaults to 240 frames)\n  --tour         scripted camera relocations for streaming measurements\n  --playtest     run headless mechanics course and progression expedition\n  --expedition   run controlled headless progression expedition\n  --profile PATH write frame timings and chunk backlog as CSV\n  --mute         disable sound playback\n  --pack         start with the inventory open\n\nWASD move; mouse look; Space jump; Shift sprint\nLMB mine/attack; RMB place/eat/use; wheel or 1-9 select\nE inventory/crafting/stats; R sleep near bed; F5 save; Esc menu"
                 );
                 std::process::exit(0);
             }
@@ -640,6 +645,10 @@ fn smoke() -> Result<(), String> {
 }
 fn run() -> Result<(), String> {
     let mut options = options()?;
+    if options.playtest {
+        playtest::run()?;
+        return expedition::run();
+    }
     if options.expedition {
         return expedition::run();
     }

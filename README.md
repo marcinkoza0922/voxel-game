@@ -111,3 +111,8 @@ python3 tools/analyze-profile.py /tmp/tour.csv
 The tour requires an explicit save path that does not already exist. Use a fresh
 path for each run. See [playtest results](docs/PLAYTEST.md) for measured results
 and remaining manual checks.
+
+`cargo run -- --playtest` runs the deterministic headless mechanics course and
+progression expedition. Both also run automatically under `cargo nextest run`.
+They check game rules using controlled fixtures without touching your save;
+see [the playtest guide](docs/PLAYTEST.md) for coverage and limits.

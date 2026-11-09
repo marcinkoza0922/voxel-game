@@ -13,5 +13,5 @@ check cargo fmt --check
 check cargo clippy --message-format=short -- -D warnings
 check cargo nextest run
 check cargo run -- --smoke
-check cargo run -- --expedition
-printf 'Formatting, clippy, nextest, gameplay smoke, and expedition passed.\n'
+check cargo run -- --playtest
+printf 'Formatting, clippy, nextest, gameplay smoke, and automated playtest passed.\n'

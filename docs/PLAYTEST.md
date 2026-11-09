@@ -110,3 +110,19 @@ feels good. Further rendering work should follow a repeatable measured hitch.
 - Natural ruin search, full travel, smelter mouse ergonomics, combat balance and
   extended play remain human evaluation work. Tundra temperature/clothing are
   outside this content pass.
+
+## Automated functional suite
+
+Run `cargo nextest run` for the mechanics course and progression expedition along
+with the unit regressions. Run `cargo run -- --playtest` for both scenarios with
+success reports, or `./tools/verify.sh` for formatting, lint, tests and CLI checks.
+No display, audio service or existing save is required. Failures name the failed
+mechanics checkpoint or expedition action and return a failing test/exit status.
+
+The mechanics course covers movement speeds, sprint hunger gating, jumping,
+landing, solid walls, falls, hunger/rest drain, starvation, death/respawn inventory
+retention and timed torch expiry. The expedition covers resource-to-iron
+progression, placed processing stations, combat/loot, food/sleep, exploration
+rewards, the tundra guardian/cache and persistence. Both use controlled fixtures;
+see DESIGN.md for their setup and limits. They establish functional correctness,
+not fun, natural resource discoverability or UI/audio/visual quality.

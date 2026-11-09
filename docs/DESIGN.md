@@ -368,3 +368,33 @@ Native validation: a bounded 900-frame release Vulkan session using a temporary
 ruin save rendered and exited cleanly. Capture inspection confirmed ruin geometry,
 the guardian, held iron sword, new hotbar icons and damage feedback. The session
 was muted. See docs/PLAYTEST.md for measured frame times and remaining manual checks.
+
+## Automated functional playtesting
+
+`tools/playtest.rs` provides a deterministic, display-free mechanics course at
+seed 314159, with cleared headroom and a stone floor at y=299. Fixtures set up
+conditions (including low hunger, a high fall, death, and a shortened torch timer);
+normal `Game::tick` calls at 60 Hz drive each action. Bounded frame counts and
+checkpoint-specific errors make failures repeatable without real-time waits.
+The course checks walking distance, sprint speed and its hunger gate, hunger/rest
+drain, jumping and landing, wall collision, fall damage, starvation, respawn
+vitals/inventory retention, and torch presence before/after expiry.
+
+`playtest::tests::mechanics_course` and
+`playtest::tests::progression_expedition` are ordinary nextest tests, so the
+functional scenarios run with `cargo nextest run`. The latter reuses
+`tools/expedition.rs` for mining, crafting, station placement, timed processing,
+combat/loot, eating, sleep safety, biome discovery, ruin completion and save/load.
+`cargo run -- --playtest` runs both with concise success reports and a nonzero
+exit on failure; `tools/verify.sh` also checks that command-line entry point.
+The expedition uses a temporary save, cleans it up on success or failure, and
+never opens the player's save. Neither scenario starts a window or audio worker.
+
+These are mechanics contracts, not an autonomous exploration agent: controlled
+resource blocks, inventory/grid setup and diagnostic relocation bypass resource
+search, mouse/UI interactions and travel difficulty. Shortened timers avoid
+waiting for long survival cycles. Rendering, audible sound quality, input wiring,
+performance, balance and fun still require separate native/human checks. Existing
+unit tests cover detailed transaction rejection and persistence edge cases.
+Add new functional checkpoints here or extend the expedition as systems arrive;
+keep fixtures explicit and assert observable outcomes through game actions.
