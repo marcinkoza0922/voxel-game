@@ -1074,9 +1074,14 @@ fn vegetation(out: &mut Vec<Vertex>, seed: u64, support: IVec3, block: Block) {
     let root = origin + Vec3::new(0.5, 0., 0.5);
     if block == Block::Shrub {
         // Overlapping asymmetric leaf clusters around short woody branches.
-        for i in 0..7 {
+        let count = 4 + (h % 7) as u32;
+        let spread = 0.65 + ((h >> 12) & 255) as f32 / 730.;
+        let stature = 0.65 + ((h >> 20) & 255) as f32 / 730.;
+        let rotation = ((h >> 32) & 255) as f32 * std::f32::consts::TAU / 255.;
+        let warmth = ((h >> 48) & 255) as f32 / 255.;
+        for i in 0..count {
             let bits = h.rotate_right(i * 9);
-            let angle = i as f32 * 2.4;
+            let angle = rotation + i as f32 * 2.4;
             let radius = if i == 0 {
                 0.
             } else {
@@ -1084,22 +1089,27 @@ fn vegetation(out: &mut Vec<Vertex>, seed: u64, support: IVec3, block: Block) {
             };
             let center = root
                 + Vec3::new(
-                    angle.cos() * radius,
-                    0.22 + ((bits >> 8) & 255) as f32 / 1100.,
-                    angle.sin() * radius,
+                    angle.cos() * radius * spread,
+                    (0.19 + ((bits >> 8) & 255) as f32 / 1100.) * stature,
+                    angle.sin() * radius * spread,
                 );
             plant_stem(out, root, center, 0.022, [0.32, 0.25, 0.12]);
-            let size = Vec3::new(0.27, 0.24, 0.27) * (0.85 + ((bits >> 24) & 63) as f32 / 180.);
+            let size = Vec3::new(0.27 * spread, 0.24 * stature, 0.27 * spread)
+                * (0.65 + ((bits >> 24) & 63) as f32 / 120.);
+            let start = out.len();
             box_mesh(
                 out,
                 center - size * 0.5,
                 size,
                 [
-                    0.15 + i as f32 * 0.012,
-                    0.32 + i as f32 * 0.018,
-                    0.09 + i as f32 * 0.008,
+                    0.13 + warmth * 0.11 + i as f32 * 0.006,
+                    0.29 + warmth * 0.10 + i as f32 * 0.012,
+                    0.07 + (1. - warmth) * 0.07,
                 ],
             );
+            for vertex in &mut out[start..] {
+                vertex.tile[2] = -4.; // Shrub leaves: cutout and transmitted sunlight.
+            }
         }
         return;
     }

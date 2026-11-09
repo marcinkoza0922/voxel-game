@@ -17,13 +17,13 @@ struct Out { @builtin(position) clip: vec4<f32>, @location(0) world: vec3<f32>, 
     var o:Out; o.clip=camera.view*vec4(v.pos,1.0);o.world=v.pos;o.normal=v.normal;o.color=v.color;o.tile=v.tile;o.shadow=camera.light_view*vec4(v.pos,1.0);return o;
 }
 fn leaf_gap(world:vec3<f32>, normal:vec3<f32>, layer:f32)->bool {
-    if(layer<14.5 || layer>17.5) {return false;}
+    if((layer<14.5 || layer>17.5) && layer > -3.5) {return false;}
     let axis=abs(normal);
     var uv=world.xy;
     if(axis.x>0.5) {uv=world.zy;}
     if(axis.y>0.5) {uv=world.xz;}
-    let cell=floor(uv*16.0);
-    return fract(sin(dot(cell,vec2(127.1,311.7)))*43758.5453)<0.28;
+    let cell=floor(uv*select(16.0,32.0,layer < -3.5));
+    return fract(sin(dot(cell,vec2(127.1,311.7)))*43758.5453)<select(0.28,0.36,layer < -3.5);
 }
 @fragment fn fs(v:Out)->@location(0) vec4<f32> {
     let p=v.shadow.xyz/v.shadow.w;

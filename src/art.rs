@@ -39,7 +39,37 @@ fn tint(c: [f32; 3], shade: f32) -> [f32; 3] {
     c.map(|v| (v * shade).clamp(0., 1.))
 }
 
+// Overlapping narrow, bent blades at native texel resolution, wrapping at tile edges.
+fn grass_texel(x: i32, y: i32) -> [f32; 3] {
+    let mut color = tint(
+        [0.26, 0.41, 0.12],
+        0.94 + (noise(x, y, 71) % 13) as f32 * 0.01,
+    );
+    for blade in 0..90 {
+        let h = noise(blade, 0, 83);
+        let root_x = (h % 32) as i32;
+        let root_y = ((h >> 8) % 32) as i32;
+        let length = 3 + ((h >> 16) % 7) as i32;
+        let along = (root_y - y).rem_euclid(32);
+        let bend = ((h >> 24) % 5) as i32 - 2;
+        let spine = root_x + bend * along / length;
+        let across = (x - spine + 16).rem_euclid(32) - 16;
+        if along < length && (across == 0 || (across == 1 && along < length / 3)) {
+            let tip = along as f32 / length as f32;
+            let shade = 0.80 + ((h >> 12) % 35) as f32 * 0.01 + tip * 0.23;
+            color = tint([0.36, 0.53, 0.16], shade);
+        }
+    }
+    color
+}
+
 pub fn texel(block: Block, face: usize, x: i32, y: i32) -> [f32; 3] {
+    if block == Block::Grass
+        && (face == 1 || (face == 0 && y < 5 + (noise(x / 2, 0, 3) % 7) as i32))
+    {
+        return grass_texel(x, y);
+    }
+
     use Block::*;
     let fine = noise(x, y, 41);
     // Broad motifs occupy two-pixel clusters; full-resolution grain breaks their edges.
@@ -64,22 +94,6 @@ pub fn texel(block: Block, face: usize, x: i32, y: i32) -> [f32; 3] {
         Shrub | TallGrass | RedFlower | YellowFlower | PurpleFlower | WhiteFlower | PinkFlower
         | BlueFlower => block.color(),
         Air => [0.; 3],
-        Grass if face == 1 => {
-            let blade = (x + (y / 3) * 5) % 7;
-            tint(
-                [0.36, 0.55, 0.20],
-                if blade == 0 {
-                    1.25
-                } else if coarse.is_multiple_of(5) {
-                    0.79
-                } else {
-                    grain
-                },
-            )
-        }
-        Grass if face == 0 && y < 3 + (noise(x / 2, 0, 3) % 4) as i32 => {
-            tint([0.32, 0.49, 0.18], grain)
-        }
         Grass | Dirt => tint(
             [0.43, 0.28, 0.17],
             if n % 23 < 2 {

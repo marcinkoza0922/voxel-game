@@ -529,3 +529,19 @@ Regression checks cover sparse/clustered grass distribution and height, soil
 spread timing, covered/isolated soil rejection, slope and chunk-boundary spread,
 natural dirt exposed by digging, saved cover, and step-versus-cliff materials.
 The latest headless tests do not substitute for a native visual check.
+
+## Shrub and turf appearance refinement
+
+Shrubs now vary deterministically between four and ten leaf clusters, with
+independent overall spread, stature, rotation, cluster size and olive-to-cool-green
+color variation. Woody branches retain opaque shading. Shrub leaf geometry uses
+material marker -4 for fine world-space cutout gaps in both color and shadow
+passes, plus the existing reverse-side foliage sunlight transmission. This gives
+partial visibility and backlit leaves without sorted alpha blending. Shapes stay
+inside their plant voxel and existing selection bounds.
+
+Grass-covered soil now uses native 32px overlapping narrow blade strokes with
+varied length, bend, shade and highlighted tips, replacing broad two-pixel green
+clusters. The same blade material extends through the uneven grassy cliff lip;
+step sides continue to use the full turf texture. Other materials retain their
+existing clustered grain and all tiles retain their generated mipmaps.
