@@ -10,6 +10,15 @@ cargo run --release
 
 The first release build takes a while. `cargo run` also works for development. By default the game loads `saves/world.json`, or creates a world with seed `314159`. Use `--save saves/another.json --seed 42` for a new world; an existing save supplies its own seed. Save files are versioned JSON and are excluded from Git. Failed or incompatible loads stop with an error and preserve the original file.
 
+To start fresh, press **Esc → New world (saves current)**. This saves your current
+world and switches to a fresh seed and separate `world-N.json` file in the same
+save directory. The window title shows the active save path. Resume that world
+later with `cargo run --release -- --save saves/world-N.json`.
+
+You can also launch with `cargo run --release -- --new`. Add `--seed 42` for a
+specific seed; `--save PATH` selects the directory beside PATH for the new file.
+Existing files are preserved.
+
 | Control | Action |
 | --- | --- |
 | WASD / mouse | Walk / look |

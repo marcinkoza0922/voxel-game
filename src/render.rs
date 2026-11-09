@@ -337,6 +337,10 @@ impl Renderer {
         let _ = self.device.poll(wgpu::PollType::wait_indefinitely());
         drop(self);
     }
+    pub fn reset_world(&mut self) {
+        self.meshes.clear();
+        self.ui = crate::ui::Ui::new();
+    }
     pub fn resize(&mut self, w: u32, h: u32) {
         if w == 0 || h == 0 {
             return;

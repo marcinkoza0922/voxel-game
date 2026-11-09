@@ -4,7 +4,11 @@ use crate::{
     world::{Edit, MAX_Y, MIN_Y},
 };
 use serde::{Deserialize, Serialize};
-use std::{collections::BTreeMap, fs, path::Path};
+use std::{
+    collections::BTreeMap,
+    fs,
+    path::{Path, PathBuf},
+};
 
 #[derive(Serialize, Deserialize)]
 struct Save {
@@ -21,6 +25,47 @@ pub fn write(game: &Game, path: &Path) -> Result<(), String> {
     if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
         fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     }
+    let data = encode(game)?;
+    let temp = path.with_extension("json.tmp");
+    use std::io::Write;
+    let mut f = fs::File::create(&temp).map_err(|e| e.to_string())?;
+    f.write_all(&data)
+        .and_then(|_| f.sync_all())
+        .map_err(|e| e.to_string())?;
+    fs::rename(temp, path).map_err(|e| e.to_string())
+}
+
+/// Creates a separate save beside the current one, never replacing an existing file.
+pub fn create(game: &Game, beside: &Path) -> Result<PathBuf, String> {
+    use std::io::Write;
+    let directory = beside
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    fs::create_dir_all(directory).map_err(|e| e.to_string())?;
+    let data = encode(game)?;
+    for index in 1u64.. {
+        let path = directory.join(format!("world-{index}.json"));
+        let mut file = match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+        {
+            Ok(file) => file,
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e.to_string()),
+        };
+        if let Err(e) = file.write_all(&data).and_then(|_| file.sync_all()) {
+            drop(file);
+            let _ = fs::remove_file(&path);
+            return Err(e.to_string());
+        }
+        return Ok(path);
+    }
+    Err("No available world filename".into())
+}
+
+fn encode(game: &Game) -> Result<Vec<u8>, String> {
     let save = Save {
         version: 3,
         seed: game.world.seed,
@@ -38,15 +83,9 @@ pub fn write(game: &Game, path: &Path) -> Result<(), String> {
         torches: game.torch_life.iter().map(|(p, t)| (*p, *t)).collect(),
         furnaces: game.furnaces.iter().map(|(p, f)| (*p, f.clone())).collect(),
     };
-    let data = serde_json::to_vec(&save).map_err(|e| e.to_string())?;
-    let temp = path.with_extension("json.tmp");
-    use std::io::Write;
-    let mut f = fs::File::create(&temp).map_err(|e| e.to_string())?;
-    f.write_all(&data)
-        .and_then(|_| f.sync_all())
-        .map_err(|e| e.to_string())?;
-    fs::rename(temp, path).map_err(|e| e.to_string())
+    serde_json::to_vec(&save).map_err(|e| e.to_string())
 }
+
 pub fn read(path: &Path) -> Result<Option<Game>, String> {
     let data = match fs::read(path) {
         Ok(d) => d,
@@ -182,6 +221,26 @@ pub fn read(path: &Path) -> Result<Option<Game>, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn new_saves_preserve_existing_worlds() {
+        let directory = std::env::temp_dir().join(format!("voxel-new-save-{}", std::process::id()));
+        fs::create_dir_all(&directory).unwrap();
+        let original = directory.join("world.json");
+        fs::write(&original, b"existing world").unwrap();
+        fs::write(directory.join("world-1.json"), b"occupied").unwrap();
+        let first = create(&Game::new(42), &original).unwrap();
+        let second = create(&Game::new(99), &original).unwrap();
+        assert_ne!(first, second);
+        assert_eq!(read(&first).unwrap().unwrap().world.seed, 42);
+        assert_eq!(read(&second).unwrap().unwrap().world.seed, 99);
+        assert_eq!(fs::read(&original).unwrap(), b"existing world");
+        assert_eq!(
+            fs::read(directory.join("world-1.json")).unwrap(),
+            b"occupied"
+        );
+        fs::remove_dir_all(directory).unwrap();
+    }
+
     #[test]
     fn roundtrip_and_reject_version() {
         let path =

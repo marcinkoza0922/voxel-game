@@ -266,3 +266,20 @@ A regression test uses a freely accepting fake sink to verify that 200 ms of PCM
 cannot be generated faster than real time; another checks stale cue rejection.
 Formatting, short Clippy, quiet nextest, smoke and expedition passed. Live desktop
 listening has not been repeated for this correction.
+
+## Creating new worlds
+
+The pause menu offers New world (saves current). The current save must succeed
+before creating or switching worlds; failure keeps the current game active.
+New worlds receive a fresh seed from the standard library randomly seeded hasher,
+initial player state and an exclusive `world-N.json` file beside the current save.
+Existing names are skipped using create_new, including the current filename.
+The initial save is written and synced before switching; a failed initial write
+removes its incomplete file. Switching clears renderer meshes, inventory UI,
+input and simulation/autosave accumulators. The window title identifies the
+active save path. Resume a selected file with the existing --save option.
+
+--new creates a separate save at launch, using a fresh seed unless --seed is
+provided. --save chooses its parent directory; it never overwrites that path.
+Regression coverage checks distinct new saves, seeds on reload and preservation
+of existing files. Native menu interaction still requires a desktop playtest.

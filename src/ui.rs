@@ -19,6 +19,7 @@ pub enum Action {
     Resume,
     Save,
     Quit,
+    NewWorld,
 }
 pub struct Ui {
     pub vertices: Vec<UiVertex>,
@@ -131,7 +132,13 @@ impl Ui {
                 Action::Quit,
                 true,
             );
-            self.text(x, y + 220., "Esc returns to the world", 1.4, MUTED);
+            self.button(
+                [x, y + 208., 320., 42.],
+                "New world (saves current)",
+                Action::NewWorld,
+                true,
+            );
+            self.text(x, y + 272., "Esc returns to the world", 1.4, MUTED);
             if g.message_time > 0. {
                 self.text(24., h - 40., &g.message, 1.3, INK);
             }

@@ -25,6 +25,7 @@ use winit::{
 
 struct Options {
     seed: u64,
+    new: bool,
     save: PathBuf,
     smoke: bool,
     expedition: bool,
@@ -38,6 +39,7 @@ struct Options {
 fn options() -> Result<Options, String> {
     let mut o = Options {
         seed: 314159,
+        new: false,
         save: PathBuf::from("saves/world.json"),
         smoke: false,
         expedition: false,
@@ -49,11 +51,14 @@ fn options() -> Result<Options, String> {
         profile: None,
     };
     let mut explicit_save = false;
+    let mut explicit_seed = false;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
+            "--new" => o.new = true,
             "--mute" => o.mute = true,
             "--seed" => {
+                explicit_seed = true;
                 o.seed = args
                     .next()
                     .ok_or("--seed needs an integer")?
@@ -88,7 +93,7 @@ fn options() -> Result<Options, String> {
             }
             "--help" | "-h" => {
                 println!(
-                    "Voxel Adventure\n  --seed N       seed for a new world (default 314159)\n  --save PATH    world file (default saves/world.json)\n  --smoke        headless gameplay/persistence check; uses a temporary save\n  --frames N     render N frames then save and exit\n  --capture PATH save final frame as PPM (defaults to 240 frames)\n  --tour         scripted camera relocations for streaming measurements\n  --expedition   run controlled headless progression expedition\n  --profile PATH write frame timings and chunk backlog as CSV\n  --mute         disable sound playback\n  --pack         start with the inventory open\n\nWASD move; mouse look; Space jump; Shift sprint\nLMB mine/attack; RMB place/eat/use; wheel or 1-9 select\nE inventory/crafting/stats; R sleep near bed; F5 save; Esc menu"
+                    "Voxel Adventure\n  --new          create a separate fresh save with a random seed\n  --seed N       seed for a new world (default 314159)\n  --save PATH    world file (default saves/world.json)\n  --smoke        headless gameplay/persistence check; uses a temporary save\n  --frames N     render N frames then save and exit\n  --capture PATH save final frame as PPM (defaults to 240 frames)\n  --tour         scripted camera relocations for streaming measurements\n  --expedition   run controlled headless progression expedition\n  --profile PATH write frame timings and chunk backlog as CSV\n  --mute         disable sound playback\n  --pack         start with the inventory open\n\nWASD move; mouse look; Space jump; Shift sprint\nLMB mine/attack; RMB place/eat/use; wheel or 1-9 select\nE inventory/crafting/stats; R sleep near bed; F5 save; Esc menu"
                 );
                 std::process::exit(0);
             }
@@ -104,7 +109,16 @@ fn options() -> Result<Options, String> {
                 .into(),
         );
     }
+    if o.new && !explicit_seed {
+        o.seed = fresh_seed();
+    }
     Ok(o)
+}
+fn fresh_seed() -> u64 {
+    let mut hasher = std::collections::hash_map::RandomState::new().build_hasher();
+    use std::hash::{BuildHasher, Hasher};
+    hasher.write_u32(std::process::id());
+    hasher.finish()
 }
 struct App {
     game: Game,
@@ -155,6 +169,35 @@ impl App {
                 self.game.say(format!("Save failed: {e}"));
                 false
             }
+        }
+    }
+    fn new_world(&mut self) {
+        if !self.save() {
+            return;
+        }
+        let mut game = Game::new(fresh_seed());
+        match save::create(&game, &self.options.save) {
+            Ok(path) => {
+                game.say(format!("New world: {}", path.display()));
+                self.game = game;
+                self.options.save = path;
+                if let Some(r) = &mut self.renderer {
+                    r.reset_world();
+                }
+                if let Some(w) = &self.window {
+                    w.set_title(&format!(
+                        "Voxel Adventure - {}",
+                        self.options.save.display()
+                    ));
+                }
+                self.pack = false;
+                self.paused = false;
+                self.accumulator = 0.;
+                self.autosave = 0.;
+                self.last = Instant::now();
+                self.capture();
+            }
+            Err(e) => self.game.say(format!("New world failed: {e}")),
         }
     }
     fn exit(&mut self, event_loop: &ActiveEventLoop) {
@@ -220,6 +263,7 @@ impl App {
             ui::Action::Save => {
                 self.save();
             }
+            ui::Action::NewWorld => self.new_world(),
             ui::Action::Quit => self.exit(event_loop),
         }
     }
@@ -234,7 +278,10 @@ impl ApplicationHandler for App {
                 event_loop
                     .create_window(
                         Window::default_attributes()
-                            .with_title("Voxel Adventure")
+                            .with_title(format!(
+                                "Voxel Adventure - {}",
+                                self.options.save.display()
+                            ))
                             .with_inner_size(winit::dpi::LogicalSize::new(1280., 800.))
                             .with_min_inner_size(winit::dpi::LogicalSize::new(900., 600.)),
                     )
@@ -585,14 +632,21 @@ fn smoke() -> Result<(), String> {
     Ok(())
 }
 fn run() -> Result<(), String> {
-    let options = options()?;
+    let mut options = options()?;
     if options.expedition {
         return expedition::run();
     }
     if options.smoke {
         return smoke();
     }
-    let game = save::read(&options.save)?.unwrap_or_else(|| Game::new(options.seed));
+    let game = if options.new {
+        let game = Game::new(options.seed);
+        options.save = save::create(&game, &options.save)?;
+        println!("Created {} (seed {})", options.save.display(), options.seed);
+        game
+    } else {
+        save::read(&options.save)?.unwrap_or_else(|| Game::new(options.seed))
+    };
     let event_loop = EventLoop::new().map_err(|e| e.to_string())?;
     let pack = options.pack;
     let profile = options
