@@ -104,7 +104,7 @@ fn options() -> Result<Options, String> {
             }
             "--help" | "-h" => {
                 println!(
-                    "Voxel Adventure\n  --headless     render offscreen without display/audio (default 240 frames)\n  --new          create a separate fresh save with a random seed\n  --seed N       seed for a new world (default 314159)\n  --save PATH    world file (default saves/world.json)\n  --smoke        headless gameplay/persistence check; uses a temporary save\n  --frames N     render N frames then save and exit\n  --capture PATH save final frame as PPM (defaults to 240 frames)\n  --tour         scripted camera relocations for streaming measurements\n  --playtest     run headless mechanics course and progression expedition\n  --expedition   run controlled headless progression expedition\n  --profile PATH write frame timings and chunk backlog as CSV\n  --mute         disable sound playback\n  --pack         start with the inventory open\n\nWASD move; mouse look; Space jump; Shift sprint\nLMB mine/attack; RMB place/eat/use; wheel or 1-9 select\nE inventory/crafting/stats; R sleep near bed; F5 save; Esc menu"
+                    "Voxel Adventure\n  --headless     render offscreen without display/audio (default 240 frames)\n  --new          create a separate fresh save with a random seed\n  --seed N       seed for a new world (default 314159)\n  --save PATH    world file (default saves/world.json)\n  --smoke        headless gameplay/persistence check; uses a temporary save\n  --frames N     render N frames then save and exit\n  --capture PATH save final frame as PPM (defaults to 240 frames)\n  --tour         scripted camera relocations for streaming measurements\n  --playtest     run headless mechanics course and progression expedition\n  --expedition   run controlled headless progression expedition\n  --profile PATH write frame timings and chunk backlog as CSV\n  --mute         disable sound playback\n  --pack         start with the inventory open\n\nWASD move; mouse look; Space jump; double-tap W sprint; Shift walk\nLMB mine/attack; RMB place/eat/use; wheel or 1-9 select\nE inventory/crafting/stats; R sleep near bed; F5 save; Esc menu"
                 );
                 std::process::exit(0);
             }
@@ -142,6 +142,8 @@ struct App {
     audio: Option<audio::Audio>,
     keys: HashSet<KeyCode>,
     attack: bool,
+    forward_tap: Option<Instant>,
+    sprinting: bool,
     pack: bool,
     paused: bool,
     focused: bool,
@@ -171,6 +173,8 @@ impl App {
         self.drag_origin = None;
         self.attack = false;
         self.keys.clear();
+        self.forward_tap = None;
+        self.sprinting = false;
     }
     fn save(&mut self) -> bool {
         match save::write(&self.game, &self.options.save) {
@@ -355,6 +359,23 @@ impl ApplicationHandler for App {
             }
             WindowEvent::KeyboardInput { event, .. } => {
                 if let PhysicalKey::Code(code) = event.physical_key {
+                    if code == KeyCode::KeyW {
+                        if event.state == ElementState::Pressed
+                            && !event.repeat
+                            && !self.keys.contains(&code)
+                            && !self.pack
+                            && !self.paused
+                            && self.focused
+                        {
+                            let now = Instant::now();
+                            self.sprinting = self
+                                .forward_tap
+                                .is_some_and(|last| now.duration_since(last).as_secs_f32() <= 0.3);
+                            self.forward_tap = Some(now);
+                        } else if event.state == ElementState::Released {
+                            self.sprinting = false;
+                        }
+                    }
                     if event.state == ElementState::Pressed {
                         self.keys.insert(code);
                     } else {
@@ -500,7 +521,8 @@ impl ApplicationHandler for App {
                         right: pressed(KeyCode::KeyD) as i32 as f32
                             - pressed(KeyCode::KeyA) as i32 as f32,
                         jump: pressed(KeyCode::Space),
-                        sprint: pressed(KeyCode::ShiftLeft),
+                        sprint: self.sprinting && pressed(KeyCode::KeyW),
+                        walk: pressed(KeyCode::ShiftLeft) || pressed(KeyCode::ShiftRight),
                         attack: self.attack,
                     };
                     while self.accumulator >= STEP {
@@ -690,6 +712,8 @@ fn run() -> Result<(), String> {
         renderer: None,
         audio,
         keys: HashSet::new(),
+        forward_tap: None,
+        sprinting: false,
         attack: false,
         pack,
         paused: false,

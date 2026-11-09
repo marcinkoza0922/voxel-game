@@ -96,6 +96,7 @@ pub struct Input {
     pub right: f32,
     pub jump: bool,
     pub sprint: bool,
+    pub walk: bool,
     pub attack: bool,
 }
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -526,9 +527,12 @@ impl Game {
                 self.world.set(IVec3::from_array(p), Block::Air);
             }
         }
+        let sprint = input.sprint && !input.walk && self.player.hunger > 10.;
         let speed = 4.5
             * (1. + (self.player.stats[5] as f32 * 0.012).min(0.24))
-            * if input.sprint && self.player.hunger > 10. {
+            * if input.walk {
+                0.45
+            } else if sprint {
                 1.45
             } else {
                 1.
@@ -538,13 +542,21 @@ impl Game {
         let walk = (forward * input.forward + right * input.right).normalize_or_zero() * speed;
         self.velocity.x = walk.x;
         self.velocity.z = walk.z;
-        if input.jump && self.grounded {
+        let position = Vec3::from_array(self.player.pos);
+        let ahead = position + walk.normalize_or_zero() * 0.45;
+        let auto_jump = !input.walk
+            && walk.length_squared() > 0.
+            && collides(&self.world, ahead)
+            && !collides(&self.world, ahead + Vec3::Y)
+            && !collides(&self.world, position + Vec3::Y);
+        if (input.jump || auto_jump) && self.grounded {
             self.velocity.y = 7.2 * (1. + self.player.stats[5] as f32 * 0.008);
             self.grounded = false;
         }
         self.velocity.y = (self.velocity.y - 22. * dt).max(-45.);
         let mut pos = Vec3::from_array(self.player.pos);
         let was_falling = self.velocity.y;
+        let edge_guard = input.walk && self.grounded;
         self.grounded = false;
         for axis in [0, 2, 1] {
             let delta = self.velocity[axis] * dt;
@@ -552,6 +564,9 @@ impl Game {
             for _ in 0..steps {
                 let mut next = pos;
                 next[axis] += delta / steps as f32;
+                if axis != 1 && edge_guard && !collides(&self.world, next - Vec3::Y * 0.06) {
+                    break;
+                }
                 if collides(&self.world, next) {
                     if axis == 1 {
                         if self.velocity.y < 0. {
@@ -573,8 +588,7 @@ impl Game {
         self.player.pos = pos.to_array();
         self.tick_drops(dt);
         self.collect_drops();
-        self.player.hunger =
-            (self.player.hunger - dt * if input.sprint { 0.12 } else { 0.055 }).max(0.);
+        self.player.hunger = (self.player.hunger - dt * if sprint { 0.12 } else { 0.055 }).max(0.);
         self.player.rest = (self.player.rest - dt * 0.035).max(0.);
         if self.player.hunger == 0. || self.player.rest == 0. {
             self.player.health -= dt * 1.5;
@@ -831,11 +845,30 @@ impl Game {
             self.mining = None;
         }
     }
+    fn spawn_is_dark(&self, pos: Vec3) -> bool {
+        let sample = pos + Vec3::Y;
+        if crate::render::spawn_sky_light(&self.world, self.time, sample) > 0.1 {
+            return false;
+        }
+        let torch_lit = |light: Vec3| {
+            let falloff = (1. - sample.distance(light) / 9.).max(0.);
+            0.8 * falloff * falloff > 0.1
+        };
+        !self
+            .torch_life
+            .keys()
+            .any(|p| torch_lit(IVec3::from_array(*p).as_vec3() + Vec3::new(0.5, 0.77, 0.5)))
+            && !(self.player.inventory.selected() == Item::Torch
+                && self.player.inventory.selected_count() > 0
+                && torch_lit(Vec3::from_array(self.player.pos) + Vec3::Y * 1.6))
+    }
+
     fn update_mobs(&mut self, dt: f32) {
         let player = Vec3::from_array(self.player.pos);
         if let Some(home) = self.world.nearby_ruin(player.x as i32, player.z as i32) {
             let key = format!("guardian:{:?}", home.to_array());
-            if player.distance(home.as_vec3()) < 28.
+            if self.spawn_is_dark(home.as_vec3() + Vec3::new(0.5, 1.01, 3.5))
+                && player.distance(home.as_vec3()) < 28.
                 && self.world.get(home + IVec3::Y) == Block::Reliquary
                 && !self.player.discoveries.contains(&key)
                 && !self
@@ -864,9 +897,17 @@ impl Game {
                 let angle = (h % 628) as f32 / 100.;
                 let x = player.x + angle.sin() * 20.;
                 let z = player.z + angle.cos() * 20.;
-                let y = self.world.height(x as i32, z as i32) as f32 + 1.01;
-                let pos = Vec3::new(x, y, z);
-                if !collides(&self.world, pos) {
+                let surface = self.world.height(x.floor() as i32, z.floor() as i32) + 1;
+                let base = player.y.floor() as i32;
+                let candidate = (base - 8..=base + 8)
+                    .chain(std::iter::once(surface))
+                    .map(|y| Vec3::new(x, y as f32 + 0.01, z))
+                    .find(|p| {
+                        !collides(&self.world, *p)
+                            && collides(&self.world, *p - Vec3::Y * 0.06)
+                            && self.spawn_is_dark(*p)
+                    });
+                if let Some(pos) = candidate {
                     self.entities.spawn(Mob {
                         kind: MobKind::Husk,
                         pos,
@@ -979,6 +1020,73 @@ pub fn collides(world: &World, pos: Vec3) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn spawning_requires_darkness_and_respects_torches() {
+        let mut g = sky_fixture();
+        let p = Vec3::new(0.5, 100.01, 0.5);
+        g.time = 0.25;
+        assert!(!g.spawn_is_dark(p));
+        g.time = 0.75;
+        assert!(g.spawn_is_dark(p));
+        g.torch_life.insert([1, 100, 0], 600.);
+        assert!(!g.spawn_is_dark(p));
+        g.torch_life.clear();
+        g.time = 0.25;
+        for x in -12..=12 {
+            for z in -12..=12 {
+                g.world.set(IVec3::new(x, 103, z), Block::Stone);
+            }
+        }
+        assert!(g.spawn_is_dark(p));
+    }
+
+    #[test]
+    fn auto_jump_climbs_one_block_but_walking_stays_below() {
+        for walking in [false, true] {
+            let mut g = sky_fixture();
+            for x in -2..=2 {
+                g.world.set(IVec3::new(x, 100, -1), Block::Stone);
+            }
+            for _ in 0..120 {
+                g.tick(
+                    &Input {
+                        forward: 1.,
+                        walk: walking,
+                        ..Default::default()
+                    },
+                    STEP,
+                );
+            }
+            if walking {
+                assert!(g.player.pos[2] >= 0.29);
+                assert!(g.player.pos[1] < 100.1);
+            } else {
+                assert!(g.player.pos[2] < -1.);
+            }
+        }
+    }
+
+    #[test]
+    fn walking_guards_edges_in_both_axes_and_overrides_sprint() {
+        let mut g = sky_fixture();
+        for _ in 0..600 {
+            g.tick(
+                &Input {
+                    forward: 1.,
+                    right: 1.,
+                    walk: true,
+                    sprint: true,
+                    ..Default::default()
+                },
+                STEP,
+            );
+        }
+        assert!(g.player.pos[1] > 99.9);
+        assert!(g.player.pos[0] < 6.29);
+        assert!(g.player.pos[2] > -5.29);
+        assert!(g.velocity.x.abs() < 2.);
+    }
+
     #[test]
     fn fixed_step_landing() {
         let mut g = Game::new(7);
@@ -1484,6 +1592,7 @@ mod expansion_tests {
             .find_map(|x| (-8..=8).find_map(|z| g.world.ruin_in_cell(x, z)))
             .unwrap();
         g.player.pos = (home.as_vec3() + Vec3::new(0.5, 1.01, 4.5)).to_array();
+        g.time = 0.75;
         g.update_mobs(0.);
         g.update_mobs(0.);
         assert_eq!(

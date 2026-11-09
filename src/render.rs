@@ -1109,6 +1109,16 @@ impl SkyAccess<'_> {
         value
     }
 }
+pub fn spawn_sky_light(world: &World, time: f32, pos: Vec3) -> f32 {
+    let mut sky = SkyAccess {
+        world,
+        roofs: HashMap::new(),
+        opaque: HashMap::new(),
+        exposure: HashMap::new(),
+    };
+    sky.sample(pos.floor().as_ivec3()) * sky_cycle(time).1
+}
+
 pub fn apply_sky_access(w: &World, mesh: &mut [Vertex]) {
     let mut sky = SkyAccess {
         world: w,

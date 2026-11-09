@@ -640,3 +640,21 @@ occupancy and roof queries are cached per mesh; worker snapshots include edits
 within that reach across chunk boundaries. This approximates entrance skylight;
 multiple light bounces and torch occlusion through walls are not simulated.
 Existing shadow maps continue to provide directional surface shadows.
+
+## Darkness-gated monsters and movement controls
+
+Husks and ruin guardians spawn only when sky exposure multiplied by the current
+daylight is at most 0.1 and nearby held/placed torch light is at most 0.1. The
+spawn check reuses the renderer's sky-access sampling, including roofs and nearby
+openings; torch falloff uses the same nine-block range. Existing monsters remain
+when light changes. Husk candidates search supported empty positions within eight
+blocks vertically of the player before trying the surface, allowing cave spawns.
+
+Double-tapping W within 300 ms starts sprinting until W is released. Key repeats
+do not count as taps; focus/menu capture resets the gesture. Either Shift key
+walks at 45% speed and overrides sprint. Sprint retains its hunger requirement.
+Grounded movement automatically jumps toward one-block obstacles with headroom;
+Shift disables this. Shift walking checks support at every horizontal collision
+substep on both axes and stops at ledges, including diagonal approaches. Space
+continues to provide manual jumping. Regression tests cover daylight, night, roofs,
+torches, automatic climbing, and diagonal edge protection.

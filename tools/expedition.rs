@@ -271,6 +271,7 @@ pub fn run() -> Result<(), String> {
         .find_map(|x| (-8..=8).find_map(|z| g.world.ruin_in_cell(x, z)))
         .ok_or("No tundra ruin found")?;
     println!("Tundra ruin fixture (seed 314159): {home:?}");
+    g.time = 0.75;
     g.player.pos = (home.as_vec3() + Vec3::new(0.5, 1.01, 4.5)).to_array();
     g.velocity = Vec3::ZERO;
     equip(&mut g, Item::IronSword);
