@@ -10,6 +10,7 @@
   debug. Put them in `tools/` and document them in DESIGN.md.
 
 ## Asset tools
+- Some assets are available in `/home/marcink/Kenney Game Assets All-in-1 3.8.0/`.
 - Blender: available via MCP. 3D modeling, scenes, rendering.
 - ArtCraft (pure Rust, installed locally). Use only when the project needs
   that asset type:

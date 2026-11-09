@@ -1,6 +1,6 @@
 use crate::{
     game::{Game, STAT_NAMES},
-    items::{ITEMS, RECIPES},
+    items::{Item, RECIPES, Stack, grid_recipe},
 };
 use bytemuck::{Pod, Zeroable};
 #[repr(C)]
@@ -11,12 +11,15 @@ pub struct UiVertex {
 }
 #[derive(Clone, Copy)]
 pub enum Action {
-    Craft(usize),
-    Equip(usize),
+    Output,
+    Recipe(i32),
+    Slot(usize),
+    Tab(u8),
     Stat(usize),
     Resume,
     Save,
     Quit,
+    NewWorld,
 }
 pub struct Ui {
     pub vertices: Vec<UiVertex>,
@@ -24,6 +27,9 @@ pub struct Ui {
     pub scale: f32,
     pub width: f32,
     pub height: f32,
+    pub mode: u8,
+    pub recipe: usize,
+    pub pointer: (f32, f32),
 }
 impl Ui {
     pub fn new() -> Self {
@@ -33,6 +39,9 @@ impl Ui {
             scale: 1.,
             width: 1100.,
             height: 720.,
+            mode: 0,
+            recipe: 0,
+            pointer: (0., 0.),
         }
     }
     pub fn begin(&mut self, width: u32, height: u32) {
@@ -123,11 +132,37 @@ impl Ui {
                 Action::Quit,
                 true,
             );
-            self.text(x, y + 220., "Esc returns to the world", 1.4, MUTED);
+            self.button(
+                [x, y + 208., 320., 42.],
+                "New world (saves current)",
+                Action::NewWorld,
+                true,
+            );
+            self.text(x, y + 272., "Esc returns to the world", 1.4, MUTED);
             if g.message_time > 0. {
                 self.text(24., h - 40., &g.message, 1.3, INK);
             }
             return;
+        }
+        if g.feedback.hurt > 0. {
+            let alpha = g.feedback.hurt / 0.3 * 0.35;
+            for (x, y, rw, rh) in [
+                (0., 0., w, 14.),
+                (0., h - 14., w, 14.),
+                (0., 14., 14., h - 28.),
+                (w - 14., 14., 14., h - 28.),
+            ] {
+                self.rect(x, y, rw, rh, [0.9, 0.12, 0.08, alpha]);
+            }
+        }
+        if g.feedback.hit > 0. {
+            let color = [1., 0.82, 0.35, g.feedback.hit / 0.18];
+            for (dx, dy) in [(-1., -1.), (1., -1.), (-1., 1.), (1., 1.)] {
+                for i in 0..4 {
+                    let offset = 7. + i as f32;
+                    self.rect(w / 2. + dx * offset, h / 2. + dy * offset, 2., 2., color);
+                }
+            }
         }
         self.rect(20., 20., 260., 86., PANEL);
         self.text(32., 31., g.biome().name(), 1.8, INK);
@@ -176,46 +211,17 @@ impl Ui {
             self.rect(bx + 65., y, 150. * value.clamp(0., 1.), 10., *color);
         }
         let start = w / 2. - 9. * 53. / 2.;
-        for (n, item) in g.player.inventory.hotbar.iter().enumerate() {
-            let x = start + n as f32 * 53.;
-            let selected = n == g.player.inventory.selected;
-            self.rect(
-                x,
-                h - 70.,
-                49.,
-                49.,
-                if selected {
-                    [0.55, 0.62, 0.44, 0.98]
-                } else {
-                    PANEL
-                },
-            );
-            self.text(x + 5., h - 65., &format!("{}", n + 1), 1.1, MUTED);
-            self.text(x + 7., h - 48., abbrev(*item), 1.2, INK);
-            self.text(
-                x + 7.,
-                h - 32.,
-                &g.player.inventory.count(*item).to_string(),
-                1.1,
-                INK,
+        for n in 0..9 {
+            self.stack_slot(
+                [start + n as f32 * 53., h - 70., 49., 49.],
+                g.player.inventory.slots[n],
+                None,
+                n == g.player.inventory.selected,
             );
         }
         let selected = g.player.inventory.selected();
-        self.text(w / 2. - 150., h - 91., selected.name(), 1.6, INK);
-        if selected.durability() > 0 {
-            self.text(
-                w / 2. + 65.,
-                h - 91.,
-                &format!(
-                    "{}/{}",
-                    selected
-                        .durability()
-                        .saturating_sub(g.player.inventory.wear[selected as usize]),
-                    selected.durability()
-                ),
-                1.3,
-                MUTED,
-            );
+        if g.player.inventory.selected_count() > 0 {
+            self.text(w / 2. - 110., h - 92., selected.name(), 1.5, INK);
         }
         self.rect(w / 2. - 6., h / 2. - 1., 12., 2., INK);
         self.rect(w / 2. - 1., h / 2. - 6., 2., 12., INK);
@@ -256,161 +262,404 @@ impl Ui {
             self.text(w / 2. - 317., 128., &g.message, 1.25, INK);
         }
     }
-    fn pack(&mut self, g: &Game) {
-        let x = (self.width - 1060.) / 2.;
-        let y = (self.height - 650.) / 2.;
-        self.rect(0., 0., self.width, self.height, [0.015, 0.025, 0.035, 0.78]);
-        self.rect(x, y, 1060., 650., PANEL);
-        self.text(x + 24., y + 22., "FIELD PACK", 2.8, INK);
-        self.text(
-            x + 330.,
-            y + 29.,
-            "E closes | Click an item to equip in active slot",
-            1.4,
-            MUTED,
+    pub fn icon(&mut self, x: f32, y: f32, item: Item, scale: f32) {
+        use Item::*;
+        let block = matches!(
+            item,
+            Log | Planks | Dirt | Cobble | CopperOre | Table | Furnace | Bed
         );
-        self.text(x + 24., y + 68., "INVENTORY", 1.8, INK);
-        for (n, item) in ITEMS.iter().enumerate() {
-            let row = n / 2;
-            let col = n % 2;
-            let r = [
-                x + 24. + col as f32 * 156.,
-                y + 99. + row as f32 * 37.,
-                149.,
-                32.,
-            ];
+        let color: [f32; 4] = match item {
+            Log => [0.43, 0.27, 0.12, 1.],
+            Planks | Table => [0.73, 0.51, 0.27, 1.],
+            Dirt => [0.48, 0.30, 0.19, 1.],
+            Cobble | CopperOre | Furnace | StoneAxe | StonePick => [0.57, 0.61, 0.62, 1.],
+            CopperIngot | CopperAxe | CopperPick | Sword => [0.84, 0.45, 0.25, 1.],
+            Coal => [0.18, 0.20, 0.24, 1.],
+            Berries => [0.85, 0.22, 0.34, 1.],
+            Meat => [0.84, 0.41, 0.37, 1.],
+            CookedMeat => [0.51, 0.25, 0.13, 1.],
+            Bed => [0.63, 0.29, 0.24, 1.],
+            _ => [0.73, 0.53, 0.29, 1.],
+        };
+        let tool = item.durability() > 0;
+        for py in 0..16 {
+            for px in 0_i32..16 {
+                let head = if matches!(item, WoodPick | StonePick | CopperPick) {
+                    (2..14).contains(&px) && (2..5).contains(&py)
+                } else if item == Sword {
+                    (7..10).contains(&px) && (1..11).contains(&py)
+                } else {
+                    (3..10).contains(&px) && (2..7).contains(&py)
+                };
+                let handle = tool && (7..9).contains(&px) && (5..15).contains(&py);
+                let filled = if block {
+                    (1..15).contains(&px)
+                        && py >= 2 + (px - 8).abs() / 2
+                        && py <= 14 - (px - 8).abs() / 2
+                } else if tool {
+                    head || handle
+                } else if matches!(item, Stick | Torch) {
+                    (7..10).contains(&px) && (2..15).contains(&py)
+                } else if item == CopperIngot {
+                    (3..14).contains(&px) && (5..12).contains(&py) && px + py > 9 && px + py < 23
+                } else {
+                    let dx = px - 8;
+                    let dy = py - 8;
+                    dx * dx + dy * dy < 39
+                };
+                if !filled {
+                    continue;
+                }
+                let mut c = if handle {
+                    [0.47, 0.30, 0.15, 1.]
+                } else {
+                    color
+                };
+                if item == Torch && py < 6 {
+                    c = [1., 0.73, 0.20, 1.];
+                }
+                if matches!(item, Table | Furnace) && (5..11).contains(&px) && (6..11).contains(&py)
+                {
+                    c = [0.20, 0.19, 0.17, 1.];
+                }
+                if item == CopperOre && (px + py * 3) % 7 < 2 {
+                    c = [0.90, 0.49, 0.26, 1.];
+                }
+                if item == Planks && py % 4 == 0 {
+                    for v in &mut c[..3] {
+                        *v *= 0.65;
+                    }
+                }
+                if item == Log && px % 3 == 0 && py > 6 {
+                    for v in &mut c[..3] {
+                        *v *= 0.65;
+                    }
+                }
+                if item == Berries && py < 5 {
+                    c = [0.25, 0.57, 0.24, 1.];
+                }
+                let shade = if block {
+                    if py <= 6 - (px - 8).abs() / 2 {
+                        1.20
+                    } else if px < 8 {
+                        0.85
+                    } else {
+                        0.65
+                    }
+                } else if px < 4 || py < 4 {
+                    1.16
+                } else if px > 11 || py > 11 {
+                    0.70
+                } else if (px + py * 3) % 5 == 0 {
+                    0.87
+                } else {
+                    1.
+                };
+                for v in &mut c[..3] {
+                    *v = (*v * shade).min(1.);
+                }
+                self.rect(
+                    x + px as f32 * scale,
+                    y + py as f32 * scale,
+                    scale,
+                    scale,
+                    c,
+                );
+            }
+        }
+    }
+    fn stack_slot(
+        &mut self,
+        r: [f32; 4],
+        stack: Option<Stack>,
+        action: Option<Action>,
+        selected: bool,
+    ) {
+        self.rect(
+            r[0],
+            r[1],
+            r[2],
+            r[3],
+            if selected {
+                [0.76, 0.69, 0.43, 1.]
+            } else {
+                [0.37, 0.41, 0.42, 1.]
+            },
+        );
+        self.rect(
+            r[0] + 2.,
+            r[1] + 2.,
+            r[2] - 4.,
+            r[3] - 4.,
+            [0.10, 0.13, 0.15, 1.],
+        );
+        if let Some(s) = stack {
+            self.icon(r[0] + 5., r[1] + 4., s.item, (r[2] - 10.) / 16.);
+            if s.count > 1 {
+                let label = s.count.to_string();
+                self.text(
+                    r[0] + r[2] - label.len() as f32 * 8. - 4.,
+                    r[1] + r[3] - 13.,
+                    &label,
+                    1.3,
+                    INK,
+                );
+            }
+            if s.item.durability() > 0 {
+                self.rect(
+                    r[0] + 5.,
+                    r[1] + r[3] - 6.,
+                    (r[2] - 10.) * (1. - s.wear as f32 / s.item.durability() as f32),
+                    3.,
+                    [0.39, 0.79, 0.31, 1.],
+                );
+            }
+        }
+        if let Some(a) = action {
+            self.hits.push((r, a));
+        }
+    }
+    fn pack(&mut self, g: &Game) {
+        let x = (self.width - 1000.) / 2.;
+        let y = (self.height - 650.) / 2.;
+        let inv = &g.player.inventory;
+        let empty_furnace = crate::items::Furnace::default();
+        let furnace_state = g.furnace().unwrap_or(&empty_furnace);
+        self.rect(0., 0., self.width, self.height, [0.015, 0.025, 0.035, 0.82]);
+        self.rect(x, y, 1000., 650., PANEL);
+        self.text(x + 24., y + 22., "FIELD PACK", 2.5, INK);
+        self.button(
+            [x + 24., y + 61., 160., 32.],
+            "Personal 2x2",
+            Action::Tab(0),
+            true,
+        );
+        let (table, furnace) = g.stations();
+        self.button(
+            [x + 194., y + 61., 160., 32.],
+            "Table 3x3",
+            Action::Tab(1),
+            table,
+        );
+        self.button(
+            [x + 364., y + 61., 160., 32.],
+            "Furnace",
+            Action::Tab(2),
+            furnace,
+        );
+        let mode = if self.mode == 1 && !table || self.mode == 2 && !furnace {
+            0
+        } else {
+            self.mode
+        };
+        if mode < 2 {
+            let size = if mode == 1 { 3 } else { 2 };
+            self.text(x + 24., y + 112., "CRAFTING", 1.6, INK);
+            for row in 0..size {
+                for col in 0..size {
+                    let n = row * 3 + col;
+                    self.stack_slot(
+                        [
+                            x + 24. + col as f32 * 52.,
+                            y + 143. + row as f32 * 52.,
+                            48.,
+                            48.,
+                        ],
+                        if mode == 0 { inv.hand[n] } else { inv.grid[n] },
+                        Some(Action::Slot(if mode == 0 { 47 + n } else { 36 + n })),
+                        false,
+                    );
+                }
+            }
+            self.text(x + 203., y + 199., ">", 2.5, INK);
+            let output = grid_recipe(if mode == 0 { &inv.hand } else { &inv.grid }, size)
+                .map(|n| Stack::new(RECIPES[n].output, RECIPES[n].amount));
+            self.stack_slot(
+                [x + 250., y + 184., 56., 56.],
+                output,
+                Some(Action::Output),
+                true,
+            );
+            let r = &RECIPES[self.recipe];
+            self.text(x + 355., y + 112., "RECIPE GUIDE", 1.3, MUTED);
+            self.text(x + 355., y + 136., r.output.name(), 1.2, INK);
+            let example = crate::items::recipe_grid(self.recipe);
+            for (n, stack) in example.into_iter().enumerate() {
+                self.stack_slot(
+                    [
+                        x + 355. + (n % 3) as f32 * 30.,
+                        y + 160. + (n / 3) as f32 * 30.,
+                        27.,
+                        27.,
+                    ],
+                    stack,
+                    None,
+                    false,
+                );
+            }
+            self.icon(x + 465., y + 182., r.output, 2.);
+            self.text(x + 463., y + 224., &format!("x{}", r.amount), 1.2, INK);
             self.button(
-                r,
-                &format!("{} {}", abbrev(*item), g.player.inventory.count(*item)),
-                Action::Equip(n),
-                g.player.inventory.count(*item) > 0,
+                [x + 355., y + 258., 60., 28.],
+                "<",
+                Action::Recipe(-1),
+                true,
+            );
+            self.button([x + 425., y + 258., 60., 28.], ">", Action::Recipe(1), true);
+        } else {
+            self.text(x + 24., y + 112., "FURNACE", 1.6, INK);
+            self.text(x + 24., y + 139., "INPUT", 1.2, MUTED);
+            self.text(x + 24., y + 224., "FUEL", 1.2, MUTED);
+            self.stack_slot(
+                [x + 87., y + 136., 48., 48.],
+                furnace_state.furnace[0],
+                Some(Action::Slot(45)),
+                false,
+            );
+            self.stack_slot(
+                [x + 87., y + 220., 48., 48.],
+                furnace_state.furnace[1],
+                Some(Action::Slot(46)),
+                false,
+            );
+            self.rect(x + 150., y + 193., 65., 12., MUTED);
+            self.rect(
+                x + 150.,
+                y + 193.,
+                65. * furnace_state.furnace_progress as f32 / crate::items::SMELT_TICKS as f32,
+                12.,
+                [0.95, 0.65, 0.2, 1.],
+            );
+            self.rect(x + 87., y + 279., 80., 8., MUTED);
+            let energy = furnace_state.furnace_joules as f32 / crate::items::COAL_JOULES as f32;
+            let loaded = furnace_state.furnace[1].is_some_and(|s| s.item == Item::Coal);
+            self.rect(
+                x + 87.,
+                y + 279.,
+                80. * if energy > 0. {
+                    energy
+                } else if loaded {
+                    1.
+                } else {
+                    0.
+                },
+                8.,
+                [0.95, 0.4, 0.12, 1.],
+            );
+            self.text(
+                x + 150.,
+                y + 215.,
+                &format!(
+                    "{}%",
+                    furnace_state.furnace_progress * 100 / crate::items::SMELT_TICKS
+                ),
+                1.0,
+                MUTED,
+            );
+            let output = furnace_state.furnace_output;
+            self.stack_slot(
+                [x + 230., y + 179., 56., 56.],
+                output,
+                Some(Action::Output),
+                true,
+            );
+            self.text(x + 322., y + 185., "1 coal fuels 4 smelts", 1.2, MUTED);
+            self.text(x + 322., y + 209., "5 seconds per item", 1.2, MUTED);
+            self.text(
+                x + 322.,
+                y + 233.,
+                &format!(
+                    "Energy: {}%",
+                    furnace_state.furnace_joules * 100 / crate::items::COAL_JOULES
+                ),
+                1.2,
+                MUTED,
+            );
+        }
+        self.text(x + 24., y + 313., "INVENTORY", 1.6, INK);
+        for row in 0..3 {
+            for col in 0..9 {
+                let n = 9 + row * 9 + col;
+                self.stack_slot(
+                    [
+                        x + 24. + col as f32 * 57.,
+                        y + 342. + row as f32 * 57.,
+                        52.,
+                        52.,
+                    ],
+                    inv.slots[n],
+                    Some(Action::Slot(n)),
+                    false,
+                );
+            }
+        }
+        for n in 0..9 {
+            self.stack_slot(
+                [x + 24. + n as f32 * 57., y + 527., 52., 52.],
+                inv.slots[n],
+                Some(Action::Slot(n)),
+                n == inv.selected,
             );
         }
         self.text(
             x + 24.,
-            y + 535.,
-            &format!("Active slot: {}", g.player.inventory.selected + 1),
+            y + 602.,
+            "Drag items | RMB: half stack / place one | E: close",
+            1.25,
+            MUTED,
+        );
+        self.text(
+            x + 620.,
+            y + 111.,
+            &format!("ATTRIBUTES  {} points", g.player.points),
             1.5,
             INK,
         );
-        self.text(x + 24., y + 560., "1-9 selects a hotbar slot", 1.2, MUTED);
-        self.text(x + 350., y + 68., "CRAFTING", 1.8, INK);
-        let (table, furnace) = g.stations();
-        for (n, r) in RECIPES.iter().enumerate() {
-            let ready = r
-                .inputs
-                .iter()
-                .all(|(i, c)| g.player.inventory.count(*i) >= *c)
-                && match r.station {
-                    crate::items::Station::Hand => true,
-                    crate::items::Station::Table => table,
-                    crate::items::Station::Furnace => furnace,
-                };
-            let yy = y + 99. + n as f32 * 32.;
-            self.button(
-                [x + 350., yy, 414., 29.],
-                &format!("{} x{}", r.output.name(), r.amount),
-                Action::Craft(n),
-                ready,
-            );
-            let ingredients = r
-                .inputs
-                .iter()
-                .map(|(i, n)| format!("{} {}", n, abbrev(*i)))
-                .collect::<Vec<_>>()
-                .join(" + ");
-            self.text(
-                x + 563.,
-                yy + 10.,
-                &format!("[{}] {}", r.station.name(), ingredients),
-                0.9,
-                MUTED,
-            );
-        }
-        self.text(
-            x + 350.,
-            y + 593.,
-            "Place stations within 3 blocks to use them.",
-            1.2,
-            MUTED,
-        );
-        self.text(x + 790., y + 68., "ATTRIBUTES", 1.8, INK);
-        self.text(
-            x + 790.,
-            y + 100.,
-            &format!("Level {} | {} points", g.player.level, g.player.points),
-            1.4,
-            MUTED,
-        );
         for (n, name) in STAT_NAMES.iter().enumerate() {
             self.button(
-                [x + 790., y + 140. + n as f32 * 44., 246., 35.],
-                &if n == 3 || n == 4 {
-                    format!("{} (future)", name)
-                } else {
-                    format!("{} {}  +", name, g.player.stats[n])
-                },
+                [x + 620., y + 144. + n as f32 * 45., 350., 35.],
+                &format!(
+                    "{} {}{}",
+                    name,
+                    g.player.stats[n],
+                    if n == 3 || n == 4 { " (future)" } else { " +" }
+                ),
                 Action::Stat(n),
                 n != 3 && n != 4 && g.player.points > 0 && g.player.stats[n] < 20,
             );
         }
-        self.text(x + 790., y + 475., "Each stat is capped at 20.", 1.2, MUTED);
-        self.text(x + 790., y + 500., "XP: discoveries, crafting,", 1.2, MUTED);
-        self.text(x + 790., y + 518., "and challenging enemies.", 1.2, MUTED);
-        for (row, line) in [
-            "VIG: health | STR: damage",
-            "DEX: attack speed",
-            "AGI: speed, jump, falls",
-            "ING: bonus crafting yield",
-        ]
-        .iter()
-        .enumerate()
-        {
-            self.text(x + 790., y + 550. + row as f32 * 15., line, 1.1, MUTED);
+        if g.message_time > 0. {
+            self.text(
+                x + 620.,
+                y + 500.,
+                &g.message.chars().take(38).collect::<String>(),
+                1.1,
+                MUTED,
+            );
         }
-        self.text(
-            x + 24.,
-            y + 620.,
-            if g.message_time > 0. {
-                &g.message
+        let px = self.pointer.0 / self.scale;
+        let py = self.pointer.1 / self.scale;
+        if let Some(stack) = inv.cursor {
+            self.icon(px - 16., py - 16., stack.item, 2.);
+            self.text(px + 14., py + 12., &stack.count.to_string(), 1.4, INK);
+        } else if let Some(Action::Slot(n)) = self.click(self.pointer.0, self.pointer.1)
+            && let Some(stack) = if (45..=46).contains(&n) {
+                furnace_state.furnace[n - 45]
             } else {
-                "Tip: logs > planks > table > stone tools > furnace > copper"
-            },
-            1.3,
-            INK,
-        );
+                inv.slot(n)
+            }
+        {
+            let label = stack.item.name();
+            let tx = px.min(self.width - 180.);
+            let ty = (py + 24.).min(self.height - 30.);
+            self.rect(tx, ty, label.len() as f32 * 8. + 16., 25., PANEL);
+            self.text(tx + 7., ty + 7., label, 1.3, INK);
+        }
     }
 }
 const PANEL: [f32; 4] = [0.045, 0.067, 0.075, 0.96];
 const INK: [f32; 4] = [0.90, 0.91, 0.81, 1.];
 const MUTED: [f32; 4] = [0.58, 0.66, 0.64, 1.];
-fn abbrev(i: crate::items::Item) -> &'static str {
-    use crate::items::Item::*;
-    match i {
-        Log => "LOG",
-        Planks => "PLANK",
-        Stick => "STICK",
-        Dirt => "DIRT",
-        Cobble => "STONE",
-        CopperOre => "C.ORE",
-        Coal => "COAL",
-        CopperIngot => "COPPER",
-        Table => "TABLE",
-        Furnace => "FURN.",
-        Torch => "TORCH",
-        Berries => "BERRY",
-        Meat => "MEAT",
-        CookedMeat => "COOKED",
-        Bed => "BED",
-        WoodAxe => "W.AXE",
-        WoodPick => "W.PICK",
-        StoneAxe => "S.AXE",
-        StonePick => "S.PICK",
-        CopperAxe => "C.AXE",
-        CopperPick => "C.PICK",
-        Sword => "SWORD",
-    }
-}
 fn glyph(c: char) -> [u8; 7] {
     match c {
         'A' => [14, 17, 17, 31, 17, 17, 17],
@@ -460,8 +709,59 @@ fn glyph(c: char) -> [u8; 7] {
         '(' => [2, 4, 8, 8, 8, 4, 2],
         ')' => [8, 4, 2, 2, 2, 4, 8],
         '>' => [16, 8, 4, 2, 4, 8, 16],
+        '<' => [1, 2, 4, 8, 4, 2, 1],
         '|' => [4; 7],
         '!' => [4, 4, 4, 4, 4, 0, 4],
         _ => [0; 7],
+    }
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::world::Block;
+    #[test]
+    fn scaled_inventory_hit_regions_and_icons_stay_inside_view() {
+        let g = Game::new(8);
+        for (w, h) in [(1280, 800), (800, 600), (1920, 1080)] {
+            let mut ui = Ui::new();
+            ui.build(&g, true, false, w, h, 60.);
+            let x = (ui.width - 1000.) / 2.;
+            let y = (ui.height - 650.) / 2.;
+            assert!(matches!(
+                ui.click((x + 40.) * ui.scale, (y + 545.) * ui.scale),
+                Some(Action::Slot(0))
+            ));
+            assert!(matches!(
+                ui.click((x + 40.) * ui.scale, (y + 360.) * ui.scale),
+                Some(Action::Slot(9))
+            ));
+            assert!(
+                ui.vertices
+                    .iter()
+                    .all(|v| v.pos.iter().all(|p| p.is_finite() && p.abs() <= 1.001))
+            );
+        }
+    }
+    #[test]
+    fn table_and_furnace_expose_correct_slots_and_output() {
+        let mut g = Game::new(9);
+        let p = glam::Vec3::from_array(g.player.pos).floor().as_ivec3();
+        g.world.set(p + glam::IVec3::X, Block::Table);
+        g.world.set(p - glam::IVec3::X, Block::Furnace);
+        let mut ui = Ui::new();
+        ui.mode = 1;
+        ui.build(&g, true, false, 1280, 800, 60.);
+        assert_eq!(
+            ui.hits
+                .iter()
+                .filter(|(_, a)| matches!(a, Action::Slot(36..=44)))
+                .count(),
+            9
+        );
+        ui.mode = 2;
+        ui.build(&g, true, false, 1280, 800, 60.);
+        assert!(ui.hits.iter().any(|(_, a)| matches!(a, Action::Slot(45))));
+        assert!(ui.hits.iter().any(|(_, a)| matches!(a, Action::Slot(46))));
+        assert!(ui.hits.iter().any(|(_, a)| matches!(a, Action::Output)));
     }
 }

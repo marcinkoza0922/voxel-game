@@ -98,7 +98,17 @@ pub struct Input {
     pub sprint: bool,
     pub attack: bool,
 }
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct WorldDrop {
+    #[serde(default)]
+    pub velocity: [f32; 3],
+    pub pos: [f32; 3],
+    pub item: Item,
+    pub count: u32,
+}
 pub struct Game {
+    pub drops: Vec<WorldDrop>,
+    pub feedback: crate::feedback::Feedback,
     pub world: World,
     pub player: Player,
     pub entities: Entities,
@@ -112,6 +122,8 @@ pub struct Game {
     pub mining_progress: f32,
     attack_timer: f32,
     spawn_timer: f32,
+    pub furnaces: std::collections::BTreeMap<[i32; 3], items::Furnace>,
+    pub active_furnace: Option<[i32; 3]>,
     pub torch_life: std::collections::BTreeMap<[i32; 3], f32>,
 }
 impl Game {
@@ -119,6 +131,8 @@ impl Game {
         let world = World::new(seed);
         let player = Player::new(&world);
         Self {
+            drops: Vec::new(),
+            feedback: Default::default(),
             world,
             player,
             entities: Entities::default(),
@@ -132,6 +146,8 @@ impl Game {
             mining_progress: 0.,
             attack_timer: 0.,
             spawn_timer: 4.,
+            furnaces: Default::default(),
+            active_furnace: None,
             torch_life: Default::default(),
         }
     }
@@ -147,42 +163,122 @@ impl Game {
     pub fn stations(&self) -> (bool, bool) {
         let p = Vec3::from_array(self.player.pos).floor().as_ivec3();
         let mut table = false;
-        let mut furnace = false;
         for x in -3..=3 {
             for y in -2..=2 {
                 for z in -3..=3 {
-                    match self.world.get(p + IVec3::new(x, y, z)) {
-                        Block::Table => table = true,
-                        Block::Furnace => furnace = true,
-                        _ => (),
+                    if self.world.get(p + IVec3::new(x, y, z)) == Block::Table {
+                        table = true;
                     }
                 }
             }
         }
-        (table, furnace)
+        (table, self.furnace_position().is_some())
+    }
+    pub fn furnace_position(&self) -> Option<[i32; 3]> {
+        let p = Vec3::from_array(self.player.pos).floor().as_ivec3();
+        let reachable = |q: [i32; 3]| {
+            let d = IVec3::from_array(q) - p;
+            d.x.abs() <= 3
+                && d.y.abs() <= 2
+                && d.z.abs() <= 3
+                && self.world.get(IVec3::from_array(q)) == Block::Furnace
+        };
+        if let Some(q) = self.active_furnace {
+            return reachable(q).then_some(q);
+        }
+        (-3..=3)
+            .flat_map(|x| {
+                (-2..=2)
+                    .flat_map(move |y| (-3..=3).map(move |z| (p + IVec3::new(x, y, z)).to_array()))
+            })
+            .filter(|q| reachable(*q))
+            .min_by_key(|q| ((IVec3::from_array(*q) - p).length_squared(), *q))
+    }
+    pub fn furnace(&self) -> Option<&items::Furnace> {
+        self.furnaces.get(&self.furnace_position()?)
+    }
+    // Reuse inventory transactions with a temporary station state; the player
+    // never retains a copy of a placed furnace's contents.
+    fn furnace_transaction(&mut self, action: impl FnOnce(&mut Inventory)) {
+        if let Some(p) = self.furnace_position() {
+            let state = self.furnaces.entry(p).or_default();
+            std::mem::swap(&mut self.player.inventory.processing, state);
+            action(&mut self.player.inventory);
+            std::mem::swap(&mut self.player.inventory.processing, state);
+        }
+    }
+    pub fn transfer(&mut self, n: usize, right: bool) {
+        if (45..=46).contains(&n) {
+            self.furnace_transaction(|inv| inv.transfer(n, right));
+        } else {
+            self.player.inventory.transfer(n, right);
+        }
+    }
+    pub fn quick_transfer(&mut self, n: usize, mode: u8) {
+        let (table, furnace) = self.stations();
+        if mode == 1 && !table || mode == 2 && !furnace {
+            return;
+        }
+        if mode == 2 {
+            self.furnace_transaction(|inv| inv.quick_transfer(n, mode));
+        } else {
+            self.player.inventory.quick_transfer(n, mode);
+        }
+    }
+    pub fn quick_output(&mut self, mode: u8) {
+        let (table, furnace) = self.stations();
+        if mode == 1 && !table || mode == 2 && !furnace {
+            return;
+        }
+        if mode == 2 {
+            self.furnace_transaction(|inv| {
+                inv.quick_output(mode);
+            });
+        } else if let Some(index) = self.player.inventory.quick_output(mode) {
+            self.reward_craft(index);
+        }
     }
     pub fn craft(&mut self, index: usize) {
         let (table, furnace) = self.stations();
         match items::craft(&mut self.player.inventory, index, table, furnace) {
             Ok(()) => {
-                let r = &RECIPES[index];
-                let count = self.player.crafts[index];
-                let xp = items::craft_xp(r.xp, count);
-                self.player.crafts[index] = count.saturating_add(1);
-                let ingenuity = self.player.stats[6];
-                if ingenuity > 0 && count.saturating_add(1).is_multiple_of(24 - ingenuity) {
-                    self.player.inventory.add(r.output, 1);
-                }
-                self.player.gain(xp);
-                self.say(format!(
-                    "Crafted {} x{} (+{} XP)",
-                    r.output.name(),
-                    r.amount,
-                    xp
-                ));
+                self.reward_craft(index);
             }
             Err(e) => self.say(e),
         }
+    }
+    pub fn craft_grid(&mut self, mode: u8) {
+        let (table, furnace) = self.stations();
+        if mode == 1 && !table || mode == 2 && !furnace {
+            self.say("Required station is out of reach");
+            return;
+        }
+        if mode == 2 {
+            self.furnace_transaction(|inv| {
+                items::take_output(inv, 2);
+            });
+            return;
+        }
+        if let Some(index) = items::take_output(&mut self.player.inventory, mode) {
+            self.reward_craft(index);
+        }
+    }
+    fn reward_craft(&mut self, index: usize) {
+        let r = &RECIPES[index];
+        let count = self.player.crafts[index];
+        let xp = items::craft_xp(r.xp, count);
+        self.player.crafts[index] = count.saturating_add(1);
+        let ingenuity = self.player.stats[6];
+        if ingenuity > 0 && count.saturating_add(1).is_multiple_of(24 - ingenuity) {
+            self.player.inventory.add(r.output, 1);
+        }
+        self.player.gain(xp);
+        self.say(format!(
+            "Crafted {} x{} (+{} XP)",
+            r.output.name(),
+            r.amount,
+            xp
+        ));
     }
     pub fn allocate(&mut self, index: usize) {
         if index < 7
@@ -198,12 +294,12 @@ impl Game {
     }
     pub fn use_selected(&mut self) {
         let i = self.player.inventory.selected();
-        if self.player.inventory.count(i) == 0 {
+        if self.player.inventory.selected_count() == 0 {
             self.say("That slot is empty");
             return;
         }
         if matches!(i, Item::Berries | Item::CookedMeat | Item::Meat) {
-            self.player.inventory.take(i, 1);
+            self.player.inventory.take_selected();
             let food = if i == Item::CookedMeat {
                 40.
             } else if i == Item::Berries {
@@ -239,7 +335,13 @@ impl Game {
                     return;
                 }
                 if self.world.set(adjacent, block) {
-                    self.player.inventory.take(i, 1);
+                    self.player.inventory.take_selected();
+                    if block == Block::Furnace {
+                        self.furnaces.insert(
+                            adjacent.to_array(),
+                            std::mem::take(&mut self.player.inventory.processing),
+                        );
+                    }
                     if block == Block::Torch {
                         self.torch_life.insert(adjacent.to_array(), 600.);
                     }
@@ -275,7 +377,110 @@ impl Game {
             self.say("Place a bedroll nearby to sleep");
         }
     }
+    pub fn tick_furnace(&mut self) {
+        let mut rewards = Vec::new();
+        for state in self.furnaces.values_mut() {
+            if let Some(index) = items::tick_furnace(state) {
+                rewards.push(index);
+            }
+        }
+        for index in rewards {
+            self.reward_craft(index);
+        }
+    }
+
+    fn tick_drops(&mut self, dt: f32) {
+        let player = Vec3::from_array(self.player.pos);
+        // Short sweeps keep fast falls from crossing an entire voxel.
+        for drop in &mut self.drops {
+            let mut pos = Vec3::from_array(drop.pos);
+            let mut velocity = Vec3::from_array(drop.velocity);
+            let nearest = Vec3::new(player.x, pos.y.clamp(player.y, player.y + 1.8), player.z);
+            let target = Vec3::new(
+                player.x,
+                pos.y.clamp(player.y + 0.45, player.y + 1.35),
+                player.z,
+            );
+            let mut capacity = self.player.inventory.clone();
+            if pos.distance_squared(nearest) <= 1.4 * 1.4 && capacity.add(drop.item, drop.count) {
+                // Steer toward the body quickly, with a capped final step so
+                // the drop cannot overshoot the pickup region.
+                let offset = target - pos;
+                let desired = offset.normalize_or_zero() * 7.;
+                velocity = velocity.lerp(desired, (dt * 18.).min(1.));
+                velocity = velocity.clamp_length_max(offset.length() / dt.max(0.0001));
+            } else {
+                velocity.y = (velocity.y - 18. * dt).max(-24.);
+            }
+            let steps = ((velocity.length() * dt / 0.1).ceil() as usize).max(1);
+            for _ in 0..steps {
+                for axis in [0, 2, 1] {
+                    let delta = velocity[axis] * dt / steps as f32;
+                    let mut next = pos;
+                    next[axis] += delta;
+                    if drop_collides(&self.world, next) {
+                        // Resolve to the surface so resting drops do not hover
+                        // at a distance determined by their last fall speed.
+                        let mut low = 0.;
+                        let mut high = 1.;
+                        for _ in 0..12 {
+                            let fraction = (low + high) * 0.5;
+                            let mut probe = pos;
+                            probe[axis] += delta * fraction;
+                            if drop_collides(&self.world, probe) {
+                                high = fraction;
+                            } else {
+                                low = fraction;
+                            }
+                        }
+                        pos[axis] += delta * low;
+                        if axis == 1 && velocity.y < -1.5 {
+                            velocity.y *= -0.28;
+                            velocity.x *= 0.55;
+                            velocity.z *= 0.55;
+                        } else {
+                            velocity[axis] = 0.;
+                            if axis == 1 {
+                                velocity.x *= 0.8;
+                                velocity.z *= 0.8;
+                            }
+                        }
+                    } else {
+                        pos = next;
+                    }
+                }
+            }
+            drop.pos = pos.to_array();
+            drop.velocity = velocity.to_array();
+        }
+    }
+
+    pub fn collect_drops(&mut self) {
+        let player = Vec3::from_array(self.player.pos);
+        let mut collected = false;
+        self.drops.retain(|drop| {
+            let p = Vec3::from_array(drop.pos);
+            let nearest = Vec3::new(player.x, p.y.clamp(player.y, player.y + 1.8), player.z);
+            if p.distance_squared(nearest) <= 0.35 * 0.35
+                && self.player.inventory.add(drop.item, drop.count)
+            {
+                collected = true;
+                self.player
+                    .discover(format!("resource:{}", drop.item.name()), 15);
+                false
+            } else {
+                true
+            }
+        });
+        if collected {
+            self.feedback.sound(crate::feedback::Cue::Pickup);
+        }
+    }
+
     pub fn tick(&mut self, input: &Input, dt: f32) {
+        let previous_health = self.player.health;
+        self.feedback.tick(dt);
+        self.tick_furnace();
         self.time += dt / 900.;
         self.message_time = (self.message_time - dt).max(0.);
         self.attack_timer = (self.attack_timer - dt).max(0.);
@@ -337,6 +542,8 @@ impl Game {
             }
         }
         self.player.pos = pos.to_array();
+        self.tick_drops(dt);
+        self.collect_drops();
         self.player.hunger =
             (self.player.hunger - dt * if input.sprint { 0.12 } else { 0.055 }).max(0.);
         self.player.rest = (self.player.rest - dt * 0.035).max(0.);
@@ -349,12 +556,20 @@ impl Game {
         self.player.discover(format!("biome:{}", biome.name()), 30);
         self.target();
         if input.attack {
+            if self.feedback.swing == 0. {
+                self.feedback.swing = 0.32;
+                self.feedback.sound(crate::feedback::Cue::Swing);
+            }
             self.attack(dt);
         } else {
             self.mining = None;
             self.mining_progress = 0.;
         }
         self.update_mobs(dt);
+        if self.player.health < previous_health && self.feedback.hurt == 0. {
+            self.feedback.hurt = 0.3;
+            self.feedback.sound(crate::feedback::Cue::Hurt);
+        }
         if self.player.health <= 0. || pos.y < crate::world::MIN_Y as f32 {
             self.player.pos = self.player.spawn;
             self.velocity = Vec3::ZERO;
@@ -396,7 +611,7 @@ impl Game {
             }
             self.attack_timer = 0.5 / (1. + self.player.stats[2] as f32 * 0.015);
             let selected = self.player.inventory.selected();
-            let equipped = self.player.inventory.count(selected) > 0;
+            let equipped = self.player.inventory.selected_count() > 0;
             let damage = (if equipped && selected == Item::Sword {
                 14.
             } else if equipped && selected.axe() > 0 {
@@ -409,13 +624,16 @@ impl Game {
                 m.health -= damage;
                 m.pos += Vec3::new(dir.x, 0., dir.z) * 0.4;
                 if m.health <= 0. {
-                    killed = Some(m.level);
+                    killed = Some((m.level, m.pos));
                 }
             }
+            self.feedback.hit = 0.18;
+            self.feedback.sound(crate::feedback::Cue::Hit);
+            self.feedback.burst(eye + dir * 1.8, [0.55, 0.63, 0.32], 12);
             if equipped {
                 self.player.inventory.damage_tool(selected);
             }
-            if let Some(level) = killed {
+            if let Some((level, pos)) = killed {
                 self.entities.despawn(id);
                 let xp = if self.player.level > level + 5 {
                     0
@@ -423,7 +641,12 @@ impl Game {
                     25 / (1 + self.player.level.saturating_sub(level))
                 };
                 self.player.gain(xp);
-                self.player.inventory.add(Item::Meat, 2);
+                self.drops.push(WorldDrop {
+                    velocity: [0.6, 2.5, -0.4],
+                    pos: (pos + Vec3::Y * 0.6).to_array(),
+                    item: Item::Meat,
+                    count: 2,
+                });
                 self.say(format!("Husk defeated (+{xp} XP)"));
             }
             return;
@@ -435,7 +658,7 @@ impl Game {
         };
         let b = self.world.get(p);
         let tool = self.player.inventory.selected();
-        let has = self.player.inventory.count(tool) > 0;
+        let has = self.player.inventory.selected_count() > 0;
         let pick = if has { tool.pick() } else { 0 };
         let axe = if has { tool.axe() } else { 0 };
         let hard = matches!(
@@ -466,8 +689,34 @@ impl Game {
         } else {
             0.35
         };
+        let previous_progress = self.mining_progress;
         self.mining_progress += dt / seconds;
-        if self.mining_progress >= 1. && self.world.set(p, Block::Air) {
+        if previous_progress == 0.
+            || (previous_progress * seconds / 0.32).floor()
+                < (self.mining_progress * seconds / 0.32).floor()
+        {
+            let cue = if hard {
+                crate::feedback::Cue::Stone
+            } else if matches!(b, Block::Log | Block::Planks | Block::Table) {
+                crate::feedback::Cue::Wood
+            } else {
+                crate::feedback::Cue::Earth
+            };
+            self.feedback.sound(cue);
+            let (_, adjacent) = self.target.unwrap();
+            let face = (adjacent - p).as_vec3();
+            self.feedback
+                .burst(p.as_vec3() + Vec3::splat(0.5) + face * 0.53, b.color(), 4);
+        }
+        if self.mining_progress >= 1. && p.y > crate::world::MIN_Y && p.y <= crate::world::MAX_Y {
+            if b == Block::Furnace
+                && self.furnaces.get(&p.to_array()).is_some_and(|f| {
+                    f.furnace.iter().any(Option::is_some) || f.furnace_output.is_some()
+                })
+            {
+                self.say("Empty the furnace before mining it");
+                return;
+            }
             let drop = match b {
                 Block::Log => Some(Item::Log),
                 Block::Stone | Block::Cobble => Some(Item::Cobble),
@@ -483,10 +732,19 @@ impl Game {
                 _ => None,
             };
             if let Some(i) = drop {
-                self.player.inventory.add(i, 1);
-                self.player.discover(format!("resource:{}", i.name()), 15);
+                self.drops.push(WorldDrop {
+                    velocity: [0.6, 2.5, -0.4],
+                    pos: (p.as_vec3() + Vec3::splat(0.5)).to_array(),
+                    item: i,
+                    count: 1,
+                });
             }
+            self.feedback.sound(crate::feedback::Cue::Break);
+            self.feedback
+                .burst(p.as_vec3() + Vec3::splat(0.5), b.color(), 20);
+            self.world.set(p, Block::Air);
             self.torch_life.remove(&p.to_array());
+            self.furnaces.remove(&p.to_array());
             self.player.inventory.damage_tool(tool);
             self.mining_progress = 0.;
             self.mining = None;
@@ -567,6 +825,21 @@ impl Game {
         self.world.biome(p.x as i32, p.z as i32)
     }
 }
+fn drop_collides(world: &World, pos: Vec3) -> bool {
+    let min = (pos - Vec3::splat(0.2)).floor().as_ivec3();
+    let max = (pos + Vec3::splat(0.2)).floor().as_ivec3();
+    for x in min.x..=max.x {
+        for y in min.y..=max.y {
+            for z in min.z..=max.z {
+                if world.get(IVec3::new(x, y, z)).solid() {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
 pub fn overlaps(pos: Vec3, b: IVec3) -> bool {
     pos.x + 0.29 > b.x as f32
         && pos.x - 0.29 < (b.x + 1) as f32
@@ -663,6 +936,136 @@ mod tests {
         assert!(!collides(&g.world, Vec3::from_array(g.player.pos)));
     }
     #[test]
+    fn drops_fall_bounce_settle_and_land_again_when_support_is_removed() {
+        let mut g = sky_fixture();
+        g.player.pos = [20., 100., 20.];
+        for x in -3..=3 {
+            for z in -3..=3 {
+                g.world.set(IVec3::new(x, 100, z), Block::Stone);
+            }
+        }
+        g.drops.push(WorldDrop {
+            pos: [0.5, 104., 0.5],
+            velocity: [0., 0., 0.],
+            item: Item::Log,
+            count: 1,
+        });
+        let mut bounced = false;
+        for _ in 0..240 {
+            g.tick_drops(STEP);
+            bounced |= g.drops[0].velocity[1] > 0.;
+            assert!(!drop_collides(&g.world, Vec3::from_array(g.drops[0].pos)));
+        }
+        assert!(bounced);
+        assert!((g.drops[0].pos[1] - 101.2).abs() < 0.002);
+        assert_eq!(g.drops[0].velocity[1], 0.);
+        g.world.set(IVec3::new(0, 100, 0), Block::Air);
+        for _ in 0..20 {
+            g.tick_drops(STEP);
+        }
+        assert!(g.drops[0].pos[1] < 101.);
+    }
+
+    #[test]
+    fn fast_drops_collide_with_walls_without_tunneling() {
+        let mut g = sky_fixture();
+        g.world.set(IVec3::new(1, 103, 0), Block::Stone);
+        g.drops.push(WorldDrop {
+            pos: [0.5, 103.5, 0.5],
+            velocity: [24., 0., 0.],
+            item: Item::Log,
+            count: 1,
+        });
+        g.tick_drops(0.1);
+        assert!(g.drops[0].pos[0] <= 0.8);
+        assert_eq!(g.drops[0].velocity[0], 0.);
+    }
+
+    #[test]
+    fn nearby_drops_pull_in_before_collection_and_sound() {
+        let mut g = sky_fixture();
+        g.player.pos = [0.5, 100., 0.5];
+        g.drops.push(WorldDrop {
+            pos: [1.7, 101., 0.5],
+            velocity: [0.; 3],
+            item: Item::Log,
+            count: 1,
+        });
+        g.collect_drops();
+        assert_eq!(g.drops.len(), 1);
+        assert!(g.feedback.sounds.is_empty());
+        g.tick_drops(STEP);
+        assert!(g.drops[0].pos[0] < 1.7);
+        assert!(g.drops[0].pos[0] > 0.85);
+        for _ in 0..60 {
+            g.tick_drops(STEP);
+            g.collect_drops();
+            if g.drops.is_empty() {
+                break;
+            }
+        }
+        assert!(g.drops.is_empty());
+        assert_eq!(g.player.inventory.count(Item::Log), 1);
+        assert_eq!(
+            g.feedback
+                .sounds
+                .iter()
+                .filter(|c| matches!(c, crate::feedback::Cue::Pickup))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn full_inventory_disables_drop_attraction() {
+        let mut g = sky_fixture();
+        g.player.pos = [0.5, 100., 0.5];
+        g.player
+            .inventory
+            .slots
+            .fill(Some(items::Stack::new(Item::Dirt, 64)));
+        g.drops.push(WorldDrop {
+            pos: [1.7, 101., 0.5],
+            velocity: [0.; 3],
+            item: Item::Log,
+            count: 1,
+        });
+        g.tick_drops(STEP);
+        g.collect_drops();
+        assert_eq!(g.drops[0].pos[0], 1.7);
+        assert!(g.drops[0].velocity[1] < 0.);
+        assert!(g.feedback.sounds.is_empty());
+    }
+
+    #[test]
+    fn drops_wait_for_proximity_and_inventory_space() {
+        let mut g = sky_fixture();
+        let p = IVec3::new(0, 101, -2);
+        g.world.set(p, Block::Dirt);
+        for slot in &mut g.player.inventory.slots {
+            *slot = Some(items::Stack::new(Item::Dirt, 64));
+        }
+        g.target = Some((p, p + IVec3::Z));
+        g.attack(5.);
+        assert_eq!(g.world.get(p), Block::Air);
+        assert_eq!(g.drops.len(), 1);
+        g.collect_drops();
+        assert_eq!(g.drops.len(), 1);
+        g.player.inventory.slots[0] = None;
+        g.collect_drops();
+        assert_eq!(g.drops.len(), 1);
+        g.player.pos = [0.5, 100., -1.5];
+        g.collect_drops();
+        assert!(g.drops.is_empty());
+        assert_eq!(g.player.inventory.count(Item::Dirt), 35 * 64 + 1);
+        assert!(
+            g.player
+                .discoveries
+                .contains(&format!("resource:{}", Item::Dirt.name()))
+        );
+    }
+
+    #[test]
     fn copper_requires_stone_pick_and_yields_ore() {
         let mut g = sky_fixture();
         let p = IVec3::new(0, 101, -2);
@@ -672,11 +1075,21 @@ mod tests {
         g.attack(5.);
         assert_eq!(g.world.get(p), Block::Copper);
         assert_eq!(g.player.inventory.count(Item::CopperOre), 0);
+        assert!(g.feedback.particles.is_empty());
+        assert!(g.feedback.sounds.is_empty());
         g.player.inventory.add(Item::StonePick, 1);
-        g.player.inventory.hotbar[1] = Item::StonePick;
+        g.player.inventory.equip(Item::StonePick, 1);
         g.attack(5.);
         assert_eq!(g.world.get(p), Block::Air);
-        assert_eq!(g.player.inventory.count(Item::CopperOre), 1);
+        assert_eq!(g.player.inventory.count(Item::CopperOre), 0);
+        assert_eq!(g.drops[0].item, Item::CopperOre);
+        assert!(!g.feedback.particles.is_empty());
+        assert!(
+            g.feedback
+                .sounds
+                .iter()
+                .any(|cue| matches!(cue, crate::feedback::Cue::Break))
+        );
     }
     #[test]
     fn stations_gate_complete_copper_progression() {
@@ -704,9 +1117,18 @@ mod tests {
         assert_eq!(g.player.inventory.count(Item::CopperIngot), 0);
         g.world.set(IVec3::new(-2, 100, 0), Block::Furnace);
         g.player.inventory.take(Item::Furnace, 1);
-        for _ in 0..3 {
-            g.craft(10);
+        g.furnaces.entry([-2, 100, 0]).or_default().furnace = [
+            Some(items::Stack::new(Item::CopperOre, 3)),
+            Some(items::Stack::new(Item::Coal, 1)),
+        ];
+        g.player.inventory.take(Item::CopperOre, 3);
+        g.player.inventory.take(Item::Coal, 1);
+        for _ in 0..3 * items::SMELT_TICKS {
+            g.tick_furnace();
         }
+        g.craft_grid(2);
+        let output = g.player.inventory.cursor.take().unwrap();
+        g.player.inventory.add(output.item, output.count);
         g.craft(13);
         assert_eq!(g.player.inventory.count(Item::CopperPick), 1);
         assert_eq!(g.player.inventory.count(Item::CopperOre), 0);
@@ -733,5 +1155,131 @@ mod tests {
         g.allocate(3);
         g.allocate(4);
         assert_eq!(g.player.points, 2);
+    }
+}
+
+#[cfg(test)]
+mod placed_furnace_tests {
+    use super::*;
+    use items::{Furnace, SMELT_TICKS, Stack};
+
+    #[test]
+    fn independent_furnaces_process_away_from_player_and_route_transactions() {
+        let mut g = Game::new(9);
+        g.player.pos = [0.5, 100., 0.5];
+        let a = [-1, 100, 0];
+        let b = [1, 100, 0];
+        for (p, input) in [(a, Item::CopperOre), (b, Item::Meat)] {
+            g.world.set(IVec3::from_array(p), Block::Furnace);
+            g.active_furnace = Some(p);
+            g.player.inventory.cursor = Some(Stack::new(input, 2));
+            g.transfer(45, false);
+            g.player.inventory.cursor = Some(Stack::new(Item::Coal, 1));
+            g.transfer(46, false);
+        }
+        assert_eq!(g.player.inventory.processing, Furnace::default());
+        g.furnaces.get_mut(&a).unwrap().furnace_output = Some(Stack::new(Item::CopperIngot, 64));
+        g.player.pos = [1000., 100., 1000.];
+        for _ in 0..SMELT_TICKS {
+            g.tick_furnace();
+        }
+        assert_eq!(g.furnaces[&a].furnace_progress, 0);
+        assert_eq!(g.furnaces[&a].furnace[1].unwrap().count, 1);
+        assert_eq!(
+            g.furnaces[&b].furnace_output,
+            Some(Stack::new(Item::CookedMeat, 1))
+        );
+        assert_eq!(g.player.crafts[10], 0);
+        assert_eq!(g.player.crafts[11], 1);
+        // A stale station must not silently redirect an interaction elsewhere.
+        g.player.inventory.cursor = Some(Stack::new(Item::Coal, 2));
+        g.transfer(46, false);
+        assert_eq!(g.player.inventory.cursor.unwrap().count, 2);
+        g.player.inventory.cursor = None;
+        g.player.pos = [0.5, 100., 0.5];
+        g.active_furnace = Some(a);
+        g.craft_grid(2);
+        assert_eq!(
+            g.player.inventory.cursor.take(),
+            Some(Stack::new(Item::CopperIngot, 64))
+        );
+        assert!(g.furnaces[&a].furnace_output.is_none());
+        g.active_furnace = Some(b);
+        g.craft_grid(2);
+        assert_eq!(
+            g.player.inventory.cursor.take(),
+            Some(Stack::new(Item::CookedMeat, 1))
+        );
+        assert_eq!(g.player.crafts[11], 1); // Collection awards no extra XP.
+        for _ in 0..SMELT_TICKS {
+            g.tick_furnace();
+        }
+        assert_eq!(
+            g.furnaces[&a].furnace_output,
+            Some(Stack::new(Item::CopperIngot, 1))
+        );
+        assert_eq!(
+            g.furnaces[&b].furnace_output,
+            Some(Stack::new(Item::CookedMeat, 1))
+        );
+    }
+
+    #[test]
+    fn mining_requires_empty_slots_and_discards_heat_without_duplicating_items() {
+        let mut g = Game::new(9);
+        g.player.pos = [0.5, 100., 0.5];
+        g.player.inventory.equip(Item::WoodPick, 0);
+        g.player.inventory.selected = 0;
+        let p = IVec3::new(0, 101, -2);
+        g.world.set(p, Block::Furnace);
+        g.target = Some((p, p + IVec3::Z));
+        for slot in 0..3 {
+            let f = g.furnaces.entry(p.to_array()).or_default();
+            *f = Furnace::default();
+            if slot < 2 {
+                f.furnace[slot] = Some(Stack::new(Item::Coal, 1));
+            } else {
+                f.furnace_output = Some(Stack::new(Item::CopperIngot, 1));
+            }
+            g.attack(10.);
+            assert_eq!(g.world.get(p), Block::Furnace);
+            assert_eq!(g.player.inventory.count(Item::Furnace), 0);
+        }
+        let f = g.furnaces.get_mut(&p.to_array()).unwrap();
+        *f = Furnace::default();
+        f.furnace_joules = 3000;
+        g.attack(10.);
+        assert_eq!(g.world.get(p), Block::Air);
+        assert!(!g.furnaces.contains_key(&p.to_array()));
+        assert_eq!(g.player.inventory.count(Item::Furnace), 0);
+        assert_eq!(g.drops[0].item, Item::Furnace);
+    }
+
+    #[test]
+    fn legacy_contents_attach_once_when_placing_a_furnace() {
+        let mut g = Game::new(9);
+        g.player.pos = [0.5, 100., 0.5];
+        for y in 100..=102 {
+            for z in -3..=0 {
+                g.world.set(IVec3::new(0, y, z), Block::Air);
+            }
+        }
+        let support = IVec3::new(0, 101, -3);
+        g.world.set(support, Block::Stone);
+        g.player.yaw = 0.;
+        g.player.pitch = 0.;
+        g.player.inventory.add(Item::Furnace, 2);
+        g.player.inventory.equip(Item::Furnace, 0);
+        g.player.inventory.selected = 0;
+        g.player.inventory.processing.furnace[0] = Some(Stack::new(Item::CopperOre, 3));
+        g.player.inventory.processing.furnace_joules = 1234;
+        let legacy = g.player.inventory.processing.clone();
+        g.use_selected();
+        let p = [0, 101, -2];
+        assert_eq!(g.world.get(IVec3::from_array(p)), Block::Furnace);
+        assert_eq!(g.furnaces[&p], legacy);
+        assert_eq!(g.player.inventory.processing, Furnace::default());
+        g.use_selected();
+        assert_eq!(g.furnaces[&[0, 101, -1]], Furnace::default());
     }
 }

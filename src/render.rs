@@ -1,14 +1,11 @@
 use crate::{
     game::Game,
     ui::{Ui, UiVertex},
-    world::{Block, SIZE, World},
+    world::{Block, SIZE, VIEW_RADIUS, World},
 };
 use bytemuck::{Pod, Zeroable};
 use glam::{IVec3, Mat4, Vec3};
-use std::{
-    collections::{HashMap, HashSet, VecDeque},
-    sync::Arc,
-};
+use std::{collections::HashMap, sync::Arc};
 use wgpu::util::DeviceExt;
 use winit::window::Window;
 
@@ -46,6 +43,7 @@ struct Mesh {
 }
 pub struct Renderer {
     surface: wgpu::Surface<'static>,
+    window: Arc<Window>,
     device: wgpu::Device,
     queue: wgpu::Queue,
     config: wgpu::SurfaceConfiguration,
@@ -58,8 +56,6 @@ pub struct Renderer {
     depth: wgpu::TextureView,
     shadow: wgpu::TextureView,
     meshes: HashMap<IVec3, Mesh>,
-    pending: VecDeque<IVec3>,
-    queued: HashSet<IVec3>,
     pub ui: Ui,
     pub width: u32,
     pub height: u32,
@@ -89,7 +85,9 @@ impl Renderer {
             backends: wgpu::Backends::VULKAN,
             ..Default::default()
         });
-        let surface = instance.create_surface(window).map_err(|e| e.to_string())?;
+        let surface = instance
+            .create_surface(window.clone())
+            .map_err(|e| e.to_string())?;
         let adapter = instance
             .request_adapter(&wgpu::RequestAdapterOptions {
                 power_preference: wgpu::PowerPreference::HighPerformance,
@@ -117,7 +115,9 @@ impl Renderer {
             format,
             width: size.width.max(1),
             height: size.height.max(1),
-            present_mode: wgpu::PresentMode::AutoVsync,
+            // Strict VSync: AutoVsync can select relaxed FIFO, which permits
+            // immediate presentation when rendering misses a refresh.
+            present_mode: wgpu::PresentMode::Fifo,
             desired_maximum_frame_latency: 2,
             alpha_mode: caps.alpha_modes[0],
             view_formats: vec![],
@@ -315,6 +315,7 @@ impl Renderer {
         });
         Ok(Self {
             surface,
+            window,
             device,
             queue,
             width: config.width,
@@ -329,14 +330,16 @@ impl Renderer {
             depth,
             shadow,
             meshes: HashMap::new(),
-            pending: VecDeque::new(),
-            queued: HashSet::new(),
             ui: Ui::new(),
         })
     }
     pub fn finish(self) {
         let _ = self.device.poll(wgpu::PollType::wait_indefinitely());
         drop(self);
+    }
+    pub fn reset_world(&mut self) {
+        self.meshes.clear();
+        self.ui = crate::ui::Ui::new();
     }
     pub fn resize(&mut self, w: u32, h: u32) {
         if w == 0 || h == 0 {
@@ -350,38 +353,29 @@ impl Renderer {
         self.depth = depth(&self.device, w, h, "Main depth");
     }
     pub fn update_world(&mut self, w: &mut World, pos: Vec3) {
-        for k in w.stream(pos, 5) {
+        for k in w.stream(pos, VIEW_RADIUS) {
             self.meshes.remove(&k);
         }
-        for k in w.dirty.drain(..) {
-            if self.queued.insert(k) {
-                self.pending.push_back(k);
+        for (k, data) in std::mem::take(&mut w.meshes) {
+            if !w.loaded(k) {
+                continue;
             }
-        }
-        for _ in 0..3 {
-            if let Some(k) = self.pending.pop_front() {
-                self.queued.remove(&k);
-                if !w.loaded(k) {
-                    continue;
-                }
-                let data = mesh_chunk(w, k);
-                if data.is_empty() {
-                    self.meshes.remove(&k);
-                } else {
-                    self.meshes.insert(
-                        k,
-                        Mesh {
-                            buffer: self.device.create_buffer_init(
-                                &wgpu::util::BufferInitDescriptor {
-                                    label: Some("Chunk mesh"),
-                                    contents: bytemuck::cast_slice(&data),
-                                    usage: wgpu::BufferUsages::VERTEX,
-                                },
-                            ),
-                            count: data.len() as u32,
-                        },
-                    );
-                }
+            if data.is_empty() {
+                self.meshes.remove(&k);
+            } else {
+                self.meshes.insert(
+                    k,
+                    Mesh {
+                        buffer: self
+                            .device
+                            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                                label: Some("Chunk mesh"),
+                                contents: bytemuck::cast_slice(&data),
+                                usage: wgpu::BufferUsages::VERTEX,
+                            }),
+                        count: data.len() as u32,
+                    },
+                );
             }
         }
     }
@@ -403,11 +397,11 @@ impl Renderer {
             1.,
         ];
         let eye = g.player.eye();
-        let view = Mat4::perspective_rh(
+        let camera_view = Mat4::perspective_rh(
             75_f32.to_radians(),
             self.width as f32 / self.height as f32,
             0.05,
-            240.,
+            1024.,
         ) * Mat4::look_at_rh(eye, eye + g.player.direction(), Vec3::Y);
         let center = eye.floor();
         let light_view = Mat4::orthographic_rh(-80., 80., -80., 80., 0.1, 250.)
@@ -420,7 +414,7 @@ impl Renderer {
             .collect();
         torches.sort_by(|a, b| a.distance_squared(eye).total_cmp(&b.distance_squared(eye)));
         let held = g.player.inventory.selected() == crate::items::Item::Torch
-            && g.player.inventory.count(crate::items::Item::Torch) > 0;
+            && g.player.inventory.selected_count() > 0;
         let mut n = 0;
         if held {
             lights[0] = [eye.x, eye.y, eye.z, 1.];
@@ -431,7 +425,7 @@ impl Renderer {
             n += 1;
         }
         let camera = Camera {
-            view: view.to_cols_array_2d(),
+            view: camera_view.to_cols_array_2d(),
             light_view: light_view.to_cols_array_2d(),
             eye: [eye.x, eye.y, eye.z, 1.],
             sun: [sun.x, sun.y, sun.z, daylight],
@@ -472,6 +466,36 @@ impl Renderer {
                 );
             }
         }
+        let mut icon = Ui::new();
+        icon.width = 16.;
+        icon.height = 16.;
+        let right = Vec3::new(g.player.yaw.cos(), 0., g.player.yaw.sin());
+        let normal = right.cross(Vec3::Y);
+        for drop in &g.drops {
+            let pos = Vec3::from_array(drop.pos);
+            if pos.distance_squared(eye) > 80. * 80. {
+                continue;
+            }
+            icon.vertices.clear();
+            icon.icon(0., 0., drop.item, 1.);
+            let center = pos + Vec3::Y * (0.14 + 0.04 * (g.feedback.clock * 2.5 + pos.x).sin());
+            for v in &icon.vertices {
+                dynamic.push(Vertex {
+                    pos: (center + right * v.pos[0] * 0.3 + Vec3::Y * v.pos[1] * 0.3).to_array(),
+                    normal: normal.to_array(),
+                    color: [v.color[0], v.color[1], v.color[2]],
+                });
+            }
+        }
+        for particle in &g.feedback.particles {
+            let size = 0.045 * (particle.life / 0.15).min(1.);
+            box_mesh(
+                &mut dynamic,
+                particle.pos,
+                Vec3::splat(size),
+                particle.color,
+            );
+        }
         if let Some((p, _)) = g.target {
             let p = p.as_vec3() - Vec3::splat(0.005);
             let t = 0.012;
@@ -490,6 +514,18 @@ impl Renderer {
                 }
             }
         }
+        let mut held_mesh = vec![];
+        if !pack && !paused {
+            held_model(&mut held_mesh, g);
+        }
+        let held_buffer = (!held_mesh.is_empty()).then(|| {
+            self.device
+                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("Held item"),
+                    contents: bytemuck::cast_slice(&held_mesh),
+                    usage: wgpu::BufferUsages::VERTEX,
+                })
+        });
         let dynamic_buffer = (!dynamic.is_empty()).then(|| {
             self.device
                 .create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -537,7 +573,10 @@ impl Renderer {
             });
             pass.set_pipeline(&self.shadow_pipeline);
             pass.set_bind_group(0, &self.shadow_bind, &[]);
-            for m in self.meshes.values() {
+            for (k, m) in &self.meshes {
+                if !chunk_visible(light_view, *k) {
+                    continue;
+                }
                 pass.set_vertex_buffer(0, m.buffer.slice(..));
                 pass.draw(0..m.count, 0..1);
             }
@@ -575,7 +614,10 @@ impl Renderer {
             });
             pass.set_pipeline(&self.pipeline);
             pass.set_bind_group(0, &self.bind, &[]);
-            for m in self.meshes.values() {
+            for (k, m) in &self.meshes {
+                if !chunk_visible(camera_view, *k) {
+                    continue;
+                }
                 pass.set_vertex_buffer(0, m.buffer.slice(..));
                 pass.draw(0..m.count, 0..1);
             }
@@ -583,6 +625,33 @@ impl Renderer {
                 pass.set_vertex_buffer(0, b.slice(..));
                 pass.draw(0..dynamic.len() as u32, 0..1);
             }
+        }
+        if let Some(buffer) = &held_buffer {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("Held item pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &view,
+                    resolve_target: None,
+                    depth_slice: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Load,
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                    view: &self.depth,
+                    depth_ops: Some(wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(1.),
+                        store: wgpu::StoreOp::Store,
+                    }),
+                    stencil_ops: None,
+                }),
+                ..Default::default()
+            });
+            pass.set_pipeline(&self.pipeline);
+            pass.set_bind_group(0, &self.bind, &[]);
+            pass.set_vertex_buffer(0, buffer.slice(..));
+            pass.draw(0..held_mesh.len() as u32, 0..1);
         }
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -659,6 +728,7 @@ impl Renderer {
             drop(data);
             buffer.unmap();
         }
+        self.window.pre_present_notify();
         frame.present();
         Ok(())
     }
@@ -673,19 +743,31 @@ const FACES: [(IVec3, IVec3, IVec3); 6] = [
     (IVec3::NEG_Z, IVec3::X, IVec3::Y),
 ];
 const CORNERS: [(i32, i32); 4] = [(-1, -1), (1, -1), (1, 1), (-1, 1)];
+// Conservative clip-space AABB test, using wgpu's 0..w depth range.
+fn chunk_visible(view: Mat4, key: IVec3) -> bool {
+    let base = (key * SIZE).as_vec3();
+    let corners = std::array::from_fn::<_, 8, _>(|i| {
+        let offset = Vec3::new((i & 1) as f32, ((i >> 1) & 1) as f32, ((i >> 2) & 1) as f32);
+        view * (base + offset * SIZE as f32).extend(1.)
+    });
+    !(0..6).any(|plane| {
+        corners.iter().all(|p| match plane {
+            0 => p.x < -p.w,
+            1 => p.x > p.w,
+            2 => p.y < -p.w,
+            3 => p.y > p.w,
+            4 => p.z < 0.,
+            _ => p.z > p.w,
+        })
+    })
+}
+#[cfg(test)]
 pub fn mesh_chunk(w: &World, k: IVec3) -> Vec<Vertex> {
+    mesh_halo(w.seed, k, &w.halo(k))
+}
+pub fn mesh_halo(seed: u64, k: IVec3, halo: &[Block]) -> Vec<Vertex> {
     let base = k * SIZE;
-    // One-block halo avoids repeated terrain queries during face and AO lookup.
-    let mut halo = vec![Block::Air; 18 * 18 * 18];
     let idx = |p: IVec3| ((p.x + 1) + 18 * ((p.z + 1) + 18 * (p.y + 1))) as usize;
-    for x in -1..=16 {
-        for z in -1..=16 {
-            for y in -1..=16 {
-                let p = IVec3::new(x, y, z);
-                halo[idx(p)] = w.get(base + p);
-            }
-        }
-    }
     let get = |p: IVec3| halo[idx(p)];
     let mut out = vec![];
     for x in 0..SIZE {
@@ -736,7 +818,7 @@ pub fn mesh_chunk(w: &World, k: IVec3) -> Vec<Vertex> {
                             color = Block::Dirt.color();
                         }
                         let variation = 0.94
-                            + (crate::world::hash(w.seed, base.x + x, base.y + y, base.z + z) % 11)
+                            + (crate::world::hash(seed, base.x + x, base.y + y, base.z + z) % 11)
                                 as f32
                                 * 0.01;
                         vertices[i].color = color.map(|c| c * (1. - ao as f32 * 0.16) * variation);
@@ -777,6 +859,18 @@ fn box_mesh(out: &mut Vec<Vertex>, pos: Vec3, size: Vec3, color: [f32; 3]) {
 mod tests {
     use super::*;
     #[test]
+    fn frustum_culls_behind_camera_and_keeps_intersections() {
+        let view = Mat4::perspective_rh(75_f32.to_radians(), 1., 0.05, 1024.);
+        assert!(chunk_visible(view, IVec3::new(0, 0, -2)));
+        assert!(chunk_visible(view, IVec3::new(0, 0, -1)));
+        assert!(!chunk_visible(view, IVec3::new(0, 0, 1)));
+        assert!(!chunk_visible(view, IVec3::new(20, 0, -2)));
+        assert!(!chunk_visible(view, IVec3::new(0, 0, -70)));
+        let light = Mat4::orthographic_rh(-80., 80., -80., 80., 0.1, 250.);
+        assert!(chunk_visible(light, IVec3::new(0, 0, -2)));
+        assert!(!chunk_visible(light, IVec3::new(20, 0, -2)));
+    }
+    #[test]
     fn empty_sky_has_no_mesh() {
         let w = World::new(1);
         assert!(mesh_chunk(&w, IVec3::new(0, 80, 0)).is_empty());
@@ -789,5 +883,108 @@ mod tests {
         assert_eq!(one, 36);
         w.set(IVec3::new(1, 100, 0), Block::Planks);
         assert_eq!(mesh_chunk(&w, IVec3::new(0, 6, 0)).len(), 60);
+    }
+}
+
+fn held_model(out: &mut Vec<Vertex>, g: &Game) {
+    use crate::items::Item;
+    let item = g.player.inventory.selected();
+    let equipped = g.player.inventory.selected_count() > 0;
+    let swing = (g.feedback.swing / 0.32 * std::f32::consts::PI).sin();
+    let moving = g.velocity.x * g.velocity.x + g.velocity.z * g.velocity.z > 0.1 && g.grounded;
+    let bob = if moving {
+        (g.feedback.clock * 11.).sin() * 0.014
+    } else {
+        0.
+    };
+    let origin = Vec3::new(
+        0.32 - swing * 0.18,
+        -0.30 + bob + swing * 0.06,
+        -0.65 + swing * 0.12,
+    );
+    box_mesh(
+        out,
+        Vec3::new(-0.065, -0.22, -0.06),
+        Vec3::new(0.13, 0.25, 0.12),
+        [0.65, 0.43, 0.29],
+    );
+    if equipped && (item.pick() > 0 || item.axe() > 0 || item == Item::Sword) {
+        let material = match item {
+            Item::WoodAxe | Item::WoodPick => [0.55, 0.35, 0.17],
+            Item::StoneAxe | Item::StonePick => [0.53, 0.55, 0.57],
+            _ => [0.77, 0.43, 0.24],
+        };
+        box_mesh(
+            out,
+            Vec3::new(-0.025, -0.10, -0.025),
+            Vec3::new(0.05, 0.48, 0.05),
+            [0.38, 0.23, 0.12],
+        );
+        if item.pick() > 0 {
+            box_mesh(
+                out,
+                Vec3::new(-0.20, 0.29, -0.04),
+                Vec3::new(0.40, 0.07, 0.08),
+                material,
+            );
+            box_mesh(
+                out,
+                Vec3::new(-0.23, 0.23, -0.035),
+                Vec3::new(0.07, 0.09, 0.07),
+                material,
+            );
+        } else if item.axe() > 0 {
+            box_mesh(
+                out,
+                Vec3::new(-0.13, 0.20, -0.045),
+                Vec3::new(0.14, 0.15, 0.09),
+                material,
+            );
+            box_mesh(
+                out,
+                Vec3::new(-0.20, 0.17, -0.025),
+                Vec3::new(0.07, 0.21, 0.05),
+                material,
+            );
+        } else {
+            box_mesh(
+                out,
+                Vec3::new(-0.045, 0.10, -0.025),
+                Vec3::new(0.09, 0.48, 0.05),
+                material,
+            );
+            box_mesh(
+                out,
+                Vec3::new(-0.13, 0.08, -0.04),
+                Vec3::new(0.26, 0.05, 0.08),
+                material,
+            );
+        }
+    } else if equipped {
+        box_mesh(
+            out,
+            Vec3::new(-0.09, 0.02, -0.10),
+            Vec3::splat(0.18),
+            item.block().map_or([0.65, 0.46, 0.24], Block::color),
+        );
+    }
+    let forward = g.player.direction();
+    let right = forward.cross(Vec3::Y).normalize();
+    let up = right.cross(forward);
+    let basis = Mat4::from_cols(
+        right.extend(0.),
+        up.extend(0.),
+        (-forward).extend(0.),
+        g.player.eye().extend(1.),
+    );
+    let transform =
+        basis * Mat4::from_translation(origin) * Mat4::from_rotation_z(-0.3 + swing * 0.95);
+    for v in out {
+        v.pos = transform
+            .transform_point3(Vec3::from_array(v.pos))
+            .to_array();
+        v.normal = transform
+            .transform_vector3(Vec3::from_array(v.normal))
+            .to_array();
     }
 }
