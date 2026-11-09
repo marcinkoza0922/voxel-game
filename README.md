@@ -36,7 +36,7 @@ Leaves yield berries; eat them with right mouse while selected. Husks pursue and
 
 Discovering biomes and resources, crafting, and defeating sufficiently strong enemies award XP. Repeated crafting awards one quarter as much XP each time, rounding down to zero. Spend level points on health, melee damage, attack speed, mobility, or crafting yield. Wisdom and Willpower are reserved for the future magic system and cannot consume points yet.
 
-The terrain streams in chunks and supports a vertical range from **-512 to 1535**. Venture far from spawn for large mountains. Grasslands, oak forests, caves, coal and copper are implemented; the broader biomes, metallurgy, magic, and automation remain future milestones.
+The terrain streams in chunks and supports a vertical range from **-512 to 1535**. Terrain streams up to 160 blocks horizontally, with full-height mountain surfaces, refresh-synchronized presentation, and camera/shadow chunk culling. Venture far from spawn for large mountains. Grasslands, oak forests, caves, coal and copper are implemented; the broader biomes, metallurgy, magic, and automation remain future milestones.
 
 ## Development
 

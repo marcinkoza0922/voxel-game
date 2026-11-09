@@ -30,7 +30,7 @@ struct Out { @builtin(position) clip: vec4<f32>, @location(0) world: vec3<f32>, 
         light+=vec3(1.0,0.49,0.16)*falloff*falloff*l.w;
     }
     let color=v.color*light;
-    let fog=smoothstep(40.0,82.0,distance(v.world,camera.eye.xyz));
+    let fog=smoothstep(112.0,160.0,distance(v.world.xz,camera.eye.xz));
     return vec4(mix(color,camera.sky.xyz,fog),1.0);
 }
 @vertex fn shadow_vs(v:In)->@builtin(position) vec4<f32> {return camera.light_view*vec4(v.pos,1.0);}

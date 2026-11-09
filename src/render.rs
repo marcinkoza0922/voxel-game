@@ -1,7 +1,7 @@
 use crate::{
     game::Game,
     ui::{Ui, UiVertex},
-    world::{Block, SIZE, World},
+    world::{Block, SIZE, VIEW_RADIUS, World},
 };
 use bytemuck::{Pod, Zeroable};
 use glam::{IVec3, Mat4, Vec3};
@@ -117,7 +117,9 @@ impl Renderer {
             format,
             width: size.width.max(1),
             height: size.height.max(1),
-            present_mode: wgpu::PresentMode::AutoVsync,
+            // Strict VSync: AutoVsync can select relaxed FIFO, which permits
+            // immediate presentation when rendering misses a refresh.
+            present_mode: wgpu::PresentMode::Fifo,
             desired_maximum_frame_latency: 2,
             alpha_mode: caps.alpha_modes[0],
             view_formats: vec![],
@@ -350,7 +352,7 @@ impl Renderer {
         self.depth = depth(&self.device, w, h, "Main depth");
     }
     pub fn update_world(&mut self, w: &mut World, pos: Vec3) {
-        for k in w.stream(pos, 5) {
+        for k in w.stream(pos, VIEW_RADIUS) {
             self.meshes.remove(&k);
         }
         for k in w.dirty.drain(..) {
@@ -358,7 +360,18 @@ impl Renderer {
                 self.pending.push_back(k);
             }
         }
-        for _ in 0..3 {
+        self.pending.retain(|k| w.loaded(*k));
+        self.queued.retain(|k| w.loaded(*k));
+        self.pending.make_contiguous().sort_by_key(|k| {
+            (*k * SIZE + IVec3::splat(SIZE / 2))
+                .as_vec3()
+                .distance_squared(pos) as i64
+        });
+        let started = std::time::Instant::now();
+        for job in 0..3 {
+            if job > 0 && started.elapsed() >= std::time::Duration::from_millis(3) {
+                break;
+            }
             if let Some(k) = self.pending.pop_front() {
                 self.queued.remove(&k);
                 if !w.loaded(k) {
@@ -403,11 +416,11 @@ impl Renderer {
             1.,
         ];
         let eye = g.player.eye();
-        let view = Mat4::perspective_rh(
+        let camera_view = Mat4::perspective_rh(
             75_f32.to_radians(),
             self.width as f32 / self.height as f32,
             0.05,
-            240.,
+            1024.,
         ) * Mat4::look_at_rh(eye, eye + g.player.direction(), Vec3::Y);
         let center = eye.floor();
         let light_view = Mat4::orthographic_rh(-80., 80., -80., 80., 0.1, 250.)
@@ -431,7 +444,7 @@ impl Renderer {
             n += 1;
         }
         let camera = Camera {
-            view: view.to_cols_array_2d(),
+            view: camera_view.to_cols_array_2d(),
             light_view: light_view.to_cols_array_2d(),
             eye: [eye.x, eye.y, eye.z, 1.],
             sun: [sun.x, sun.y, sun.z, daylight],
@@ -537,7 +550,10 @@ impl Renderer {
             });
             pass.set_pipeline(&self.shadow_pipeline);
             pass.set_bind_group(0, &self.shadow_bind, &[]);
-            for m in self.meshes.values() {
+            for (k, m) in &self.meshes {
+                if !chunk_visible(light_view, *k) {
+                    continue;
+                }
                 pass.set_vertex_buffer(0, m.buffer.slice(..));
                 pass.draw(0..m.count, 0..1);
             }
@@ -575,7 +591,10 @@ impl Renderer {
             });
             pass.set_pipeline(&self.pipeline);
             pass.set_bind_group(0, &self.bind, &[]);
-            for m in self.meshes.values() {
+            for (k, m) in &self.meshes {
+                if !chunk_visible(camera_view, *k) {
+                    continue;
+                }
                 pass.set_vertex_buffer(0, m.buffer.slice(..));
                 pass.draw(0..m.count, 0..1);
             }
@@ -673,19 +692,29 @@ const FACES: [(IVec3, IVec3, IVec3); 6] = [
     (IVec3::NEG_Z, IVec3::X, IVec3::Y),
 ];
 const CORNERS: [(i32, i32); 4] = [(-1, -1), (1, -1), (1, 1), (-1, 1)];
+// Conservative clip-space AABB test, using wgpu's 0..w depth range.
+fn chunk_visible(view: Mat4, key: IVec3) -> bool {
+    let base = (key * SIZE).as_vec3();
+    let corners = std::array::from_fn::<_, 8, _>(|i| {
+        let offset = Vec3::new((i & 1) as f32, ((i >> 1) & 1) as f32, ((i >> 2) & 1) as f32);
+        view * (base + offset * SIZE as f32).extend(1.)
+    });
+    !(0..6).any(|plane| {
+        corners.iter().all(|p| match plane {
+            0 => p.x < -p.w,
+            1 => p.x > p.w,
+            2 => p.y < -p.w,
+            3 => p.y > p.w,
+            4 => p.z < 0.,
+            _ => p.z > p.w,
+        })
+    })
+}
 pub fn mesh_chunk(w: &World, k: IVec3) -> Vec<Vertex> {
     let base = k * SIZE;
     // One-block halo avoids repeated terrain queries during face and AO lookup.
-    let mut halo = vec![Block::Air; 18 * 18 * 18];
+    let halo = w.halo(k);
     let idx = |p: IVec3| ((p.x + 1) + 18 * ((p.z + 1) + 18 * (p.y + 1))) as usize;
-    for x in -1..=16 {
-        for z in -1..=16 {
-            for y in -1..=16 {
-                let p = IVec3::new(x, y, z);
-                halo[idx(p)] = w.get(base + p);
-            }
-        }
-    }
     let get = |p: IVec3| halo[idx(p)];
     let mut out = vec![];
     for x in 0..SIZE {
@@ -776,6 +805,18 @@ fn box_mesh(out: &mut Vec<Vertex>, pos: Vec3, size: Vec3, color: [f32; 3]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn frustum_culls_behind_camera_and_keeps_intersections() {
+        let view = Mat4::perspective_rh(75_f32.to_radians(), 1., 0.05, 1024.);
+        assert!(chunk_visible(view, IVec3::new(0, 0, -2)));
+        assert!(chunk_visible(view, IVec3::new(0, 0, -1)));
+        assert!(!chunk_visible(view, IVec3::new(0, 0, 1)));
+        assert!(!chunk_visible(view, IVec3::new(20, 0, -2)));
+        assert!(!chunk_visible(view, IVec3::new(0, 0, -70)));
+        let light = Mat4::orthographic_rh(-80., 80., -80., 80., 0.1, 250.);
+        assert!(chunk_visible(light, IVec3::new(0, 0, -2)));
+        assert!(!chunk_visible(light, IVec3::new(20, 0, -2)));
+    }
     #[test]
     fn empty_sky_has_no_mesh() {
         let w = World::new(1);

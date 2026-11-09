@@ -1,10 +1,11 @@
 use glam::{IVec3, Vec3};
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 
 pub const MIN_Y: i32 = -512;
 pub const MAX_Y: i32 = 1535;
 pub const SIZE: i32 = 16;
+pub const VIEW_RADIUS: i32 = 10;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Block {
@@ -96,6 +97,7 @@ pub struct World {
     pub dirty: Vec<IVec3>,
     pub revision: u64,
     center: IVec3,
+    radius: i32,
 }
 
 pub fn hash(seed: u64, x: i32, y: i32, z: i32) -> u64 {
@@ -142,6 +144,7 @@ impl World {
             dirty: vec![],
             revision: 0,
             center: IVec3::splat(i32::MAX),
+            radius: -1,
         }
     }
     pub fn biome(&self, x: i32, z: i32) -> Biome {
@@ -241,6 +244,30 @@ impl World {
         }
         self.natural_column(p, self.height(p.x, p.z), self.tree(p.x, p.z))
     }
+    /// Sample a chunk and its AO halo, reusing generation data for each column.
+    pub fn halo(&self, key: IVec3) -> Vec<Block> {
+        let base = key * SIZE;
+        let mut blocks = vec![Block::Air; 18 * 18 * 18];
+        for x in -1..=SIZE {
+            for z in -1..=SIZE {
+                let wx = base.x + x;
+                let wz = base.z + z;
+                let h = self.height(wx, wz);
+                let t = self.tree(wx, wz);
+                for y in -1..=SIZE {
+                    let p = IVec3::new(wx, base.y + y, wz);
+                    let block = self
+                        .edits
+                        .get(&p.to_array())
+                        .copied()
+                        .or_else(|| self.chunks.get(&chunk(p)).map(|c| c[index(p)]))
+                        .unwrap_or_else(|| self.natural_column(p, h, t));
+                    blocks[((x + 1) + 18 * ((z + 1) + 18 * (y + 1))) as usize] = block;
+                }
+            }
+        }
+        blocks
+    }
     pub fn set(&mut self, p: IVec3, b: Block) -> bool {
         if !(MIN_Y + 1..=MAX_Y).contains(&p.y) {
             return false;
@@ -270,37 +297,58 @@ impl World {
     pub fn stream(&mut self, pos: Vec3, radius: i32) -> Vec<IVec3> {
         let c = chunk(pos.floor().as_ivec3());
         let mut removed = vec![];
-        if c != self.center {
+        let radius = radius.max(0);
+        if c != self.center || radius != self.radius {
             self.center = c;
+            self.radius = radius;
+            let mut desired = HashSet::new();
+            for x in c.x - radius..=c.x + radius {
+                for z in c.z - radius..=c.z + radius {
+                    // Sample every column: steep slopes and trees can cross chunk
+                    // boundaries even when the column midpoint does not.
+                    let (mut low, mut high) = (MAX_Y, MIN_Y);
+                    for dx in 0..SIZE {
+                        for dz in 0..SIZE {
+                            let h = self.height(x * SIZE + dx, z * SIZE + dz);
+                            low = low.min(h);
+                            high = high.max(h + 6);
+                        }
+                    }
+                    let lo = (low.div_euclid(SIZE) - 1).max(MIN_Y / SIZE);
+                    let hi = high.div_euclid(SIZE).min(MAX_Y / SIZE);
+                    for y in lo..=hi {
+                        desired.insert(IVec3::new(x, y, z));
+                    }
+                    // Underground gameplay needs nearby caves, not every cave
+                    // beneath every distant mountain.
+                    if (x - c.x).abs() <= 2 && (z - c.z).abs() <= 2 {
+                        for y in (c.y - 2).max(MIN_Y / SIZE)..=(c.y + 2).min(MAX_Y / SIZE) {
+                            desired.insert(IVec3::new(x, y, z));
+                        }
+                    }
+                }
+            }
             self.chunks.retain(|key, _| {
-                let keep = (key.x - c.x).abs() <= radius + 1
-                    && (key.z - c.z).abs() <= radius + 1
-                    && (key.y - c.y).abs() <= 5;
+                let keep = desired.contains(key);
                 if !keep {
                     removed.push(*key);
                 }
                 keep
             });
-            self.pending.clear();
-            let mut wanted = vec![];
-            for x in c.x - radius..=c.x + radius {
-                for z in c.z - radius..=c.z + radius {
-                    let surface = self.height(x * SIZE + 8, z * SIZE + 8).div_euclid(SIZE);
-                    let lo = (c.y - 2).min(surface - 1).max(c.y - 4).max(MIN_Y / SIZE);
-                    let hi = (c.y + 1).max(surface).min(c.y + 4).min(MAX_Y / SIZE);
-                    for y in lo..=hi {
-                        let k = IVec3::new(x, y, z);
-                        if !self.chunks.contains_key(&k) {
-                            wanted.push(k);
-                        }
-                    }
-                }
-            }
-            wanted.sort_by_key(|p| (*p - c).length_squared());
-            self.pending.extend(wanted);
+            let mut wanted: Vec<_> = desired
+                .into_iter()
+                .filter(|k| !self.chunks.contains_key(k))
+                .collect();
+            wanted.sort_by_key(|p| ((*p - c).length_squared(), p.x, p.y, p.z));
+            self.pending = wanted.into();
         }
-        // Limit generation work per frame; meshes are separately budgeted.
-        for _ in 0..3 {
+        // Soft time budget: a single chunk is indivisible, with at most three
+        // jobs per frame regardless of machine speed.
+        let started = std::time::Instant::now();
+        for job in 0..3 {
+            if job > 0 && started.elapsed() >= std::time::Duration::from_millis(2) {
+                break;
+            }
             if let Some(k) = self.pending.pop_front() {
                 let mut blocks = vec![Block::Air; 4096].into_boxed_slice();
                 for x in 0..SIZE {
@@ -403,6 +451,47 @@ impl World {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn cached_halo_matches_queries_with_edits_and_resident_chunks() {
+        let mut w = World::new(42);
+        let pos = Vec3::new(-1., 40., 16.);
+        w.stream(pos, 1);
+        w.set(IVec3::new(-1, 40, 16), Block::Planks);
+        for key in [chunk(pos.as_ivec3()), IVec3::new(-2, 1, 0)] {
+            let halo = w.halo(key);
+            for x in -1..=SIZE {
+                for z in -1..=SIZE {
+                    for y in -1..=SIZE {
+                        let i = ((x + 1) + 18 * ((z + 1) + 18 * (y + 1))) as usize;
+                        assert_eq!(halo[i], w.get(key * SIZE + IVec3::new(x, y, z)));
+                    }
+                }
+            }
+        }
+    }
+    #[test]
+    fn streaming_includes_high_surfaces_and_radius_changes() {
+        let mut w = World::new(314159);
+        let (x, z) = (-8000..=8000)
+            .step_by(256)
+            .flat_map(|x| (-8000..=8000).step_by(256).map(move |z| (x, z)))
+            .max_by_key(|(x, z)| w.height(*x, *z))
+            .unwrap();
+        let pos = Vec3::new(x as f32, 40., z as f32);
+        w.stream(pos, 0);
+        let surface = chunk(IVec3::new(x, w.height(x, z), z));
+        assert!(surface.y > chunk(pos.as_ivec3()).y + 4);
+        assert!(w.pending.contains(&surface) || w.loaded(surface));
+        w.stream(pos, 2);
+        let edge = IVec3::new(surface.x + 2, surface.y, surface.z);
+        assert!(
+            w.pending.iter().any(|k| k.x == edge.x && k.z == edge.z)
+                || w.chunks.keys().any(|k| k.x == edge.x && k.z == edge.z)
+        );
+        let removed = w.stream(Vec3::new(0., 40., 0.), 0);
+        assert!(!removed.is_empty());
+        assert!(w.pending.iter().all(|k| k.x == 0 && k.z == 0));
+    }
     #[test]
     fn negative_chunks() {
         assert_eq!(chunk(IVec3::new(-1, -17, 16)), IVec3::new(-1, -2, 1));

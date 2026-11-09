@@ -7,11 +7,16 @@ mod ui;
 mod world;
 
 use game::{Game, Input, STEP};
-use std::{collections::HashSet, path::PathBuf, sync::Arc, time::Instant};
+use std::{
+    collections::HashSet,
+    path::PathBuf,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 use winit::{
     application::ApplicationHandler,
     event::{DeviceEvent, ElementState, MouseButton, MouseScrollDelta, WindowEvent},
-    event_loop::{ActiveEventLoop, EventLoop},
+    event_loop::{ActiveEventLoop, ControlFlow, EventLoop},
     keyboard::{KeyCode, PhysicalKey},
     window::{CursorGrabMode, Window, WindowId},
 };
@@ -351,10 +356,16 @@ impl ApplicationHandler for App {
             _ => (),
         }
     }
-    fn about_to_wait(&mut self, _: &ActiveEventLoop) {
-        if let Some(w) = &self.window {
+    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        // Some desktop compositors accept FIFO frames faster than scanout.
+        // Sleep between redraws as well, keeping the default workload bounded.
+        let deadline = self.last + Duration::from_secs_f64(1. / 60.);
+        if Instant::now() >= deadline
+            && let Some(w) = &self.window
+        {
             w.request_redraw();
         }
+        event_loop.set_control_flow(ControlFlow::WaitUntil(deadline));
     }
 }
 fn smoke() -> Result<(), String> {
