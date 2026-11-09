@@ -8,12 +8,7 @@ mod ui;
 mod world;
 
 use game::{Game, Input, STEP};
-use std::{
-    collections::HashSet,
-    path::PathBuf,
-    sync::Arc,
-    time::{Duration, Instant},
-};
+use std::{collections::HashSet, path::PathBuf, sync::Arc, time::Instant};
 use winit::{
     application::ApplicationHandler,
     event::{DeviceEvent, ElementState, MouseButton, MouseScrollDelta, WindowEvent},
@@ -358,15 +353,12 @@ impl ApplicationHandler for App {
         }
     }
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
-        // Some desktop compositors accept FIFO frames faster than scanout.
-        // Sleep between redraws as well, keeping the default workload bounded.
-        let deadline = self.last + Duration::from_secs_f64(1. / 60.);
-        if Instant::now() >= deadline
-            && let Some(w) = &self.window
-        {
+        // Presentation and compositor frame callbacks pace rendering at the
+        // display refresh rate, independently of the fixed simulation tick.
+        if let Some(w) = &self.window {
             w.request_redraw();
         }
-        event_loop.set_control_flow(ControlFlow::WaitUntil(deadline));
+        event_loop.set_control_flow(ControlFlow::Wait);
     }
 }
 fn smoke() -> Result<(), String> {

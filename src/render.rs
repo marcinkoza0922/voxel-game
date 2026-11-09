@@ -43,6 +43,7 @@ struct Mesh {
 }
 pub struct Renderer {
     surface: wgpu::Surface<'static>,
+    window: Arc<Window>,
     device: wgpu::Device,
     queue: wgpu::Queue,
     config: wgpu::SurfaceConfiguration,
@@ -84,7 +85,9 @@ impl Renderer {
             backends: wgpu::Backends::VULKAN,
             ..Default::default()
         });
-        let surface = instance.create_surface(window).map_err(|e| e.to_string())?;
+        let surface = instance
+            .create_surface(window.clone())
+            .map_err(|e| e.to_string())?;
         let adapter = instance
             .request_adapter(&wgpu::RequestAdapterOptions {
                 power_preference: wgpu::PowerPreference::HighPerformance,
@@ -312,6 +315,7 @@ impl Renderer {
         });
         Ok(Self {
             surface,
+            window,
             device,
             queue,
             width: config.width,
@@ -651,6 +655,7 @@ impl Renderer {
             drop(data);
             buffer.unmap();
         }
+        self.window.pre_present_notify();
         frame.present();
         Ok(())
     }
