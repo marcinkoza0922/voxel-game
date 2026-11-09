@@ -1,0 +1,737 @@
+use crate::{
+    ecs::{Entities, Mob},
+    items::{self, Inventory, Item, RECIPES},
+    world::{Biome, Block, World},
+};
+use glam::{IVec3, Vec3};
+use serde::{Deserialize, Serialize};
+use std::collections::BTreeSet;
+
+pub const STEP: f32 = 1. / 60.;
+pub const STAT_NAMES: [&str; 7] = [
+    "Vigor",
+    "Strength",
+    "Dexterity",
+    "Wisdom",
+    "Willpower",
+    "Agility",
+    "Ingenuity",
+];
+#[derive(Clone, Serialize, Deserialize)]
+pub struct Player {
+    pub pos: [f32; 3],
+    pub yaw: f32,
+    pub pitch: f32,
+    pub health: f32,
+    pub hunger: f32,
+    pub rest: f32,
+    pub inventory: Inventory,
+    pub xp: u32,
+    pub level: u32,
+    pub points: u32,
+    pub stats: [u32; 7],
+    pub crafts: Vec<u32>,
+    pub discoveries: BTreeSet<String>,
+    pub spawn: [f32; 3],
+}
+impl Player {
+    pub fn new(world: &World) -> Self {
+        let mut spawn = Vec3::new(2.5, world.height(2, 2) as f32 + 2., 2.5);
+        // Avoid spawning inside a tree or a cave roof.
+        while world.get(spawn.floor().as_ivec3()).solid()
+            || world.get((spawn + Vec3::Y).floor().as_ivec3()).solid()
+        {
+            spawn.y += 1.;
+        }
+        Self {
+            pos: spawn.to_array(),
+            yaw: 0.5,
+            pitch: -0.1,
+            health: 100.,
+            hunger: 100.,
+            rest: 100.,
+            inventory: Inventory::default(),
+            xp: 0,
+            level: 1,
+            points: 0,
+            stats: [0; 7],
+            crafts: vec![0; RECIPES.len()],
+            discoveries: BTreeSet::new(),
+            spawn: spawn.to_array(),
+        }
+    }
+    pub fn max_health(&self) -> f32 {
+        100. + self.stats[0] as f32 * 3.
+    }
+    pub fn direction(&self) -> Vec3 {
+        Vec3::new(
+            self.yaw.sin() * self.pitch.cos(),
+            self.pitch.sin(),
+            -self.yaw.cos() * self.pitch.cos(),
+        )
+    }
+    pub fn eye(&self) -> Vec3 {
+        Vec3::from_array(self.pos) + Vec3::Y * 1.62
+    }
+    pub fn threshold(&self) -> u32 {
+        80 + self.level * 40
+    }
+    pub fn gain(&mut self, xp: u32) {
+        self.xp = self.xp.saturating_add(xp);
+        while self.xp >= self.threshold() && self.level < 100 {
+            self.xp -= self.threshold();
+            self.level += 1;
+            self.points += 2;
+        }
+    }
+    fn discover(&mut self, key: String, xp: u32) {
+        if self.discoveries.insert(key) {
+            self.gain(xp);
+        }
+    }
+}
+#[derive(Default)]
+pub struct Input {
+    pub forward: f32,
+    pub right: f32,
+    pub jump: bool,
+    pub sprint: bool,
+    pub attack: bool,
+}
+pub struct Game {
+    pub world: World,
+    pub player: Player,
+    pub entities: Entities,
+    pub time: f32,
+    pub message: String,
+    pub message_time: f32,
+    pub velocity: Vec3,
+    pub grounded: bool,
+    pub target: Option<(IVec3, IVec3)>,
+    mining: Option<IVec3>,
+    pub mining_progress: f32,
+    attack_timer: f32,
+    spawn_timer: f32,
+    pub torch_life: std::collections::BTreeMap<[i32; 3], f32>,
+}
+impl Game {
+    pub fn new(seed: u64) -> Self {
+        let world = World::new(seed);
+        let player = Player::new(&world);
+        Self {
+            world,
+            player,
+            entities: Entities::default(),
+            time: 0.28,
+            message: "Gather logs. E opens your pack and crafting.".into(),
+            message_time: 12.,
+            velocity: Vec3::ZERO,
+            grounded: false,
+            target: None,
+            mining: None,
+            mining_progress: 0.,
+            attack_timer: 0.,
+            spawn_timer: 4.,
+            torch_life: Default::default(),
+        }
+    }
+    pub fn say(&mut self, s: impl Into<String>) {
+        self.message = s.into();
+        self.message_time = 4.;
+    }
+    pub fn target(&mut self) {
+        self.target = self
+            .world
+            .raycast(self.player.eye(), self.player.direction(), 5.);
+    }
+    pub fn stations(&self) -> (bool, bool) {
+        let p = Vec3::from_array(self.player.pos).floor().as_ivec3();
+        let mut table = false;
+        let mut furnace = false;
+        for x in -3..=3 {
+            for y in -2..=2 {
+                for z in -3..=3 {
+                    match self.world.get(p + IVec3::new(x, y, z)) {
+                        Block::Table => table = true,
+                        Block::Furnace => furnace = true,
+                        _ => (),
+                    }
+                }
+            }
+        }
+        (table, furnace)
+    }
+    pub fn craft(&mut self, index: usize) {
+        let (table, furnace) = self.stations();
+        match items::craft(&mut self.player.inventory, index, table, furnace) {
+            Ok(()) => {
+                let r = &RECIPES[index];
+                let count = self.player.crafts[index];
+                let xp = items::craft_xp(r.xp, count);
+                self.player.crafts[index] = count.saturating_add(1);
+                let ingenuity = self.player.stats[6];
+                if ingenuity > 0 && count.saturating_add(1).is_multiple_of(24 - ingenuity) {
+                    self.player.inventory.add(r.output, 1);
+                }
+                self.player.gain(xp);
+                self.say(format!(
+                    "Crafted {} x{} (+{} XP)",
+                    r.output.name(),
+                    r.amount,
+                    xp
+                ));
+            }
+            Err(e) => self.say(e),
+        }
+    }
+    pub fn allocate(&mut self, index: usize) {
+        if index < 7
+            && index != 3
+            && index != 4
+            && self.player.points > 0
+            && self.player.stats[index] < 20
+        {
+            self.player.points -= 1;
+            self.player.stats[index] += 1;
+            self.say(format!("{} increased", STAT_NAMES[index]));
+        }
+    }
+    pub fn use_selected(&mut self) {
+        let i = self.player.inventory.selected();
+        if self.player.inventory.count(i) == 0 {
+            self.say("That slot is empty");
+            return;
+        }
+        if matches!(i, Item::Berries | Item::CookedMeat | Item::Meat) {
+            self.player.inventory.take(i, 1);
+            let food = if i == Item::CookedMeat {
+                40.
+            } else if i == Item::Berries {
+                15.
+            } else {
+                7.
+            };
+            self.player.hunger = (self.player.hunger + food).min(100.);
+            self.say("You eat and recover some hunger");
+            return;
+        }
+        self.target();
+        if let Some((hit, adjacent)) = self.target {
+            if self.world.get(hit) == Block::Bed {
+                self.sleep();
+                return;
+            }
+            if let Some(block) = i.block() {
+                if adjacent == hit || self.world.get(adjacent) != Block::Air {
+                    return;
+                }
+                let pos = Vec3::from_array(self.player.pos);
+                if block.solid() && overlaps(pos, adjacent) {
+                    self.say("Cannot place a block inside yourself");
+                    return;
+                }
+                if self.entities.iter().any(|(_, m)| overlaps(m.pos, adjacent)) {
+                    self.say("A creature is in the way");
+                    return;
+                }
+                if block == Block::Torch && self.torch_life.len() >= 256 {
+                    self.say("Torch limit reached (256)");
+                    return;
+                }
+                if self.world.set(adjacent, block) {
+                    self.player.inventory.take(i, 1);
+                    if block == Block::Torch {
+                        self.torch_life.insert(adjacent.to_array(), 600.);
+                    }
+                }
+            }
+        }
+    }
+    pub fn sleep(&mut self) {
+        let p = Vec3::from_array(self.player.pos).floor().as_ivec3();
+        if self
+            .entities
+            .iter()
+            .any(|(_, m)| m.pos.distance(Vec3::from_array(self.player.pos)) < 12.)
+        {
+            self.say("A hostile creature is too close to sleep");
+            return;
+        }
+        let mut bed = false;
+        for x in -3..=3 {
+            for y in -2..=2 {
+                for z in -3..=3 {
+                    bed |= self.world.get(p + IVec3::new(x, y, z)) == Block::Bed;
+                }
+            }
+        }
+        if bed {
+            self.time = self.time.floor() + 1.28;
+            self.player.rest = 100.;
+            self.player.hunger = (self.player.hunger - 12.).max(0.);
+            self.player.health = (self.player.health + 25.).min(self.player.max_health());
+            self.say("You wake at dawn, rested");
+        } else {
+            self.say("Place a bedroll nearby to sleep");
+        }
+    }
+    pub fn tick(&mut self, input: &Input, dt: f32) {
+        self.time += dt / 900.;
+        self.message_time = (self.message_time - dt).max(0.);
+        self.attack_timer = (self.attack_timer - dt).max(0.);
+        let mut expired = vec![];
+        for (p, t) in &mut self.torch_life {
+            *t -= dt;
+            if *t <= 0. {
+                expired.push(*p);
+            }
+        }
+        for p in expired {
+            self.torch_life.remove(&p);
+            if self.world.get(IVec3::from_array(p)) == Block::Torch {
+                self.world.set(IVec3::from_array(p), Block::Air);
+            }
+        }
+        let speed = 4.5
+            * (1. + (self.player.stats[5] as f32 * 0.012).min(0.24))
+            * if input.sprint && self.player.hunger > 10. {
+                1.45
+            } else {
+                1.
+            };
+        let forward = Vec3::new(self.player.yaw.sin(), 0., -self.player.yaw.cos());
+        let right = Vec3::new(self.player.yaw.cos(), 0., self.player.yaw.sin());
+        let walk = (forward * input.forward + right * input.right).normalize_or_zero() * speed;
+        self.velocity.x = walk.x;
+        self.velocity.z = walk.z;
+        if input.jump && self.grounded {
+            self.velocity.y = 7.2 * (1. + self.player.stats[5] as f32 * 0.008);
+            self.grounded = false;
+        }
+        self.velocity.y = (self.velocity.y - 22. * dt).max(-45.);
+        let mut pos = Vec3::from_array(self.player.pos);
+        let was_falling = self.velocity.y;
+        self.grounded = false;
+        for axis in [0, 2, 1] {
+            let delta = self.velocity[axis] * dt;
+            let steps = (delta.abs() / 0.2).ceil().max(1.) as u32;
+            for _ in 0..steps {
+                let mut next = pos;
+                next[axis] += delta / steps as f32;
+                if collides(&self.world, next) {
+                    if axis == 1 {
+                        if self.velocity.y < 0. {
+                            self.grounded = true;
+                            if was_falling < -12. {
+                                let damage = (-was_falling - 12.)
+                                    * 3.
+                                    * (1. - self.player.stats[5] as f32 * 0.02);
+                                self.player.health -= damage.max(0.);
+                            }
+                        }
+                        self.velocity.y = 0.;
+                    }
+                    break;
+                }
+                pos = next;
+            }
+        }
+        self.player.pos = pos.to_array();
+        self.player.hunger =
+            (self.player.hunger - dt * if input.sprint { 0.12 } else { 0.055 }).max(0.);
+        self.player.rest = (self.player.rest - dt * 0.035).max(0.);
+        if self.player.hunger == 0. || self.player.rest == 0. {
+            self.player.health -= dt * 1.5;
+        } else if self.player.hunger > 60. && self.player.rest > 25. {
+            self.player.health = (self.player.health + dt * 0.6).min(self.player.max_health());
+        }
+        let biome = self.world.biome(pos.x as i32, pos.z as i32);
+        self.player.discover(format!("biome:{}", biome.name()), 30);
+        self.target();
+        if input.attack {
+            self.attack(dt);
+        } else {
+            self.mining = None;
+            self.mining_progress = 0.;
+        }
+        self.update_mobs(dt);
+        if self.player.health <= 0. || pos.y < crate::world::MIN_Y as f32 {
+            self.player.pos = self.player.spawn;
+            self.velocity = Vec3::ZERO;
+            self.player.health = self.player.max_health();
+            self.player.hunger = 75.;
+            self.player.rest = 75.;
+            self.say("You awaken at your starting place. Inventory retained.");
+        }
+    }
+    fn attack(&mut self, dt: f32) {
+        let eye = self.player.eye();
+        let dir = self.player.direction();
+        let block_distance = self
+            .target
+            .map(|(p, _)| (p.as_vec3() + Vec3::splat(0.5)).distance(eye))
+            .unwrap_or(5.);
+        let victim = self
+            .entities
+            .iter()
+            .filter_map(|(id, m)| {
+                let d = m.pos + Vec3::Y - eye;
+                let along = d.dot(dir);
+                if along > 0.
+                    && along < 3.2
+                    && along < block_distance
+                    && (d - dir * along).length() < 0.8
+                {
+                    Some((id, along))
+                } else {
+                    None
+                }
+            })
+            .min_by(|a, b| a.1.total_cmp(&b.1))
+            .map(|(id, _)| id);
+        if let Some(id) = victim {
+            self.mining_progress = 0.;
+            if self.attack_timer > 0. {
+                return;
+            }
+            self.attack_timer = 0.5 / (1. + self.player.stats[2] as f32 * 0.015);
+            let selected = self.player.inventory.selected();
+            let equipped = self.player.inventory.count(selected) > 0;
+            let damage = (if equipped && selected == Item::Sword {
+                14.
+            } else if equipped && selected.axe() > 0 {
+                7.
+            } else {
+                3.
+            }) * (1. + self.player.stats[1] as f32 * 0.025);
+            let mut killed = None;
+            if let Some(m) = self.entities.get_mut(id) {
+                m.health -= damage;
+                m.pos += Vec3::new(dir.x, 0., dir.z) * 0.4;
+                if m.health <= 0. {
+                    killed = Some(m.level);
+                }
+            }
+            if equipped {
+                self.player.inventory.damage_tool(selected);
+            }
+            if let Some(level) = killed {
+                self.entities.despawn(id);
+                let xp = if self.player.level > level + 5 {
+                    0
+                } else {
+                    25 / (1 + self.player.level.saturating_sub(level))
+                };
+                self.player.gain(xp);
+                self.player.inventory.add(Item::Meat, 2);
+                self.say(format!("Husk defeated (+{xp} XP)"));
+            }
+            return;
+        }
+        let Some((p, _)) = self.target else {
+            self.mining = None;
+            self.mining_progress = 0.;
+            return;
+        };
+        let b = self.world.get(p);
+        let tool = self.player.inventory.selected();
+        let has = self.player.inventory.count(tool) > 0;
+        let pick = if has { tool.pick() } else { 0 };
+        let axe = if has { tool.axe() } else { 0 };
+        let hard = matches!(
+            b,
+            Block::Stone | Block::Copper | Block::Coal | Block::Cobble | Block::Furnace
+        );
+        if (hard && pick == 0) || (b == Block::Copper && pick < 2) || (b == Block::Log && axe == 0)
+        {
+            if self.message_time < 1. {
+                self.say(if b == Block::Copper {
+                    "Copper ore needs a stone pickaxe"
+                } else if b == Block::Log {
+                    "Use an axe to harvest logs"
+                } else {
+                    "Use a pickaxe to harvest stone"
+                });
+            }
+            return;
+        }
+        if self.mining != Some(p) {
+            self.mining = Some(p);
+            self.mining_progress = 0.;
+        }
+        let seconds = if hard {
+            1.8 / (pick as f32).max(1.)
+        } else if b == Block::Log {
+            1.2 / (axe as f32).max(1.)
+        } else {
+            0.35
+        };
+        self.mining_progress += dt / seconds;
+        if self.mining_progress >= 1. && self.world.set(p, Block::Air) {
+            let drop = match b {
+                Block::Log => Some(Item::Log),
+                Block::Stone | Block::Cobble => Some(Item::Cobble),
+                Block::Copper => Some(Item::CopperOre),
+                Block::Coal => Some(Item::Coal),
+                Block::Dirt | Block::Grass | Block::Sand => Some(Item::Dirt),
+                Block::Planks => Some(Item::Planks),
+                Block::Table => Some(Item::Table),
+                Block::Furnace => Some(Item::Furnace),
+                Block::Bed => Some(Item::Bed),
+                Block::Torch => Some(Item::Torch),
+                Block::Leaves => Some(Item::Berries),
+                _ => None,
+            };
+            if let Some(i) = drop {
+                self.player.inventory.add(i, 1);
+                self.player.discover(format!("resource:{}", i.name()), 15);
+            }
+            self.torch_life.remove(&p.to_array());
+            self.player.inventory.damage_tool(tool);
+            self.mining_progress = 0.;
+            self.mining = None;
+        }
+    }
+    fn update_mobs(&mut self, dt: f32) {
+        let player = Vec3::from_array(self.player.pos);
+        self.spawn_timer -= dt;
+        if self.spawn_timer <= 0. {
+            self.spawn_timer = 18.;
+            if self.entities.iter().count() < 5 {
+                let n = (self.time * 10000.) as i32;
+                let h = crate::world::hash(self.world.seed, n, 0, 0);
+                let angle = (h % 628) as f32 / 100.;
+                let x = player.x + angle.sin() * 20.;
+                let z = player.z + angle.cos() * 20.;
+                let y = self.world.height(x as i32, z as i32) as f32 + 1.01;
+                let pos = Vec3::new(x, y, z);
+                if !collides(&self.world, pos) {
+                    self.entities.spawn(Mob {
+                        pos,
+                        health: 30.,
+                        cooldown: 0.,
+                        level: 1,
+                    });
+                }
+            }
+        }
+        let remove: Vec<_> = self
+            .entities
+            .iter()
+            .filter(|(_, m)| m.pos.distance(player) > 90.)
+            .map(|(id, _)| id)
+            .collect();
+        for id in remove {
+            self.entities.despawn(id);
+        }
+        for mob in self.entities.iter_mut() {
+            mob.cooldown = (mob.cooldown - dt).max(0.);
+            let diff = player - mob.pos;
+            let dist = diff.length();
+            if dist < 18. && dist > 1.4 {
+                let movement = Vec3::new(diff.x, 0., diff.z).normalize_or_zero() * dt * 1.7;
+                for axis in [0, 2] {
+                    let mut p = mob.pos;
+                    p[axis] += movement[axis];
+                    if !collides(&self.world, p) {
+                        mob.pos = p;
+                    } else if !collides(&self.world, p + Vec3::Y)
+                        && collides(&self.world, p - Vec3::Y * 0.1)
+                    {
+                        mob.pos = p + Vec3::Y;
+                    }
+                }
+            }
+            let down = mob.pos - Vec3::Y * dt * 6.;
+            if !collides(&self.world, down) {
+                mob.pos = down;
+            }
+            if dist < 1.8
+                && mob.cooldown == 0.
+                && self
+                    .world
+                    .raycast(
+                        mob.pos + Vec3::Y,
+                        (player + Vec3::Y) - (mob.pos + Vec3::Y),
+                        dist,
+                    )
+                    .is_none()
+            {
+                self.player.health -= 7.;
+                mob.cooldown = 1.2;
+            }
+        }
+    }
+    pub fn biome(&self) -> Biome {
+        let p = Vec3::from_array(self.player.pos);
+        self.world.biome(p.x as i32, p.z as i32)
+    }
+}
+pub fn overlaps(pos: Vec3, b: IVec3) -> bool {
+    pos.x + 0.29 > b.x as f32
+        && pos.x - 0.29 < (b.x + 1) as f32
+        && pos.y + 1.8 > b.y as f32
+        && pos.y < (b.y + 1) as f32
+        && pos.z + 0.29 > b.z as f32
+        && pos.z - 0.29 < (b.z + 1) as f32
+}
+pub fn collides(world: &World, pos: Vec3) -> bool {
+    let min = (pos - Vec3::new(0.29, 0., 0.29)).floor().as_ivec3();
+    let max = (pos + Vec3::new(0.29, 1.79, 0.29)).floor().as_ivec3();
+    for x in min.x..=max.x {
+        for y in min.y..=max.y {
+            for z in min.z..=max.z {
+                if world.get(IVec3::new(x, y, z)).solid() {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn fixed_step_landing() {
+        let mut g = Game::new(7);
+        for _ in 0..180 {
+            g.tick(&Input::default(), STEP);
+        }
+        assert!(g.grounded);
+        assert!(!collides(&g.world, Vec3::from_array(g.player.pos)));
+        assert!(g.player.health > 0.);
+    }
+    #[test]
+    fn grounded_player_can_jump() {
+        let mut g = Game::new(7);
+        for _ in 0..120 {
+            g.tick(&Input::default(), STEP);
+        }
+        let y = g.player.pos[1];
+        g.tick(
+            &Input {
+                jump: true,
+                ..Default::default()
+            },
+            STEP,
+        );
+        assert!(g.player.pos[1] > y);
+    }
+    #[test]
+    fn stats_are_bounded() {
+        let mut g = Game::new(7);
+        g.player.points = 40;
+        for _ in 0..30 {
+            g.allocate(0);
+        }
+        assert_eq!(g.player.stats[0], 20);
+        assert_eq!(g.player.points, 20);
+    }
+    fn sky_fixture() -> Game {
+        let mut g = Game::new(7);
+        g.player.pos = [0.5, 100.01, 0.5];
+        g.player.yaw = 0.;
+        g.player.pitch = 0.;
+        for x in -5..=5 {
+            for z in -5..=5 {
+                g.world.set(IVec3::new(x, 99, z), Block::Stone);
+            }
+        }
+        g
+    }
+    #[test]
+    fn walking_cannot_tunnel_through_wall() {
+        let mut g = sky_fixture();
+        for x in -3..=3 {
+            for y in 100..=104 {
+                g.world.set(IVec3::new(x, y, -2), Block::Stone);
+            }
+        }
+        for _ in 0..180 {
+            g.tick(
+                &Input {
+                    forward: 1.,
+                    sprint: true,
+                    ..Default::default()
+                },
+                STEP,
+            );
+        }
+        assert!(g.player.pos[2] >= -0.72);
+        assert!(!collides(&g.world, Vec3::from_array(g.player.pos)));
+    }
+    #[test]
+    fn copper_requires_stone_pick_and_yields_ore() {
+        let mut g = sky_fixture();
+        let p = IVec3::new(0, 101, -2);
+        g.world.set(p, Block::Copper);
+        g.player.inventory.selected = 1;
+        g.target();
+        g.attack(5.);
+        assert_eq!(g.world.get(p), Block::Copper);
+        assert_eq!(g.player.inventory.count(Item::CopperOre), 0);
+        g.player.inventory.add(Item::StonePick, 1);
+        g.player.inventory.hotbar[1] = Item::StonePick;
+        g.attack(5.);
+        assert_eq!(g.world.get(p), Block::Air);
+        assert_eq!(g.player.inventory.count(Item::CopperOre), 1);
+    }
+    #[test]
+    fn stations_gate_complete_copper_progression() {
+        let mut g = sky_fixture();
+        g.player.inventory.add(Item::Log, 10);
+        for _ in 0..10 {
+            g.craft(0);
+        }
+        g.craft(1);
+        g.craft(1);
+        g.craft(2);
+        g.player.inventory.add(Item::Cobble, 14);
+        g.craft(8);
+        assert_eq!(g.player.inventory.count(Item::StonePick), 0);
+        g.world.set(IVec3::new(2, 100, 0), Block::Table);
+        g.player.inventory.take(Item::Table, 1);
+        g.craft(8);
+        g.craft(7);
+        g.craft(9);
+        assert_eq!(g.player.inventory.count(Item::StonePick), 1);
+        assert_eq!(g.player.inventory.count(Item::Furnace), 1);
+        g.player.inventory.add(Item::CopperOre, 3);
+        g.player.inventory.add(Item::Coal, 3);
+        g.craft(10);
+        assert_eq!(g.player.inventory.count(Item::CopperIngot), 0);
+        g.world.set(IVec3::new(-2, 100, 0), Block::Furnace);
+        g.player.inventory.take(Item::Furnace, 1);
+        for _ in 0..3 {
+            g.craft(10);
+        }
+        g.craft(13);
+        assert_eq!(g.player.inventory.count(Item::CopperPick), 1);
+        assert_eq!(g.player.inventory.count(Item::CopperOre), 0);
+        assert!(g.player.level > 1);
+    }
+    #[test]
+    fn torches_expire_and_sleep_restores_rest() {
+        let mut g = sky_fixture();
+        let p = IVec3::new(2, 100, 0);
+        g.world.set(p, Block::Torch);
+        g.torch_life.insert(p.to_array(), 0.01);
+        g.tick(&Input::default(), STEP);
+        assert_eq!(g.world.get(p), Block::Air);
+        assert!(g.torch_life.is_empty());
+        g.world.set(p, Block::Bed);
+        g.player.rest = 1.;
+        g.sleep();
+        assert_eq!(g.player.rest, 100.);
+    }
+    #[test]
+    fn magic_stats_do_not_consume_points() {
+        let mut g = sky_fixture();
+        g.player.points = 2;
+        g.allocate(3);
+        g.allocate(4);
+        assert_eq!(g.player.points, 2);
+    }
+}

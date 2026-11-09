@@ -1,0 +1,24 @@
+[package]
+name = "voxel-game"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+winit = "0.30.13"
+wgpu = "27.0.1"
+pollster = "0.4"
+bytemuck = { version = "1.24", features = ["derive"] }
+glam = "0.30"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[lints.clippy]
+correctness = "deny"
+suspicious = "warn"
+perf = "warn"
+
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 2
