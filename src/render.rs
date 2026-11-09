@@ -16,13 +16,14 @@ pub struct Vertex {
     normal: [f32; 3],
     color: [f32; 3],
     tile: [f32; 3],
+    sky_access: f32,
 }
-const VERTEX_ATTRIBUTES: [wgpu::VertexAttribute; 4] =
-    wgpu::vertex_attr_array![0=>Float32x3,1=>Float32x3,2=>Float32x3,3=>Float32x3];
+const VERTEX_ATTRIBUTES: [wgpu::VertexAttribute; 5] =
+    wgpu::vertex_attr_array![0=>Float32x3,1=>Float32x3,2=>Float32x3,3=>Float32x3,4=>Float32];
 impl Vertex {
     fn layout() -> wgpu::VertexBufferLayout<'static> {
         wgpu::VertexBufferLayout {
-            array_stride: 48,
+            array_stride: 52,
             step_mode: wgpu::VertexStepMode::Vertex,
             attributes: &VERTEX_ATTRIBUTES,
         }
@@ -530,7 +531,7 @@ impl Renderer {
         } else {
             -celestial
         };
-        let strength = daylight + (1. - daylight) * 0.12;
+        let strength = daylight + (1. - daylight) * 0.025 * sun.y.max(0.).sqrt();
         let sky = [daylight, 0., 0., 1.];
         let eye = g.player.eye();
         let camera_view = Mat4::perspective_rh(
@@ -713,6 +714,7 @@ impl Renderer {
             let center = pos + Vec3::Y * (0.14 + 0.04 * (g.feedback.clock * 2.5 + pos.x).sin());
             for v in &icon.vertices {
                 dynamic.push(Vertex {
+                    sky_access: 1.,
                     pos: (center + right * v.pos[0] * 0.3 + Vec3::Y * v.pos[1] * 0.3).to_array(),
                     normal: normal.to_array(),
                     color: [v.color[0], v.color[1], v.color[2]],
@@ -759,6 +761,7 @@ impl Renderer {
                     usage: wgpu::BufferUsages::VERTEX,
                 })
         });
+        apply_sky_access(&g.world, &mut dynamic);
         let dynamic_buffer = (!dynamic.is_empty()).then(|| {
             self.device
                 .create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -1022,7 +1025,101 @@ fn chunk_visible(view: Mat4, key: IVec3) -> bool {
 }
 #[cfg(test)]
 pub fn mesh_chunk(w: &World, k: IVec3) -> Vec<Vertex> {
-    mesh_halo(w.seed, k, &w.halo(k), &w.torch_mounts)
+    let mut mesh = mesh_halo(w.seed, k, &w.halo(k), &w.torch_mounts);
+    apply_sky_access(w, &mut mesh);
+    mesh
+}
+/// Maximum reach of indirect skylight into an entrance (in blocks).
+pub const SKY_REACH: i32 = 12;
+
+struct SkyAccess<'a> {
+    world: &'a World,
+    roofs: HashMap<(i32, i32), i32>,
+    opaque: HashMap<IVec3, bool>,
+    exposure: HashMap<IVec3, f32>,
+}
+impl SkyAccess<'_> {
+    fn open_sky(&mut self, cell: IVec3) -> bool {
+        let w = self.world;
+        let roof = self.roofs.entry((cell.x, cell.z)).or_insert_with(|| {
+            let top = w
+                .edits
+                .keys()
+                .filter(|p| p[0] == cell.x && p[2] == cell.z)
+                .map(|p| p[1])
+                .max()
+                .unwrap_or(crate::world::MIN_Y)
+                .max(w.height(cell.x, cell.z) + 16);
+            (crate::world::MIN_Y..=top.min(crate::world::MAX_Y))
+                .rev()
+                .find(|y| {
+                    let b = w.get(IVec3::new(cell.x, *y, cell.z));
+                    b.solid() && b != Block::Leaves
+                })
+                .unwrap_or(crate::world::MIN_Y)
+        });
+        cell.y > *roof
+    }
+    fn blocked(&mut self, cell: IVec3) -> bool {
+        *self.opaque.entry(cell).or_insert_with(|| {
+            let b = self.world.get(cell);
+            b.solid() && b != Block::Leaves
+        })
+    }
+    fn sample(&mut self, cell: IVec3) -> f32 {
+        if let Some(value) = self.exposure.get(&cell) {
+            return *value;
+        }
+        let mut value: f32 = 0.;
+        if self.open_sky(cell) {
+            value = 1.;
+        } else {
+            // Trace toward nearby openings, stopping at walls. The limited reach
+            // preserves complete darkness in deep caves and enclosed rooms.
+            for (x, z) in [
+                (1, 0),
+                (-1, 0),
+                (0, 1),
+                (0, -1),
+                (1, 1),
+                (1, -1),
+                (-1, 1),
+                (-1, -1),
+            ] {
+                for rise in [0., 0.5] {
+                    let direction = Vec3::new(x as f32, rise, z as f32).normalize();
+                    for step in 1..SKY_REACH * 2 {
+                        let distance = step as f32 * 0.5;
+                        let p = (cell.as_vec3() + Vec3::splat(0.5) + direction * distance)
+                            .floor()
+                            .as_ivec3();
+                        if self.blocked(p) {
+                            break;
+                        }
+                        if self.open_sky(p) {
+                            let falloff = 1. - distance / SKY_REACH as f32;
+                            value = value.max(0.65 * falloff * falloff);
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        self.exposure.insert(cell, value);
+        value
+    }
+}
+pub fn apply_sky_access(w: &World, mesh: &mut [Vertex]) {
+    let mut sky = SkyAccess {
+        world: w,
+        roofs: HashMap::new(),
+        opaque: HashMap::new(),
+        exposure: HashMap::new(),
+    };
+    for vertex in mesh {
+        let sample = Vec3::from_array(vertex.pos) + Vec3::from_array(vertex.normal) * 0.02;
+        vertex.sky_access = sky.sample(sample.floor().as_ivec3());
+    }
 }
 pub fn mesh_halo(
     seed: u64,
@@ -1060,6 +1157,7 @@ pub fn mesh_halo(
                         continue;
                     }
                     let mut vertices = [Vertex {
+                        sky_access: 1.,
                         pos: [0.; 3],
                         normal: normal.as_vec3().to_array(),
                         color: [1.; 3],
@@ -1149,6 +1247,7 @@ fn vegetation(out: &mut Vec<Vertex>, seed: u64, support: IVec3, block: Block) {
                     (tip, [0.43, 0.59, 0.16]),
                 ] {
                     out.push(Vertex {
+                        sky_access: 1.,
                         pos: point.to_array(),
                         normal,
                         color,
@@ -1364,6 +1463,7 @@ fn box_mesh(out: &mut Vec<Vertex>, pos: Vec3, size: Vec3, color: [f32; 3]) {
                 + u.as_vec3() * a as f32 * 0.5
                 + v.as_vec3() * b as f32 * 0.5;
             Vertex {
+                sky_access: 1.,
                 pos: (pos + p * size).to_array(),
                 normal: n.as_vec3().to_array(),
                 color,
@@ -1652,5 +1752,61 @@ mod sky_tests {
         assert_eq!(sky_cycle(0.75).1, 0.);
         assert!(sky_cycle(0.).0.y.abs() < 0.00001);
         assert!(sky_cycle(0.5).0.y.abs() < 0.00001);
+    }
+    #[test]
+    fn sky_access_blocks_caves_and_tracks_roof_edits() {
+        let mut world = World::new(42);
+        let y = world.height(0, 0) + 30;
+        let mut vertices = [Vertex {
+            pos: [0.5, y as f32, 0.5],
+            normal: [0., 1., 0.],
+            color: [1.; 3],
+            tile: [0.; 3],
+            sky_access: 1.,
+        }];
+        apply_sky_access(&world, &mut vertices);
+        assert_eq!(vertices[0].sky_access, 1.);
+        world.set(IVec3::new(0, y + 40, 0), Block::Stone);
+        apply_sky_access(&world, &mut vertices);
+        assert!(vertices[0].sky_access > 0. && vertices[0].sky_access < 1.);
+        world.set(IVec3::new(0, y + 40, 0), Block::Air);
+        apply_sky_access(&world, &mut vertices);
+        assert_eq!(vertices[0].sky_access, 1.);
+        vertices[0].pos[1] = (world.height(0, 0) - 20) as f32;
+        apply_sky_access(&world, &mut vertices);
+        assert_eq!(vertices[0].sky_access, 0.);
+    }
+    #[test]
+    fn entrance_light_fades_with_distance_and_stops_at_walls() {
+        let mut world = World::new(42);
+        let y = world.height(0, 0) + 60;
+        for x in 0..=28 {
+            for z in -14..=14 {
+                world.set(IVec3::new(x, y + 2, z), Block::Stone);
+            }
+        }
+        let mut sky = SkyAccess {
+            world: &world,
+            roofs: HashMap::new(),
+            opaque: HashMap::new(),
+            exposure: HashMap::new(),
+        };
+        let near = sky.sample(IVec3::new(1, y, 0));
+        let middle = sky.sample(IVec3::new(5, y, 0));
+        let deep = sky.sample(IVec3::new(14, y, 0));
+        assert!(near > middle && middle > 0.);
+        assert_eq!(deep, 0.);
+        for z in -14..=14 {
+            for dy in -1..=2 {
+                world.set(IVec3::new(0, y + dy, z), Block::Stone);
+            }
+        }
+        let mut sky = SkyAccess {
+            world: &world,
+            roofs: HashMap::new(),
+            opaque: HashMap::new(),
+            exposure: HashMap::new(),
+        };
+        assert_eq!(sky.sample(IVec3::new(1, y, 0)), 0.);
     }
 }

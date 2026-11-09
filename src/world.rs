@@ -586,6 +586,12 @@ impl World {
         if let Some(c) = self.chunks.get_mut(&key) {
             c[index(p)] = b;
         }
+        self.dirty.extend(
+            self.chunks
+                .keys()
+                .copied()
+                .filter(|k| (k.x - key.x).abs() <= 1 && (k.z - key.z).abs() <= 1),
+        );
         self.dirty.push(key);
         // AO samples diagonal neighbors too, including across chunk corners.
         for x in -1..=1 {
@@ -753,13 +759,21 @@ impl World {
             let base = key * SIZE;
             let mut snapshot = World::new(self.seed);
             snapshot.torch_mounts = self.torch_mounts.clone();
-            // Copy only edits intersecting the chunk and its one-block AO halo.
+            // Include the full vertical columns for sky occlusion above the AO halo.
             snapshot.edits = self
                 .edits
-                .range([base.x - 1, i32::MIN, i32::MIN]..=[base.x + SIZE, i32::MAX, i32::MAX])
+                .range(
+                    [base.x - crate::render::SKY_REACH - 1, i32::MIN, i32::MIN]
+                        ..=[
+                            base.x + SIZE + crate::render::SKY_REACH + 1,
+                            i32::MAX,
+                            i32::MAX,
+                        ],
+                )
                 .filter(|(p, _)| {
-                    (base.y - 1..=base.y + SIZE).contains(&p[1])
-                        && (base.z - 1..=base.z + SIZE).contains(&p[2])
+                    (base.z - crate::render::SKY_REACH - 1
+                        ..=base.z + SIZE + crate::render::SKY_REACH + 1)
+                        .contains(&p[2])
                 })
                 .map(|(p, b)| (*p, *b))
                 .collect();

@@ -49,10 +49,10 @@ struct SkyOut {
     color=mix(color,vec3(0.65,0.75,0.9),moon*above);
     return vec4(color,1.0);
 }
-struct In { @location(0) pos: vec3<f32>, @location(1) normal: vec3<f32>, @location(2) color: vec3<f32>, @location(3) tile: vec3<f32> };
-struct Out { @builtin(position) clip: vec4<f32>, @location(0) world: vec3<f32>, @location(1) normal: vec3<f32>, @location(2) color: vec3<f32>, @location(3) shadow: vec4<f32>, @location(4) tile: vec3<f32> };
+struct In { @location(0) pos: vec3<f32>, @location(1) normal: vec3<f32>, @location(2) color: vec3<f32>, @location(3) tile: vec3<f32>, @location(4) sky_access:f32 };
+struct Out { @builtin(position) clip: vec4<f32>, @location(0) world: vec3<f32>, @location(1) normal: vec3<f32>, @location(2) color: vec3<f32>, @location(3) shadow: vec4<f32>, @location(4) tile: vec3<f32>, @location(5) sky_access:f32 };
 @vertex fn vs(v:In)->Out {
-    var o:Out; o.clip=camera.view*vec4(v.pos,1.0);o.world=v.pos;o.normal=v.normal;o.color=v.color;o.tile=v.tile;o.shadow=camera.light_view*vec4(v.pos,1.0);return o;
+    var o:Out; o.clip=camera.view*vec4(v.pos,1.0);o.world=v.pos;o.normal=v.normal;o.color=v.color;o.tile=v.tile;o.sky_access=v.sky_access;o.shadow=camera.light_view*vec4(v.pos,1.0);return o;
 }
 fn leaf_gap(world:vec3<f32>, normal:vec3<f32>, layer:f32)->bool {
     if((layer<14.5 || layer>17.5) && layer > -3.5) {return false;}
@@ -76,9 +76,10 @@ fn leaf_gap(world:vec3<f32>, normal:vec3<f32>, layer:f32)->bool {
     let facing=dot(v.normal,camera.sun.xyz);
     let diffuse=(max(facing,0.0)+select(0.0,max(-facing,0.0)*0.55,foliage))*camera.sun.w*shadow;
     let day=camera.sky.x;
-    let ambient=mix(vec3(0.025,0.035,0.065),vec3(0.15,0.19,0.25),day);
+    let ambient=mix(vec3(0.0005,0.0008,0.0015),vec3(0.12,0.16,0.21),day);
     let tint=mix(vec3(0.40,0.55,0.85),vec3(0.92,0.84,0.68),day);
-    var light=ambient+tint*diffuse;
+    let sky_access=clamp(v.sky_access,0.0,1.0);
+    var light=(ambient+tint*diffuse)*sky_access;
     for(var i=0;i<16;i=i+1) {
         let l=camera.lights[i];let d=distance(v.world,l.xyz);let falloff=max(1.0-d/9.0,0.0);
         light+=vec3(1.0,0.49,0.16)*falloff*falloff*l.w;
@@ -88,7 +89,7 @@ fn leaf_gap(world:vec3<f32>, normal:vec3<f32>, layer:f32)->bool {
     let color=select(v.color*surface*light,v.color,v.tile.z < -1.5 && v.tile.z > -2.5);
     let fog=smoothstep(112.0,160.0,distance(v.world.xz,camera.eye.xz));
     if(leaf_gap(v.world,v.normal,v.tile.z)) {discard;}
-    return vec4(mix(color,atmosphere(normalize(v.world-camera.eye.xyz)),fog),1.0);
+    return vec4(mix(color,atmosphere(normalize(v.world-camera.eye.xyz))*sky_access,fog),1.0);
 }
 struct ShadowOut {
     @builtin(position) clip:vec4<f32>,

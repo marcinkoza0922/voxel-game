@@ -621,3 +621,22 @@ changes generated terrain in existing saves without changing the save format;
 previous player edits persist. The expedition helper searches the full underground
 range for cave collision fixtures. Regression coverage checks all formation scales,
 surface openings, bedrock, spawn safety and halo/query agreement across three seeds.
+
+## Cave darkness and moonlight
+
+Terrain workers attach a sky exposure value to vertices using the highest opaque
+voxel in each sampled vertical column, including saved edits above the chunk.
+Leaves transmit sky light. Column results are cached per mesh. Edits invalidate
+resident meshes throughout neighboring vertical columns so building or removing
+a roof updates exposure below it. Dynamic world objects use the same calculation.
+Ambient light, celestial light and atmospheric fog are multiplied by exposure;
+sealed caves therefore have no illumination without torches. Torch flames remain
+emissive and torch lighting remains additive. Midnight ambient is near zero and
+moonlight peaks at 2.5% of sunlight, fading toward the horizon.
+Nearby sky openings now contribute indirect light along sixteen horizontal or
+upward rays, blocked by opaque voxels. Light fades quadratically over twelve
+blocks into an entrance, reaching zero in deep caves or sealed rooms. Exposure,
+occupancy and roof queries are cached per mesh; worker snapshots include edits
+within that reach across chunk boundaries. This approximates entrance skylight;
+multiple light bounces and torch occlusion through walls are not simulated.
+Existing shadow maps continue to provide directional surface shadows.

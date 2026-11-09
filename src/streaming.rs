@@ -48,12 +48,13 @@ impl Workers {
                                     }
                                 }
                             }
-                            let mesh = mesh_halo(
+                            let mut mesh = mesh_halo(
                                 job.snapshot.seed,
                                 job.key,
                                 &halo,
                                 &job.snapshot.torch_mounts,
                             );
+                            crate::render::apply_sky_access(&job.snapshot, &mut mesh);
                             if results
                                 .send(Completed {
                                     key: job.key,
