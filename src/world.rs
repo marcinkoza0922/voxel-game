@@ -37,13 +37,14 @@ pub enum Block {
     WhiteFlower,
     PinkFlower,
     BlueFlower,
+    Shrub,
 }
 impl Block {
     pub fn solid(self) -> bool {
         !matches!(self, Self::Air | Self::Torch) && !self.plant()
     }
     pub fn plant(self) -> bool {
-        self == Self::TallGrass || self.flower_index().is_some()
+        matches!(self, Self::TallGrass | Self::Shrub) || self.flower_index().is_some()
     }
     pub fn flower_index(self) -> Option<usize> {
         FLOWERS.iter().position(|b| *b == self)
@@ -53,6 +54,7 @@ impl Block {
     }
     pub fn color(self) -> [f32; 3] {
         match self {
+            Self::Shrub => [0.20, 0.39, 0.13],
             Self::TallGrass => [0.25, 0.45, 0.12],
             Self::RedFlower => FLOWER_COLORS[0],
             Self::YellowFlower => FLOWER_COLORS[1],
@@ -84,6 +86,7 @@ impl Block {
     }
     pub fn name(self) -> &'static str {
         match self {
+            Self::Shrub => "Shrub",
             Self::TallGrass => "Tall grass",
             Self::RedFlower => "Red flower",
             Self::YellowFlower => "Yellow flower",
@@ -135,7 +138,8 @@ pub fn vegetation_hash(seed: u64, support: IVec3) -> u64 {
 }
 pub fn grass_height(h: u64, tuft: u32) -> f32 {
     let bits = h.rotate_right(tuft * 17);
-    0.48 + ((bits >> 16) & 255) as f32 / 950.
+    let stature = 0.16 + ((h >> 56) & 255) as f32 / 255. * 0.79;
+    stature * (0.72 + ((bits >> 16) & 255) as f32 / 255. * 0.28)
 }
 // Small selection bounds let rays pass above low grass or beside flower stems.
 fn plant_hit(seed: u64, p: IVec3, block: Block, origin: Vec3, dir: Vec3, reach: f32) -> bool {
@@ -149,11 +153,10 @@ fn plant_hit(seed: u64, p: IVec3, block: Block, origin: Vec3, dir: Vec3, reach: 
                 0.98,
             ),
         )
+    } else if block == Block::Shrub {
+        (Vec3::new(0.06, 0., 0.06), Vec3::new(0.94, 0.7, 0.94))
     } else {
-        (
-            Vec3::new(0.35, 0., 0.35),
-            Vec3::new(0.65, 0.35 + ((h >> 40) & 255) as f32 / 640. + 0.045, 0.65),
-        )
+        (Vec3::new(0.15, 0., 0.15), Vec3::new(0.85, 0.85, 0.85))
     };
     let mut near = 0_f32;
     let mut far = reach;
@@ -178,6 +181,9 @@ pub fn vegetation_block(seed: u64, support: IVec3) -> Block {
     // Keep flower abundance independent of the much sparser grass objects.
     if !h.is_multiple_of(5) && (h >> 32).is_multiple_of(13) {
         return FLOWERS[((h >> 48) % 6) as usize];
+    }
+    if (h >> 20).is_multiple_of(47) {
+        return Block::Shrub;
     }
     let patch = noise(
         seed ^ 0x74756674,
@@ -1045,6 +1051,30 @@ mod vegetation_tests {
         assert_eq!(w.get(p), Block::Air);
     }
     #[test]
+    fn vegetation_includes_short_tall_grass_and_non_solid_shrubs() {
+        let (mut short, mut tall, mut shrubs) = (0, 0, 0);
+        for x in 0..4096 {
+            let p = IVec3::new(x, 100, 0);
+            match vegetation_block(314159, p) {
+                Block::TallGrass => {
+                    let height = grass_height(vegetation_hash(314159, p), 0);
+                    short += usize::from(height < 0.25);
+                    tall += usize::from(height > 0.8);
+                }
+                Block::Shrub => shrubs += 1,
+                _ => {}
+            }
+        }
+        assert!(short > 0 && tall > 0 && shrubs > 0);
+        assert!(Block::Shrub.plant() && !Block::Shrub.solid());
+        let mut world = World::new(314159);
+        let support = IVec3::new(0, 100, 0);
+        world.set(support, Block::Grass);
+        world.set(support + IVec3::Y, Block::Shrub);
+        world.set(support, Block::Dirt);
+        assert_eq!(world.get(support + IVec3::Y), Block::Air);
+    }
+    #[test]
     fn tall_grass_is_sparse_with_denser_patches() {
         let mut grass = 0;
         let mut total = 0;
@@ -1071,7 +1101,7 @@ mod vegetation_tests {
                 if block == Block::TallGrass {
                     grass += 1;
                     let h = vegetation_hash(314159, p);
-                    assert!((0..3).all(|i| (0.48..0.75).contains(&grass_height(h, i))));
+                    assert!((0..3).all(|i| (0.11..=0.95).contains(&grass_height(h, i))));
                 }
                 total += 1;
             }
@@ -1148,6 +1178,6 @@ mod vegetation_tests {
                 }
             }
         }
-        assert!(grass > 0 && tall == grass && flowers > 0);
+        assert!(grass > 0 && tall > 0 && tall < grass && flowers > 0);
     }
 }

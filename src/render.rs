@@ -1050,7 +1050,10 @@ fn vegetation(out: &mut Vec<Vertex>, seed: u64, support: IVec3, block: Block) {
             let direction = Vec3::new(angle.cos(), 0., angle.sin());
             for blade in 0..3 {
                 let side = glam::Quat::from_rotation_y(blade as f32 * 2.094) * direction;
-                let tip = center + Vec3::Y * height + side * height * 0.3;
+                let tip = (center + Vec3::Y * height + side * height * 0.3).clamp(
+                    origin + Vec3::new(0.02, 0., 0.02),
+                    origin + Vec3::new(0.98, 0.95, 0.98),
+                );
                 let normal = side.cross(Vec3::Y).normalize().to_array();
                 for (point, color) in [
                     (center - side * 0.045, [0.16, 0.30, 0.07]),
@@ -1068,33 +1071,109 @@ fn vegetation(out: &mut Vec<Vertex>, seed: u64, support: IVec3, block: Block) {
         }
         return;
     }
+    let root = origin + Vec3::new(0.5, 0., 0.5);
+    if block == Block::Shrub {
+        // Overlapping asymmetric leaf clusters around short woody branches.
+        for i in 0..7 {
+            let bits = h.rotate_right(i * 9);
+            let angle = i as f32 * 2.4;
+            let radius = if i == 0 {
+                0.
+            } else {
+                0.18 + (bits & 31) as f32 / 300.
+            };
+            let center = root
+                + Vec3::new(
+                    angle.cos() * radius,
+                    0.22 + ((bits >> 8) & 255) as f32 / 1100.,
+                    angle.sin() * radius,
+                );
+            plant_stem(out, root, center, 0.022, [0.32, 0.25, 0.12]);
+            let size = Vec3::new(0.27, 0.24, 0.27) * (0.85 + ((bits >> 24) & 63) as f32 / 180.);
+            box_mesh(
+                out,
+                center - size * 0.5,
+                size,
+                [
+                    0.15 + i as f32 * 0.012,
+                    0.32 + i as f32 * 0.018,
+                    0.09 + i as f32 * 0.008,
+                ],
+            );
+        }
+        return;
+    }
     let Some(flower) = block.flower_index() else {
         return;
     };
     let height = 0.35 + ((h >> 40) & 255) as f32 / 640.;
-    let stem = origin + Vec3::new(0.5, 0., 0.5);
-    box_mesh(
-        out,
-        stem - Vec3::new(0.018, 0., 0.018),
-        Vec3::new(0.036, height, 0.036),
-        [0.17, 0.38, 0.08],
-    );
+    let angle = (h & 255) as f32 * std::f32::consts::TAU / 255.;
+    let lean = Vec3::new(angle.cos(), 0., angle.sin()) * (0.06 + ((h >> 8) & 255) as f32 / 1800.);
+    let middle = root + Vec3::Y * height * 0.5 + lean * 0.25;
+    let head = root + Vec3::Y * height + lean;
+    plant_stem(out, root, middle, 0.024, [0.17, 0.38, 0.08]);
+    plant_stem(out, middle, head, 0.019, [0.22, 0.43, 0.10]);
+    for side in [-1., 1.] {
+        let start = root.lerp(head, 0.3 + (side + 1.) * 0.12);
+        let direction = Vec3::new(angle.sin(), 0.45, -angle.cos()) * side;
+        plant_stem(
+            out,
+            start,
+            start + direction * 0.17,
+            0.045,
+            [0.22, 0.43, 0.10],
+        );
+    }
     let color = crate::world::FLOWER_COLORS[flower];
-    let head = stem + Vec3::Y * height;
-    for offset in [Vec3::X, Vec3::NEG_X, Vec3::Z, Vec3::NEG_Z] {
+    let petals = 4 + ((h >> 28) % 3) as usize;
+    let tilt = glam::Quat::from_rotation_z(lean.x * 2.) * glam::Quat::from_rotation_x(-lean.z * 2.);
+    for i in 0..petals {
+        let bits = h.rotate_right(i as u32 * 7);
+        let theta = angle + i as f32 * std::f32::consts::TAU / petals as f32;
+        let length = 0.085 + (bits & 31) as f32 / 650.;
+        let local = Vec3::new(
+            theta.cos() * length,
+            ((bits >> 8) & 31) as f32 / 950. - 0.025,
+            theta.sin() * length,
+        );
+        let start = out.len();
+        let size = Vec3::new(0.085 + length * 0.25, 0.035, 0.09);
+        let shade = 0.88 + ((bits >> 16) & 31) as f32 / 260.;
         box_mesh(
             out,
-            head + offset * 0.09 - Vec3::splat(0.055),
-            Vec3::new(0.11, 0.065, 0.11),
-            color,
+            local - size * 0.5,
+            size,
+            color.map(|c| (c * shade).min(1.)),
         );
+        for vertex in &mut out[start..] {
+            vertex.pos = (head + tilt * Vec3::from_array(vertex.pos)).to_array();
+            vertex.normal = (tilt * Vec3::from_array(vertex.normal)).to_array();
+        }
     }
     box_mesh(
         out,
-        head - Vec3::splat(0.045),
-        Vec3::splat(0.09),
+        head - Vec3::splat(0.035),
+        Vec3::splat(0.07),
         [1., 0.64, 0.08],
     );
+}
+// Rotate a narrow box between endpoints for curved stems, branches and leaves.
+fn plant_stem(out: &mut Vec<Vertex>, start: Vec3, end: Vec3, width: f32, color: [f32; 3]) {
+    let delta = end - start;
+    let rotation = glam::Quat::from_rotation_arc(Vec3::Y, delta.normalize());
+    let first = out.len();
+    box_mesh(
+        out,
+        Vec3::new(-width * 0.5, 0., -width * 0.5),
+        Vec3::new(width, delta.length(), width),
+        color,
+    );
+    for vertex in &mut out[first..] {
+        let mut position = start + rotation * Vec3::from_array(vertex.pos);
+        position.y = position.y.max(start.y.min(end.y));
+        vertex.pos = position.to_array();
+        vertex.normal = (rotation * Vec3::from_array(vertex.normal)).to_array();
+    }
 }
 // Shared held/placed model. Wall mounts lean away from the supporting face.
 fn torch_model(out: &mut Vec<Vertex>, origin: Vec3, mount: IVec3) {

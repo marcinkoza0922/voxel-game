@@ -61,7 +61,7 @@ pub fn texel(block: Block, face: usize, x: i32, y: i32) -> [f32; 3] {
         )
     };
     let c = match block {
-        TallGrass | RedFlower | YellowFlower | PurpleFlower | WhiteFlower | PinkFlower
+        Shrub | TallGrass | RedFlower | YellowFlower | PurpleFlower | WhiteFlower | PinkFlower
         | BlueFlower => block.color(),
         Air => [0.; 3],
         Grass if face == 1 => {

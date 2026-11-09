@@ -451,14 +451,19 @@ appearance has not been checked in a live GPU window.
 
 ## Ground vegetation and light-transmitting leaves
 
-Natural generation places non-solid tall-grass and six colored flower blocks
+Natural generation places non-solid shrubs, tall-grass and six colored flower blocks
 above grass surfaces, with the same seed/coordinate hash used by their meshes.
 Three tapered blade tufts vary in position, orientation, height and green shading.
-Grass objects are consistently tall (0.48–0.75 blocks), with no short-grass
-objects. A smooth seeded 14-block density field gives 2% placement in open
+Grass stature varies per plant from 0.16 to 0.95 blocks, with individual
+tufts at 72–100% of that height, mixing short growth and nearly block-high blades. A smooth seeded 14-block density field gives 2% placement in open
 regions, 12% in transition areas and 38% inside denser tufts. Flower placement
-keeps its previous independent abundance, with 3D stems, four petals
-and golden centers in red, yellow, purple, white/cream, pink and blue. Snow, sand
+keeps its previous independent abundance. Flowers have bent two-segment stems,
+paired angled leaves, four to six irregular petals, tilted heads and golden
+centers in red, yellow, purple, white/cream, pink and blue. Petal size, rotation,
+height and shade vary deterministically. Shrubs occur at about 2% of remaining
+sites, with seven asymmetric leaf clusters and woody branches. They are
+non-solid, harvest without a drop, and share plant support/removal persistence.
+All vegetation geometry remains inside its own voxel. Snow, sand
 and ruin floors receive no plants. Existing unedited terrain gains these plants.
 
 Plants occupy their own streamed voxels, are selectable with reduced height/width
@@ -486,7 +491,7 @@ voxel faces. The shadow pipeline now has a depth-only fragment stage for the
 mask and renders both sides of grass blades. Existing collision rules remain.
 
 Validation: all 79 quiet nextest tests and short-format Clippy passed. Mesh and
-world regressions cover repeatable shapes, sparse taller grass, natural/halo
+world regressions cover repeatable shapes, sparse varied grass, natural/halo
 agreement, plant selection and support removal. Gameplay checks cover chance
 seed drops, all six flower drops and preserved tool wear. Craft pattern tests
 cover all dye recipes; save checks cover harvested natural plants, placed
