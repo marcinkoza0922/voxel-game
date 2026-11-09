@@ -56,8 +56,8 @@ fn craft(g: &mut Game, output: Item, count: usize) -> Result<(), String> {
         if r.station == crate::items::Station::Furnace {
             for (n, &(item, count)) in r.inputs.iter().enumerate() {
                 if item == Item::Coal
-                    && (g.player.inventory.furnace_joules >= crate::items::SMELT_JOULES
-                        || g.player.inventory.furnace[1].is_some())
+                    && (g.furnace().map_or(0, |f| f.furnace_joules) >= crate::items::SMELT_JOULES
+                        || g.furnace().is_some_and(|f| f.furnace[1].is_some()))
                 {
                     continue;
                 }
@@ -65,7 +65,10 @@ fn craft(g: &mut Game, output: Item, count: usize) -> Result<(), String> {
                     g.player.inventory.take(item, count),
                     "Missing furnace fixture ingredient",
                 )?;
-                g.player.inventory.furnace[n] = Some(crate::items::Stack::new(item, count));
+                g.furnaces
+                    .entry(g.furnace_position().ok_or("No furnace")?)
+                    .or_default()
+                    .furnace[n] = Some(crate::items::Stack::new(item, count));
             }
             for _ in 0..crate::items::SMELT_TICKS {
                 g.tick_furnace();
@@ -240,6 +243,7 @@ pub fn run() -> Result<(), String> {
             serde_json::to_value(&loaded.player).unwrap()
                 == serde_json::to_value(&g.player).unwrap()
                 && loaded.world.edits == g.world.edits
+                && loaded.furnaces == g.furnaces
                 && loaded.torch_life == g.torch_life
                 && loaded.time == g.time,
             "Expedition reload mismatch",

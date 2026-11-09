@@ -112,6 +112,8 @@ pub struct Game {
     pub mining_progress: f32,
     attack_timer: f32,
     spawn_timer: f32,
+    pub furnaces: std::collections::BTreeMap<[i32; 3], items::Furnace>,
+    pub active_furnace: Option<[i32; 3]>,
     pub torch_life: std::collections::BTreeMap<[i32; 3], f32>,
 }
 impl Game {
@@ -132,6 +134,8 @@ impl Game {
             mining_progress: 0.,
             attack_timer: 0.,
             spawn_timer: 4.,
+            furnaces: Default::default(),
+            active_furnace: None,
             torch_life: Default::default(),
         }
     }
@@ -147,19 +151,56 @@ impl Game {
     pub fn stations(&self) -> (bool, bool) {
         let p = Vec3::from_array(self.player.pos).floor().as_ivec3();
         let mut table = false;
-        let mut furnace = false;
         for x in -3..=3 {
             for y in -2..=2 {
                 for z in -3..=3 {
-                    match self.world.get(p + IVec3::new(x, y, z)) {
-                        Block::Table => table = true,
-                        Block::Furnace => furnace = true,
-                        _ => (),
+                    if self.world.get(p + IVec3::new(x, y, z)) == Block::Table {
+                        table = true;
                     }
                 }
             }
         }
-        (table, furnace)
+        (table, self.furnace_position().is_some())
+    }
+    pub fn furnace_position(&self) -> Option<[i32; 3]> {
+        let p = Vec3::from_array(self.player.pos).floor().as_ivec3();
+        let reachable = |q: [i32; 3]| {
+            let d = IVec3::from_array(q) - p;
+            d.x.abs() <= 3
+                && d.y.abs() <= 2
+                && d.z.abs() <= 3
+                && self.world.get(IVec3::from_array(q)) == Block::Furnace
+        };
+        if let Some(q) = self.active_furnace {
+            return reachable(q).then_some(q);
+        }
+        (-3..=3)
+            .flat_map(|x| {
+                (-2..=2)
+                    .flat_map(move |y| (-3..=3).map(move |z| (p + IVec3::new(x, y, z)).to_array()))
+            })
+            .filter(|q| reachable(*q))
+            .min_by_key(|q| ((IVec3::from_array(*q) - p).length_squared(), *q))
+    }
+    pub fn furnace(&self) -> Option<&items::Furnace> {
+        self.furnaces.get(&self.furnace_position()?)
+    }
+    // Reuse inventory transactions with a temporary station state; the player
+    // never retains a copy of a placed furnace's contents.
+    fn furnace_transaction(&mut self, action: impl FnOnce(&mut Inventory)) {
+        if let Some(p) = self.furnace_position() {
+            let state = self.furnaces.entry(p).or_default();
+            std::mem::swap(&mut self.player.inventory.processing, state);
+            action(&mut self.player.inventory);
+            std::mem::swap(&mut self.player.inventory.processing, state);
+        }
+    }
+    pub fn transfer(&mut self, n: usize, right: bool) {
+        if (45..=46).contains(&n) {
+            self.furnace_transaction(|inv| inv.transfer(n, right));
+        } else {
+            self.player.inventory.transfer(n, right);
+        }
     }
     pub fn craft(&mut self, index: usize) {
         let (table, furnace) = self.stations();
@@ -176,9 +217,13 @@ impl Game {
             self.say("Required station is out of reach");
             return;
         }
-        if let Some(index) = items::take_output(&mut self.player.inventory, mode)
-            && mode != 2
-        {
+        if mode == 2 {
+            self.furnace_transaction(|inv| {
+                items::take_output(inv, 2);
+            });
+            return;
+        }
+        if let Some(index) = items::take_output(&mut self.player.inventory, mode) {
             self.reward_craft(index);
         }
     }
@@ -255,6 +300,12 @@ impl Game {
                 }
                 if self.world.set(adjacent, block) {
                     self.player.inventory.take_selected();
+                    if block == Block::Furnace {
+                        self.furnaces.insert(
+                            adjacent.to_array(),
+                            std::mem::take(&mut self.player.inventory.processing),
+                        );
+                    }
                     if block == Block::Torch {
                         self.torch_life.insert(adjacent.to_array(), 600.);
                     }
@@ -291,10 +342,17 @@ impl Game {
         }
     }
     pub fn tick_furnace(&mut self) {
-        if let Some(index) = items::tick_furnace(&mut self.player.inventory) {
+        let mut rewards = Vec::new();
+        for state in self.furnaces.values_mut() {
+            if let Some(index) = items::tick_furnace(state) {
+                rewards.push(index);
+            }
+        }
+        for index in rewards {
             self.reward_craft(index);
         }
     }
+
     pub fn tick(&mut self, input: &Input, dt: f32) {
         self.tick_furnace();
         self.time += dt / 900.;
@@ -489,6 +547,14 @@ impl Game {
         };
         self.mining_progress += dt / seconds;
         if self.mining_progress >= 1. && p.y > crate::world::MIN_Y && p.y <= crate::world::MAX_Y {
+            if b == Block::Furnace
+                && self.furnaces.get(&p.to_array()).is_some_and(|f| {
+                    f.furnace.iter().any(Option::is_some) || f.furnace_output.is_some()
+                })
+            {
+                self.say("Empty the furnace before mining it");
+                return;
+            }
             let drop = match b {
                 Block::Log => Some(Item::Log),
                 Block::Stone | Block::Cobble => Some(Item::Cobble),
@@ -512,6 +578,7 @@ impl Game {
             }
             self.world.set(p, Block::Air);
             self.torch_life.remove(&p.to_array());
+            self.furnaces.remove(&p.to_array());
             self.player.inventory.damage_tool(tool);
             self.mining_progress = 0.;
             self.mining = None;
@@ -729,7 +796,7 @@ mod tests {
         assert_eq!(g.player.inventory.count(Item::CopperIngot), 0);
         g.world.set(IVec3::new(-2, 100, 0), Block::Furnace);
         g.player.inventory.take(Item::Furnace, 1);
-        g.player.inventory.furnace = [
+        g.furnaces.entry([-2, 100, 0]).or_default().furnace = [
             Some(items::Stack::new(Item::CopperOre, 3)),
             Some(items::Stack::new(Item::Coal, 1)),
         ];
@@ -767,5 +834,130 @@ mod tests {
         g.allocate(3);
         g.allocate(4);
         assert_eq!(g.player.points, 2);
+    }
+}
+
+#[cfg(test)]
+mod placed_furnace_tests {
+    use super::*;
+    use items::{Furnace, SMELT_TICKS, Stack};
+
+    #[test]
+    fn independent_furnaces_process_away_from_player_and_route_transactions() {
+        let mut g = Game::new(9);
+        g.player.pos = [0.5, 100., 0.5];
+        let a = [-1, 100, 0];
+        let b = [1, 100, 0];
+        for (p, input) in [(a, Item::CopperOre), (b, Item::Meat)] {
+            g.world.set(IVec3::from_array(p), Block::Furnace);
+            g.active_furnace = Some(p);
+            g.player.inventory.cursor = Some(Stack::new(input, 2));
+            g.transfer(45, false);
+            g.player.inventory.cursor = Some(Stack::new(Item::Coal, 1));
+            g.transfer(46, false);
+        }
+        assert_eq!(g.player.inventory.processing, Furnace::default());
+        g.furnaces.get_mut(&a).unwrap().furnace_output = Some(Stack::new(Item::CopperIngot, 64));
+        g.player.pos = [1000., 100., 1000.];
+        for _ in 0..SMELT_TICKS {
+            g.tick_furnace();
+        }
+        assert_eq!(g.furnaces[&a].furnace_progress, 0);
+        assert_eq!(g.furnaces[&a].furnace[1].unwrap().count, 1);
+        assert_eq!(
+            g.furnaces[&b].furnace_output,
+            Some(Stack::new(Item::CookedMeat, 1))
+        );
+        assert_eq!(g.player.crafts[10], 0);
+        assert_eq!(g.player.crafts[11], 1);
+        // A stale station must not silently redirect an interaction elsewhere.
+        g.player.inventory.cursor = Some(Stack::new(Item::Coal, 2));
+        g.transfer(46, false);
+        assert_eq!(g.player.inventory.cursor.unwrap().count, 2);
+        g.player.inventory.cursor = None;
+        g.player.pos = [0.5, 100., 0.5];
+        g.active_furnace = Some(a);
+        g.craft_grid(2);
+        assert_eq!(
+            g.player.inventory.cursor.take(),
+            Some(Stack::new(Item::CopperIngot, 64))
+        );
+        assert!(g.furnaces[&a].furnace_output.is_none());
+        g.active_furnace = Some(b);
+        g.craft_grid(2);
+        assert_eq!(
+            g.player.inventory.cursor.take(),
+            Some(Stack::new(Item::CookedMeat, 1))
+        );
+        assert_eq!(g.player.crafts[11], 1); // Collection awards no extra XP.
+        for _ in 0..SMELT_TICKS {
+            g.tick_furnace();
+        }
+        assert_eq!(
+            g.furnaces[&a].furnace_output,
+            Some(Stack::new(Item::CopperIngot, 1))
+        );
+        assert_eq!(
+            g.furnaces[&b].furnace_output,
+            Some(Stack::new(Item::CookedMeat, 1))
+        );
+    }
+
+    #[test]
+    fn mining_requires_empty_slots_and_discards_heat_without_duplicating_items() {
+        let mut g = Game::new(9);
+        g.player.pos = [0.5, 100., 0.5];
+        g.player.inventory.equip(Item::WoodPick, 0);
+        g.player.inventory.selected = 0;
+        let p = IVec3::new(0, 101, -2);
+        g.world.set(p, Block::Furnace);
+        g.target = Some((p, p + IVec3::Z));
+        for slot in 0..3 {
+            let f = g.furnaces.entry(p.to_array()).or_default();
+            *f = Furnace::default();
+            if slot < 2 {
+                f.furnace[slot] = Some(Stack::new(Item::Coal, 1));
+            } else {
+                f.furnace_output = Some(Stack::new(Item::CopperIngot, 1));
+            }
+            g.attack(10.);
+            assert_eq!(g.world.get(p), Block::Furnace);
+            assert_eq!(g.player.inventory.count(Item::Furnace), 0);
+        }
+        let f = g.furnaces.get_mut(&p.to_array()).unwrap();
+        *f = Furnace::default();
+        f.furnace_joules = 3000;
+        g.attack(10.);
+        assert_eq!(g.world.get(p), Block::Air);
+        assert!(!g.furnaces.contains_key(&p.to_array()));
+        assert_eq!(g.player.inventory.count(Item::Furnace), 1);
+    }
+
+    #[test]
+    fn legacy_contents_attach_once_when_placing_a_furnace() {
+        let mut g = Game::new(9);
+        g.player.pos = [0.5, 100., 0.5];
+        for y in 100..=102 {
+            for z in -3..=0 {
+                g.world.set(IVec3::new(0, y, z), Block::Air);
+            }
+        }
+        let support = IVec3::new(0, 101, -3);
+        g.world.set(support, Block::Stone);
+        g.player.yaw = 0.;
+        g.player.pitch = 0.;
+        g.player.inventory.add(Item::Furnace, 2);
+        g.player.inventory.equip(Item::Furnace, 0);
+        g.player.inventory.selected = 0;
+        g.player.inventory.processing.furnace[0] = Some(Stack::new(Item::CopperOre, 3));
+        g.player.inventory.processing.furnace_joules = 1234;
+        let legacy = g.player.inventory.processing.clone();
+        g.use_selected();
+        let p = [0, 101, -2];
+        assert_eq!(g.world.get(IVec3::from_array(p)), Block::Furnace);
+        assert_eq!(g.furnaces[&p], legacy);
+        assert_eq!(g.player.inventory.processing, Furnace::default());
+        g.use_selected();
+        assert_eq!(g.furnaces[&[0, 101, -1]], Furnace::default());
     }
 }

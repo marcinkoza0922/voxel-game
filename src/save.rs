@@ -14,13 +14,15 @@ struct Save {
     time: f32,
     edits: Vec<Edit>,
     torches: Vec<([i32; 3], f32)>,
+    #[serde(default)]
+    furnaces: Vec<([i32; 3], crate::items::Furnace)>,
 }
 pub fn write(game: &Game, path: &Path) -> Result<(), String> {
     if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
         fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     }
     let save = Save {
-        version: 2,
+        version: 3,
         seed: game.world.seed,
         player: game.player.clone(),
         time: game.time,
@@ -34,6 +36,7 @@ pub fn write(game: &Game, path: &Path) -> Result<(), String> {
             })
             .collect(),
         torches: game.torch_life.iter().map(|(p, t)| (*p, *t)).collect(),
+        furnaces: game.furnaces.iter().map(|(p, f)| (*p, f.clone())).collect(),
     };
     let data = serde_json::to_vec(&save).map_err(|e| e.to_string())?;
     let temp = path.with_extension("json.tmp");
@@ -87,7 +90,7 @@ pub fn read(path: &Path) -> Result<Option<Game>, String> {
             value["player"]["inventory"] = serde_json::to_value(inv).map_err(|e| e.to_string())?;
             value["version"] = 2.into();
         }
-        Some(2) => (),
+        Some(2 | 3) => (),
         _ => return Err(format!("Unsupported save version {}", value["version"])),
     }
     let save: Save = serde_json::from_value(value).map_err(|e| format!("Invalid save: {e}"))?;
@@ -137,6 +140,35 @@ pub fn read(path: &Path) -> Result<Option<Game>, String> {
     g.player = save.player;
     g.time = save.time;
     g.world.edits = save.edits.into_iter().map(|e| (e.pos, e.block)).collect();
+    if save.version < 3 && !save.furnaces.is_empty() {
+        return Err("Legacy save contains unsupported placed furnace state".into());
+    }
+    for (pos, state) in save.furnaces {
+        if !state.valid()
+            || g.world.edits.get(&pos) != Some(&crate::world::Block::Furnace)
+            || g.furnaces.insert(pos, state).is_some()
+        {
+            return Err("Invalid or duplicate placed furnace state".into());
+        }
+    }
+    if save.version < 3 {
+        let p = glam::Vec3::from_array(g.player.pos);
+        let nearest = g
+            .world
+            .edits
+            .iter()
+            .filter(|(_, b)| **b == crate::world::Block::Furnace)
+            .map(|(q, _)| *q)
+            .min_by(|a, b| {
+                let dist =
+                    |q: &[i32; 3]| glam::Vec3::from_array(q.map(|n| n as f32)).distance_squared(p);
+                dist(a).total_cmp(&dist(b)).then_with(|| a.cmp(b))
+            });
+        if let Some(pos) = nearest {
+            g.furnaces
+                .insert(pos, std::mem::take(&mut g.player.inventory.processing));
+        }
+    }
     g.torch_life = save.torches.into_iter().collect::<BTreeMap<_, _>>();
     if g.torch_life
         .keys()
@@ -163,6 +195,7 @@ mod tests {
         assert_eq!(restored.world.seed, 89);
         assert_eq!(restored.world.edits, g.world.edits);
         assert_eq!(restored.player.inventory, g.player.inventory);
+        assert_eq!(restored.furnaces, g.furnaces);
         let mut data: serde_json::Value =
             serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
         data["version"] = 99.into();
@@ -231,21 +264,26 @@ mod inventory_migration_tests {
         g.player.inventory.cursor = Some(Stack::new(Item::Planks, 3));
         g.player.inventory.grid[8] = Some(Stack::new(Item::Stick, 4));
         g.player.inventory.hand[3] = Some(Stack::new(Item::Coal, 2));
-        g.player.inventory.furnace[0] = Some(Stack::new(Item::CopperOre, 5));
-        g.player.inventory.furnace_joules = 3_000;
+        let pos = [2, 100, 2];
+        g.world
+            .set(glam::IVec3::from_array(pos), crate::world::Block::Furnace);
+        let f = g.furnaces.entry(pos).or_default();
+        f.furnace[0] = Some(Stack::new(Item::CopperOre, 5));
+        f.furnace_joules = 3_000;
         for _ in 0..crate::items::SMELT_TICKS / 2 {
             g.tick_furnace();
         }
-        g.player.inventory.furnace_output = Some(Stack::new(Item::CopperIngot, 2));
+        g.furnaces.get_mut(&pos).unwrap().furnace_output = Some(Stack::new(Item::CopperIngot, 2));
         write(&g, &path).unwrap();
         let restored = read(&path).unwrap().unwrap();
         assert_eq!(restored.player.inventory, g.player.inventory);
+        assert_eq!(restored.furnaces, g.furnaces);
         let mut resumed = restored;
         for _ in 0..crate::items::SMELT_TICKS / 2 {
             resumed.tick_furnace();
         }
-        assert_eq!(resumed.player.inventory.furnace_output.unwrap().count, 3);
-        assert_eq!(resumed.player.inventory.furnace_joules, 2_000);
+        assert_eq!(resumed.furnaces[&pos].furnace_output.unwrap().count, 3);
+        assert_eq!(resumed.furnaces[&pos].furnace_joules, 2_000);
         let mut legacy: serde_json::Value =
             serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
         for field in [
@@ -266,19 +304,131 @@ mod inventory_migration_tests {
                 .unwrap()
                 .player
                 .inventory
+                .processing
                 .furnace_joules,
             0
         );
         let legacy_inventory = read(&path).unwrap().unwrap().player.inventory;
-        assert_eq!(legacy_inventory.furnace_progress, 0);
-        assert_eq!(legacy_inventory.furnace_output, None);
-        g.player.inventory.furnace_joules = crate::items::COAL_JOULES + 1;
+        assert_eq!(legacy_inventory.processing.furnace_progress, 0);
+        assert_eq!(legacy_inventory.processing.furnace_output, None);
+        g.player.inventory.processing.furnace_joules = crate::items::COAL_JOULES + 1;
         write(&g, &path).unwrap();
         assert!(read(&path).is_err());
-        g.player.inventory.furnace_joules = 3_000;
+        g.player.inventory.processing.furnace_joules = 3_000;
         g.player.inventory.cursor.as_mut().unwrap().count = 65;
         write(&g, &path).unwrap();
         assert!(read(&path).is_err());
+        fs::remove_file(path).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod placed_furnace_save_tests {
+    use super::*;
+    use crate::{
+        items::{Furnace, Item, SMELT_TICKS, Stack},
+        world::Block,
+    };
+    use glam::IVec3;
+
+    #[test]
+    fn multiple_partial_furnaces_resume_and_invalid_states_are_rejected() {
+        let path =
+            std::env::temp_dir().join(format!("voxel-placed-furnaces-{}.json", std::process::id()));
+        let mut g = Game::new(9);
+        for (pos, input) in [([-2, 100, 0], Item::CopperOre), ([2, 100, 0], Item::Meat)] {
+            g.world.set(IVec3::from_array(pos), Block::Furnace);
+            let mut f = Furnace::default();
+            f.furnace = [Some(Stack::new(input, 2)), Some(Stack::new(Item::Coal, 1))];
+            g.furnaces.insert(pos, f);
+        }
+        for _ in 0..SMELT_TICKS / 2 {
+            g.tick_furnace();
+        }
+        write(&g, &path).unwrap();
+        let good = fs::read(&path).unwrap();
+        let mut restored = read(&path).unwrap().unwrap();
+        assert_eq!(restored.furnaces, g.furnaces);
+        for _ in 0..SMELT_TICKS / 2 {
+            restored.tick_furnace();
+        }
+        for (pos, output) in [
+            ([-2, 100, 0], Item::CopperIngot),
+            ([2, 100, 0], Item::CookedMeat),
+        ] {
+            assert_eq!(
+                restored.furnaces[&pos].furnace_output,
+                Some(Stack::new(output, 1))
+            );
+            assert_eq!(restored.furnaces[&pos].furnace_joules, 3000);
+        }
+        let original: serde_json::Value = serde_json::from_slice(&good).unwrap();
+        for (field, invalid) in [("furnace_joules", 4001), ("furnace_progress", SMELT_TICKS)] {
+            let mut bad = original.clone();
+            bad["furnaces"][0][1][field] = invalid.into();
+            fs::write(&path, serde_json::to_vec(&bad).unwrap()).unwrap();
+            assert!(read(&path).is_err());
+        }
+        let mut bad = original.clone();
+        bad["furnaces"][0][1]["furnace"][0]["count"] = 65.into();
+        fs::write(&path, serde_json::to_vec(&bad).unwrap()).unwrap();
+        assert!(read(&path).is_err());
+        let mut bad = original.clone();
+        let duplicate = bad["furnaces"][0].clone();
+        bad["furnaces"].as_array_mut().unwrap().push(duplicate);
+        fs::write(&path, serde_json::to_vec(&bad).unwrap()).unwrap();
+        assert!(read(&path).is_err());
+        let mut bad = original;
+        bad["furnaces"][0][0] = serde_json::json!([50, 100, 50]);
+        fs::write(&path, serde_json::to_vec(&bad).unwrap()).unwrap();
+        assert!(read(&path).is_err());
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn v2_shared_contents_migrate_once_to_nearest_or_survive_without_a_station() {
+        let path = std::env::temp_dir().join(format!(
+            "voxel-furnace-migration-{}.json",
+            std::process::id()
+        ));
+        let mut g = Game::new(9);
+        g.player.pos = [0.5, 100., 0.5];
+        g.player.inventory.processing.furnace = [
+            Some(Stack::new(Item::CopperOre, 3)),
+            Some(Stack::new(Item::Coal, 2)),
+        ];
+        g.player.inventory.processing.furnace_joules = 2500;
+        for _ in 0..100 {
+            crate::items::tick_furnace(&mut g.player.inventory.processing);
+        }
+        let legacy = g.player.inventory.processing.clone();
+        // With no placed station, retain all old contents across new saves.
+        write(&g, &path).unwrap();
+        let mut v: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        v["version"] = 2.into();
+        v.as_object_mut().unwrap().remove("furnaces");
+        fs::write(&path, serde_json::to_vec(&v).unwrap()).unwrap();
+        let retained = read(&path).unwrap().unwrap();
+        assert_eq!(retained.player.inventory.processing, legacy);
+        write(&retained, &path).unwrap();
+        assert_eq!(
+            read(&path).unwrap().unwrap().player.inventory.processing,
+            legacy
+        );
+        for p in [[-20, 100, 0], [1, 100, 0]] {
+            g.world.set(IVec3::from_array(p), Block::Furnace);
+        }
+        write(&g, &path).unwrap();
+        let mut v: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        v["version"] = 2.into();
+        v.as_object_mut().unwrap().remove("furnaces");
+        fs::write(&path, serde_json::to_vec(&v).unwrap()).unwrap();
+        let migrated = read(&path).unwrap().unwrap();
+        assert_eq!(migrated.furnaces[&[1, 100, 0]], legacy);
+        assert_eq!(migrated.furnaces.len(), 1);
+        assert_eq!(migrated.player.inventory.processing, Furnace::default());
+        write(&migrated, &path).unwrap();
+        assert_eq!(read(&path).unwrap().unwrap().furnaces, migrated.furnaces);
         fs::remove_file(path).unwrap();
     }
 }

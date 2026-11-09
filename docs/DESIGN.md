@@ -38,7 +38,7 @@ The owned GUI is an immediate-mode triangle builder with rectangle buttons, poin
 
 Vigor adds 3 health per point; Strength adds 2.5% melee damage; Dexterity reduces the attack interval through a 1.5%-per-point speed multiplier; Agility modestly improves walking/jumping and reduces falls. Ingenuity grants one bonus output every `24 - points` crafts (only when allocated). All stats cap at 20. Wisdom and Willpower remain visible but cannot consume points before magic is implemented. First recipe XP is quartered per repeat to zero. First biome/resource discoveries grant XP once. Kill XP falls with player level and reaches zero for sufficiently weak enemies. Death restores the player at spawn and retains inventory. Temperature and magic are deferred.
 
-Saves use a synced temporary file followed by atomic rename. Unsupported versions, malformed JSON, invalid positions, inventory selection/count/wear, stat bounds and torch timer inconsistencies are rejected. Load failures preserve existing files. A failed save keeps the quit action from closing the window. Save format v2 requires the current recipe count. Version 1 aggregate inventories migrate to real stacks on load; changed recipe registries will still require explicit migration. Concurrent writers to the same save are not supported.
+Saves use a synced temporary file followed by atomic rename. Unsupported versions, malformed JSON, invalid positions, inventory selection/count/wear, stat bounds and torch timer inconsistencies are rejected. Load failures preserve existing files. A failed save keeps the quit action from closing the window. Save format v3 requires the current recipe count and stores placed furnace states; v1/v2 saves migrate on load. Version 1 aggregate inventories migrate to real stacks on load; changed recipe registries will still require explicit migration. Concurrent writers to the same save are not supported.
 
 ## Developer tools and validation results
 
@@ -136,10 +136,12 @@ shows a loaded-fuel/remaining-energy bar, a smelting progress bar, and completed
 output. Escape menus and lost focus pause furnace processing too; opening the
 pack allows furnace-only fixed steps while the rest of gameplay remains paused.
 
-Input, fuel, output, energy, progress and tracked input type belong to the player,
-shared across furnace screens, rather than each placed furnace. Per-world-block
-furnace inventories remain future work. All processing state persists in saves;
-old v2 saves default the new fields to empty/zero. Stored energy is validated in
+Input, fuel, output, energy, progress and tracked input type belong to each placed
+furnace, keyed by block coordinates in `Game::furnaces`. Every stored furnace
+advances on each active fixed step, including outside resident terrain; there is
+no offline elapsed-time catch-up. The same stepping runs with the pack open.
+All processing state persists in v3 saves; old v2 fields default to empty/zero
+before migration. Stored energy is validated in
 0..=4,000 and progress below 300 ticks. Direct instant furnace crafting is disabled
 so it cannot bypass processing; the expedition advances the same furnace steps
 as gameplay. Craft XP is awarded once on completion, not on output collection.
@@ -167,3 +169,39 @@ smelting time, four ingots per coal, blocked-output pause and collection atomici
 idle energy retention, input-type changes, cooking, saved progress/output/energy,
 old v2 defaults, and invalid energy. The updated furnace UI has not been checked
 in a native window for this change.
+
+
+## Placed furnace persistence
+
+Each placed furnace owns a typed `items::Furnace` state. Right-clicking a furnace
+selects that exact block for the screen, slot transfers and output collection.
+The pack's furnace tab uses the nearest station within the existing station
+volume (three blocks horizontally, two vertically), with coordinate tie-breaking.
+E resets explicit selection. An explicit station that becomes unreachable never
+redirects transactions to another furnace. Crafting grids and the carried stack
+remain player-owned. Inventory transactions temporarily exchange only furnace
+state with the selected block, then restore it; no active copy remains on the
+player. Completed smelts award crafting XP once, independently for every furnace.
+
+Mining refuses a furnace containing any input, fuel or output, leaving the block,
+items and tool wear intact. Empty furnaces can be mined; their saved state is
+removed and remaining energy/progress is discarded. Replacing one starts empty.
+
+Save v3 serializes a coordinate/state list, rejecting duplicate coordinates,
+states without a placed furnace edit, invalid stacks, energy or progress. Existing
+v1 inventory migration still runs. V1/v2 shared processing state moves once to
+the placed furnace nearest the saved player position, with coordinate tie-breaking.
+If none exists, the legacy flattened inventory fields preserve the state without
+processing it; the next successful furnace placement transfers it once. V3 reloads
+never repeat migration. Existing inventory, tools, terrain edits and progression
+are retained. No user save is rewritten until the normal save action runs.
+
+Validation: formatting, short Clippy with warnings denied, quiet nextest, gameplay
+smoke and expedition passed. New regressions exercise independent ore/meat furnaces,
+blocked-output isolation, processing far from the player, station-specific input
+and output transactions, single XP awards, safe mining, saved partial progress
+and energy for multiple furnaces, invalid/duplicate states, migration with and
+without placed stations, and one-time legacy recovery on placement. The expedition
+also compares all furnace states after reload. README now describes five-second
+smelting and station ownership. Native mouse interaction has not been manually
+playtested for this change.

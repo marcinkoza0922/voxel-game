@@ -26,15 +26,17 @@ The first release build takes a while. `cargo run` also works for development. B
 | F5 | Save |
 | Esc | Pause menu; save and quit |
 
-Losing window focus pauses the game. The pack also pauses simulation. Autosave runs every 30 seconds of gameplay; closing the window saves too.
+Losing window focus pauses the game. The pack pauses movement and survival while furnaces continue processing. Autosave runs every 30 seconds of gameplay; closing the window saves too.
 
 ## First expedition
 
 You start with a wooden axe, a wooden pickaxe, and berries. Chop logs with the axe. Open the pack and turn logs into planks, then craft a table. Drag it into your hotbar and place it against a nearby block. Right-click the table to open its 3x3 grid. Stations work within three blocks.
 
-The pack has 27 backpack slots, nine hotbar slots, and a 2x2 personal crafting grid. Arrange ingredients to match the recipe guide; taking the output consumes them. Materials stack to 64, and tools have individual durability. Grid, furnace, and carried items remain stored when you close the pack and are saved with the player.
+The pack has 27 backpack slots, nine hotbar slots, and a 2x2 personal crafting grid. Arrange ingredients to match the recipe guide; taking the output consumes them. Materials stack to 64, and tools have individual durability. Crafting grids and carried items are saved with the player. Each placed furnace stores its own input, fuel, output, heat, and processing progress.
 
-Mine through the dirt to granite with the pickaxe. Make sticks and stone tools at the table. Stone pickaxes can harvest copper ore. Craft a furnace from eight cobblestone at the table, place it, and use coal plus copper ore to smelt ingots. Make copper tools and a sword at the table. In the furnace tab, put ore or raw meat in INPUT and coal in FUEL, then take the output. Processing is instant in this slice.
+Mine through the dirt to granite with the pickaxe. Make sticks and stone tools at the table. Stone pickaxes can harvest copper ore. Craft a furnace from eight cobblestone at the table, place it, and use coal plus copper ore to smelt ingots. Make copper tools and a sword at the table. In the furnace tab, put ore or raw meat in INPUT and coal in FUEL, then take the output. Each item takes five seconds to smelt; one coal fuels four items. Furnaces continue working while you explore, including outside loaded terrain, and resume from saved progress after loading. Empty all item slots before mining a furnace; breaking it discards any remaining heat.
+
+Existing saves migrate automatically and retain your inventory and tools. Old shared furnace contents move to the placed furnace nearest your saved position. If none remains, those contents are preserved for the next furnace you place.
 
 Leaves yield berries; eat them with right mouse while selected. Husks pursue and attack, and drop meat that can be cooked in the furnace. Bedrolls restore rest and advance to dawn; nearby enemies prevent sleep. Torches provide warm light while held or placed; placed torches burn out after ten minutes of active gameplay. Death returns you to spawn with your inventory.
 

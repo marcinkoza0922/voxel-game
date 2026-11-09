@@ -190,7 +190,7 @@ impl App {
                     self.drag_origin = Some(usize::MAX);
                 }
             }
-            ui::Action::Slot(n) => self.game.player.inventory.transfer(n, false),
+            ui::Action::Slot(n) => self.game.transfer(n, false),
             ui::Action::Tab(mode) => {
                 let (table, furnace) = self.game.stations();
                 if ((mode == 0) || (mode == 1 && table) || (mode == 2 && furnace))
@@ -296,6 +296,7 @@ impl ApplicationHandler for App {
                             KeyCode::KeyE => {
                                 if !self.paused {
                                     self.pack = !self.pack;
+                                    self.game.active_furnace = None;
                                     if self.pack
                                         && let Some(r) = &mut self.renderer
                                     {
@@ -344,7 +345,7 @@ impl ApplicationHandler for App {
                             .and_then(|r| r.ui.click(self.cursor.0, self.cursor.1))
                         && n != origin
                     {
-                        self.game.player.inventory.transfer(n, false);
+                        self.game.transfer(n, false);
                     }
 
                     if state == ElementState::Pressed
@@ -362,10 +363,7 @@ impl ApplicationHandler for App {
                             } else {
                                 None
                             };
-                            self.game
-                                .player
-                                .inventory
-                                .transfer(n, button == MouseButton::Right);
+                            self.game.transfer(n, button == MouseButton::Right);
                         } else {
                             self.action(a, event_loop);
                         }
@@ -384,6 +382,10 @@ impl ApplicationHandler for App {
                                         _ => None,
                                     });
                             if let Some(mode) = station {
+                                if mode == 2 {
+                                    self.game.active_furnace =
+                                        self.game.target.map(|(p, _)| p.to_array());
+                                }
                                 self.pack = true;
                                 if let Some(r) = &mut self.renderer {
                                     r.ui.mode = mode;

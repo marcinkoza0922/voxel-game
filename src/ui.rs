@@ -396,6 +396,8 @@ impl Ui {
         let x = (self.width - 1000.) / 2.;
         let y = (self.height - 650.) / 2.;
         let inv = &g.player.inventory;
+        let empty_furnace = crate::items::Furnace::default();
+        let furnace_state = g.furnace().unwrap_or(&empty_furnace);
         self.rect(0., 0., self.width, self.height, [0.015, 0.025, 0.035, 0.82]);
         self.rect(x, y, 1000., 650., PANEL);
         self.text(x + 24., y + 22., "FIELD PACK", 2.5, INK);
@@ -483,13 +485,13 @@ impl Ui {
             self.text(x + 24., y + 224., "FUEL", 1.2, MUTED);
             self.stack_slot(
                 [x + 87., y + 136., 48., 48.],
-                inv.furnace[0],
+                furnace_state.furnace[0],
                 Some(Action::Slot(45)),
                 false,
             );
             self.stack_slot(
                 [x + 87., y + 220., 48., 48.],
-                inv.furnace[1],
+                furnace_state.furnace[1],
                 Some(Action::Slot(46)),
                 false,
             );
@@ -497,13 +499,13 @@ impl Ui {
             self.rect(
                 x + 150.,
                 y + 193.,
-                65. * inv.furnace_progress as f32 / crate::items::SMELT_TICKS as f32,
+                65. * furnace_state.furnace_progress as f32 / crate::items::SMELT_TICKS as f32,
                 12.,
                 [0.95, 0.65, 0.2, 1.],
             );
             self.rect(x + 87., y + 279., 80., 8., MUTED);
-            let energy = inv.furnace_joules as f32 / crate::items::COAL_JOULES as f32;
-            let loaded = inv.furnace[1].is_some_and(|s| s.item == Item::Coal);
+            let energy = furnace_state.furnace_joules as f32 / crate::items::COAL_JOULES as f32;
+            let loaded = furnace_state.furnace[1].is_some_and(|s| s.item == Item::Coal);
             self.rect(
                 x + 87.,
                 y + 279.,
@@ -522,12 +524,12 @@ impl Ui {
                 y + 215.,
                 &format!(
                     "{}%",
-                    inv.furnace_progress * 100 / crate::items::SMELT_TICKS
+                    furnace_state.furnace_progress * 100 / crate::items::SMELT_TICKS
                 ),
                 1.0,
                 MUTED,
             );
-            let output = inv.furnace_output;
+            let output = furnace_state.furnace_output;
             self.stack_slot(
                 [x + 230., y + 179., 56., 56.],
                 output,
@@ -541,7 +543,7 @@ impl Ui {
                 y + 233.,
                 &format!(
                     "Energy: {}%",
-                    inv.furnace_joules * 100 / crate::items::COAL_JOULES
+                    furnace_state.furnace_joules * 100 / crate::items::COAL_JOULES
                 ),
                 1.2,
                 MUTED,
@@ -614,7 +616,11 @@ impl Ui {
             self.icon(px - 16., py - 16., stack.item, 2.);
             self.text(px + 14., py + 12., &stack.count.to_string(), 1.4, INK);
         } else if let Some(Action::Slot(n)) = self.click(self.pointer.0, self.pointer.1)
-            && let Some(stack) = inv.slot(n)
+            && let Some(stack) = if (45..=46).contains(&n) {
+                furnace_state.furnace[n - 45]
+            } else {
+                inv.slot(n)
+            }
         {
             let label = stack.item.name();
             let tx = px.min(self.width - 180.);
