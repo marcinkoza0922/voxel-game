@@ -600,3 +600,24 @@ run completed, wrote a 1280×800 PPM with verified header/pixel count and varied
 color data, flushed CSV timings, and saved the world. All 81 quiet nextest tests,
 short-format Clippy, formatting, and gameplay/persistence smoke passed. Software
 Vulkan and interactive presentation were not separately exercised for this change.
+
+## Cave formations
+
+Caves now use seed-hashed 160-block cells with three shapes: low winding
+passages, tall narrow crevices, and chasms up to roughly 44 blocks wide and
+48 blocks high. Elliptical ends and sinusoidal lateral bends shape each formation.
+Their floors lie about 48 blocks below the cell's terrain anchor. Roughly a
+third of candidates also carve a six-block-high descending entrance corridor;
+entrances are omitted where the endpoint differs from the anchor by more than
+12 blocks, keeping ramp steps at most one block. Openings cut through the surface
+soil and vegetation, and trees cannot root over a carved opening. The inner
+32-block spawn region, bottom four world layers, and authored ruin foundations
+remain protected. Formations are local features; they do not guarantee a connected
+worldwide cave network or introduce underground biomes.
+
+Cave intervals are computed once per column in chunk halos, using the same rules
+as direct terrain queries. Block edits still override generation. This intentionally
+changes generated terrain in existing saves without changing the save format;
+previous player edits persist. The expedition helper searches the full underground
+range for cave collision fixtures. Regression coverage checks all formation scales,
+surface openings, bedrock, spawn safety and halo/query agreement across three seeds.

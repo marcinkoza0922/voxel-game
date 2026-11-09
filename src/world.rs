@@ -355,11 +355,75 @@ impl World {
                     19
                 };
                 if h.is_multiple_of(chance) && (x - cx).abs() <= 2 && (z - cz).abs() <= 2 {
-                    return Some((cx, self.height(cx, cz), cz));
+                    let height = self.height(cx, cz);
+                    if !self
+                        .cave_column(cx, cz)
+                        .is_some_and(|(lo, hi)| (lo..=hi).contains(&height))
+                    {
+                        return Some((cx, height, cz));
+                    }
                 }
             }
         }
         None
+    }
+    /// A column's cave interval, shared by direct queries and chunk generation.
+    /// Features fit inside 160-block cells, including their entrance ramps.
+    fn cave_column(&self, x: i32, z: i32) -> Option<(i32, i32)> {
+        if (x as f64).hypot(z as f64) < 32. {
+            return None;
+        }
+        let cell_x = x.div_euclid(160);
+        let cell_z = z.div_euclid(160);
+        let h = hash(self.seed ^ 0xca7e_2026, cell_x, 0, cell_z);
+        let cx = cell_x * 160 + 72 + (h % 17) as i32;
+        let cz = cell_z * 160 + 72 + ((h >> 8) % 17) as i32;
+        let (along, across) = if h & 0x10000 == 0 {
+            (x - cx, z - cz)
+        } else {
+            (z - cz, x - cx)
+        };
+        if !(-56..=66).contains(&along) || across.abs() > 24 {
+            return None;
+        }
+        let (width, ceiling) = match (h >> 20) % 3 {
+            0 => (3., 6.),   // Low, winding passages.
+            1 => (2.5, 24.), // Tall, narrow crevices.
+            _ => (22., 44.), // Vast underground chasms.
+        };
+        let bend = (along as f32 * 0.065 + (h % 31) as f32).sin() * 2.;
+        let lateral = across as f32 - bend;
+        let shape = ((along as f32 + 12.) / 44.).powi(2) + (lateral / width).powi(2);
+        let base = self.height(cx, cz) - 48;
+        let mut interval = if shape < 1. {
+            let radius = (1. - shape).sqrt();
+            Some((
+                base - (radius * 4.) as i32,
+                base + (radius * ceiling) as i32,
+            ))
+        } else {
+            None
+        };
+        // About one in three formations has a walkable descending entrance.
+        // End above the local surface so grass/dirt cannot seal the opening.
+        if (h >> 28).is_multiple_of(3) && (0..=66).contains(&along) && lateral.abs() < 3.5 {
+            let (ex, ez) = if h & 0x10000 == 0 {
+                (cx + 60, cz)
+            } else {
+                (cx, cz + 60)
+            };
+            let exit = self.height(ex, ez);
+            if (exit - (base + 48)).abs() > 12 {
+                return interval;
+            }
+            let floor = base + (((exit - base - 2) as f32 * along as f32 / 60.).floor() as i32);
+            let ramp = (floor + 1, floor + 6);
+            interval = Some(match interval {
+                Some((lo, hi)) => (lo.min(ramp.0), hi.max(ramp.1)),
+                None => ramp,
+            });
+        }
+        interval
     }
     fn natural_column(
         &self,
@@ -367,6 +431,7 @@ impl World {
         height: i32,
         tree: Option<(i32, i32, i32)>,
         ruin: Option<IVec3>,
+        cave: Option<(i32, i32)>,
     ) -> Block {
         if !(MIN_Y..=MAX_Y).contains(&p.y) {
             return if p.y < MIN_Y {
@@ -401,6 +466,9 @@ impl World {
                 return Block::Air;
             }
         }
+        if p.y > MIN_Y + 3 && cave.is_some_and(|(lo, hi)| (lo..=hi).contains(&p.y)) {
+            return Block::Air;
+        }
         if p.y > height {
             if let Some((tx, ty, tz)) = tree {
                 if p.x == tx && p.z == tz && p.y <= ty + 5 {
@@ -419,13 +487,6 @@ impl World {
         }
         if p.y == MIN_Y {
             return Block::Stone;
-        }
-        if p.y < height - 4 {
-            let a = (p.x as f32 * 0.075 + (p.y as f32 * 0.065).sin() * 2.).sin();
-            let b = (p.z as f32 * 0.085 + (p.y as f32 * 0.051).cos() * 2.).cos();
-            if a + b > 1.56 && p.y > MIN_Y + 3 {
-                return Block::Air;
-            }
         }
         if p.y == height {
             if self.biome(p.x, p.z) == Biome::Tundra {
@@ -467,6 +528,7 @@ impl World {
                 self.height(p.x, p.z),
                 self.tree(p.x, p.z),
                 self.nearby_ruin(p.x, p.z),
+                self.cave_column(p.x, p.z),
             ),
         )
     }
@@ -493,6 +555,7 @@ impl World {
                 let h = self.height(wx, wz);
                 let t = self.tree(wx, wz);
                 let ruin = self.nearby_ruin(wx, wz);
+                let cave = self.cave_column(wx, wz);
                 for y in -1..=SIZE {
                     let p = IVec3::new(wx, base.y + y, wz);
                     let block = self
@@ -500,7 +563,7 @@ impl World {
                         .get(&p.to_array())
                         .copied()
                         .or_else(|| self.chunks.get(&chunk(p)).map(|c| c[index(p)]))
-                        .unwrap_or_else(|| self.natural_column(p, h, t, ruin));
+                        .unwrap_or_else(|| self.natural_column(p, h, t, ruin, cave));
                     blocks[((x + 1) + 18 * ((z + 1) + 18 * (y + 1))) as usize] =
                         self.supported_plant(p, block);
                 }
@@ -1179,5 +1242,62 @@ mod vegetation_tests {
             }
         }
         assert!(grass > 0 && tall > 0 && tall < grass && flowers > 0);
+    }
+}
+
+#[cfg(test)]
+mod cave_tests {
+    use super::*;
+
+    #[test]
+    fn caves_have_varied_scale_surface_access_and_protected_bedrock() {
+        for seed in [1, 42, 314159] {
+            let world = World::new(seed);
+            let mut kinds = [false; 3];
+            let mut entrance = None;
+            for cx in -4..=4 {
+                for cz in -4..=4 {
+                    let h = hash(seed ^ 0xca7e_2026, cx, 0, cz);
+                    let x = cx * 160 + 72 + (h % 17) as i32;
+                    let z = cz * 160 + 72 + ((h >> 8) % 17) as i32;
+                    let (lo, hi) = world.cave_column(x, z).unwrap();
+                    let kind = ((h >> 20) % 3) as usize;
+                    kinds[kind] = true;
+                    assert!(hi - lo >= [4, 12, 36][kind]);
+                    assert_eq!(world.get(IVec3::new(x, (lo + hi) / 2, z)), Block::Air);
+                    assert_eq!(world.get(IVec3::new(x, MIN_Y, z)), Block::Stone);
+                    for d in 48..=60 {
+                        let (ex, ez) = if h & 0x10000 == 0 {
+                            (x + d, z)
+                        } else {
+                            (x, z + d)
+                        };
+                        let surface = IVec3::new(ex, world.height(ex, ez), ez);
+                        if world.get(surface) == Block::Air {
+                            entrance = Some(surface);
+                        }
+                    }
+                }
+            }
+            assert!(kinds.into_iter().all(|found| found));
+            let mouth = entrance.expect("occasional open surface entrances");
+            let key = chunk(mouth);
+            let halo = world.halo(key);
+            for y in -1..=SIZE {
+                for z in -1..=SIZE {
+                    for x in -1..=SIZE {
+                        let p = key * SIZE + IVec3::new(x, y, z);
+                        assert_eq!(
+                            halo[((x + 1) + 18 * ((z + 1) + 18 * (y + 1))) as usize],
+                            world.get(p)
+                        );
+                    }
+                }
+            }
+            assert_eq!(
+                world.get(IVec3::new(2, world.height(2, 2), 2)),
+                Block::Grass
+            );
+        }
     }
 }

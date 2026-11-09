@@ -249,7 +249,7 @@ pub fn run() -> Result<(), String> {
         .step_by(4)
         .find_map(|x| {
             (-100..=100).step_by(4).find_map(|z| {
-                (0..g.world.height(x, z) - 5)
+                (crate::world::MIN_Y + 4..g.world.height(x, z) - 5)
                     .rev()
                     .find(|&y| {
                         let p = Vec3::new(x as f32 + 0.5, y as f32 + 0.01, z as f32 + 0.5);
