@@ -1407,3 +1407,76 @@ Left-click uses normal targeting and drops but completes block mining in one
 simulation step, bypassing tool tiers, guardian locks and tool wear. World bounds
 and the requirement to empty processors before mining remain in effect. Block
 edits persist normally; god mode itself is never saved and defaults off on load.
+
+
+### Water distribution and standalone lakes
+
+The 384-block hydrology cells now choose between the established contained
+lake-to-lake cascade and a standalone lake. Cascade candidates occupy one sixth
+of cells instead of one half; another third can host isolated lakes. Standalone
+lakes have weighted size variation: five eighths of candidates use radii of
+24–48 blocks, two eighths use 49–72, and one eighth use 80–104. Seeded aspect
+ratios and irregular shores further vary their shapes. These are candidate
+frequencies; terrain containment determines which actually survive. Standalone
+lakes centered on dry land can use sea-level water tables; cascades still need
+an elevated upper lake. Exact rim checks, carved-shore containment and ruin exclusion
+still reject unsafe sites. Shore sampling and stamping bounds scale with lake
+size, and centers keep the entire plan inside its owning cell. The existing
+cascade geometry remains stable because overlapping reaches need consistent
+source elevations. Standalone plans use identical lake endpoints and a single
+route point; diagnostics that seek waterfalls continue to select actual drops.
+
+Continental ocean blending starts at noise values below 0.54 (previously 0.48),
+creating broader large bodies of water. The initial 0.58 ocean threshold was
+reduced after play feedback so oceans occupy less of the landscape. Larger
+standalone lakes do not change ocean coverage. The protected dry spawn remains intact;
+continental shaping now blends from radius 192 to 448 instead of 256 to 640,
+so ordinary exploration reaches full river and ocean generation earlier. River
+cores widen from a noise-contour tolerance of 0.01 to 0.018, giving rasterized
+channels more margin against dry sand pinches, while retaining the terrain-aware
+valley shoulders and deep ravines. Broad continental shorelines also provide
+more water beside low terrain rather than only excavated inland basins.
+
+Small pools now vary from 2.8 to 8.3 blocks in nominal radius. Seeded aspect,
+orientation and shore perturbation vary their outlines. Generation and cached
+containment use the same shore function and a rim search large enough for every
+variant. Cold lids, sediment, lava containment and the shallow stepped beds stay
+in place. Water tables and player edits retain their existing behavior; unedited
+terrain regenerates with these changes on load.
+
+Regression coverage checks surviving standalone lakes at both small and large
+sizes, wet interiors, cell ownership and preservation of continental water under
+shore aprons. Cold river/lake tests query actual planned surfaces rather than
+assuming the previous fixed template coordinates. Existing route continuity,
+fluid simulation, pond, ocean, spawn and halo checks remain required.
+
+
+### Nearby ocean shores and cave separation
+
+Ocean frequency alone did not constrain the horizon. Continental ocean carving
+now also has a bounded, seeded footprint in each 320-block cell: nominal radii
+96–128, with up to eight blocks of noise perturbation and a 24-block shore blend.
+Dry shoulders between these footprints keep nearby land within the normal
+160-block horizontal streaming range. The river network can still cross those
+shoulders. Inland lakes retain their separate weighted 24–104 radius variation.
+A regression samples actual source-water positions across three seeds and checks
+for solid shore within 144 blocks along sixteen directions. This is a terrain
+proximity check, not a guarantee about camera direction or visual occlusion.
+
+Cave geometry is split into raw intervals (used during hydrology planning) and
+water-aware intervals (used by terrain queries and halos). Completed lake/river
+plans cap cave ceilings twelve blocks below their waterline throughout their
+wet footprint and shore apron. Continental wet columns and small pools also cap
+nearby caves at sampled offsets up to twelve blocks away. This preserves deep
+caves while preventing most exposed mouths immediately beside water, rather
+than relying on a thin sediment plug to separate the two. The raw/safe split
+avoids recursion between cave and lake containment planning.
+
+One in 32 seeded cave formations can intersect continental water. Where a cave
+reaches within three blocks of a submerged bed, generated falling water opens
+the bed and connects the sea-level source to the cavern floor. Ordinary fluid
+simulation can spread the landing water into the cavern. Planned inland lakes
+and cascades retain their rock buffer even in these rare formations. Tests cover
+ordinary cave separation, an actual rare supplied underground fall surviving
+fluid pulses and matching its chunk halo, varied surviving cave sizes, and the
+existing water/shore continuity checks.

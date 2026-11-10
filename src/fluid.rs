@@ -245,9 +245,8 @@ impl World {
         let z = cz * 64 + 16 + ((h >> 24) % 32) as i32;
         let dx = p.x - x;
         let dz = p.z - z;
-        let radius = 4.2 + ((h >> 48) % 3) as f32 * 0.35;
-        let edge = (dx as f32 * 0.9).hypot(dz as f32 * 1.1) - radius
-            + 0.45 * (dx as f32 * 1.3 + dz as f32 * 0.8).sin();
+        let radius = 2.8 + ((h >> 48) % 12) as f32 * 0.5;
+        let edge = crate::hydrology::pond_edge(h, dx, dz, radius);
         if edge > 1. {
             return None;
         }
@@ -636,19 +635,24 @@ mod tests {
         let mut found = [false; 2];
         for cx in -12..12 {
             for cz in -12..12 {
-                let h = hash(w.seed ^ 0x7269_7665, cx, 0, cz);
-                let x = cx * 384 + 144 + ((h >> 8) % 96) as i32;
-                let z = cz * 384 + 144 + ((h >> 24) % 96) as i32;
-                let Some((_, level)) = w.waterway_column(x, z) else {
+                let Some(plan) = w.waterway_plan(cx * 384 + 192, cz * 384 + 192) else {
                     continue;
                 };
-                for (i, u) in [0, 70].into_iter().enumerate() {
-                    let (px, pz) = if h & 4 == 0 { (x + u, z) } else { (x, z + u) };
+                if plan.route.len() < 2 {
+                    continue;
+                }
+                for (i, site) in [plan.route[plan.route.len() / 2], plan.lakes[1].center]
+                    .into_iter()
+                    .enumerate()
+                {
+                    let (px, pz) = (site.x, site.z);
+                    let (_, level) = w.waterway_column(px, pz).unwrap();
                     let p = IVec3::new(px, level, pz);
                     if !found[i]
                         && w.biome(px, pz) == Biome::Tundra
                         && w.waterway_block(p, w.height(px, pz)) == Some(Block::Water)
                         && w.get(p) == Block::Water
+                        && w.get(p + IVec3::Y) == Block::Air
                     {
                         found[i] = true;
                         assert_eq!(w.get(p - IVec3::Y), Block::Water);

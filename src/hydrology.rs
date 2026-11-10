@@ -1,4 +1,4 @@
-//! Seeded, contained lake-to-lake drainage, independent of chunk load order.
+//! Seeded standalone lakes and contained lake-to-lake drainage.
 use crate::world::{Biome, Block, SEA_LEVEL, World, hash};
 use glam::IVec3;
 use std::{
@@ -80,6 +80,7 @@ impl Column {
 pub(crate) struct Lake {
     pub center: IVec3,
     radius: f32,
+    aspect: f32,
     rotated: bool,
 }
 impl Lake {
@@ -89,14 +90,15 @@ impl Lake {
         } else {
             (x - self.center.x, z - self.center.z)
         };
-        (u as f32).hypot(v as f32 * 1.15)
+        (u as f32).hypot(v as f32 * self.aspect)
             - self.radius
             - 1.5 * (u as f32 * 0.19 + v as f32 * 0.13).sin()
     }
     fn shore_level(self, world: &World) -> i32 {
         let mut rim = world.height(self.center.x, self.center.z);
-        for dx in -34..=34 {
-            for dz in -34..=34 {
+        let extent = (self.radius / self.aspect.min(1.)).ceil() as i32 + 4;
+        for dx in -extent..=extent {
+            for dz in -extent..=extent {
                 let (x, z) = (self.center.x + dx, self.center.z + dz);
                 if (0.0..2.0).contains(&self.edge(x, z)) {
                     rim = rim.min(world.height(x, z));
@@ -108,7 +110,7 @@ impl Lake {
 }
 
 pub(crate) struct Waterway {
-    pub lakes: [Lake; 2],  // Upstream, downstream.
+    pub lakes: [Lake; 2],  // Upstream/downstream; identical for a standalone lake.
     pub route: Vec<IVec3>, // Four-connected, non-increasing water elevations.
     columns: HashMap<(i32, i32), Column>,
 }
@@ -121,8 +123,8 @@ impl Waterway {
         if !h.is_multiple_of(2) {
             return None;
         }
-        let x = cx * CELL + 144 + ((h >> 8) % 96) as i32;
-        let z = cz * CELL + 144 + ((h >> 24) % 96) as i32;
+        let x = cx * CELL + 160 + ((h >> 8) % 64) as i32;
+        let z = cz * CELL + 160 + ((h >> 24) % 64) as i32;
         if x.abs() < 160 && z.abs() < 160 {
             return None;
         }
@@ -134,25 +136,41 @@ impl Waterway {
                 IVec3::new(x + u, 0, z + v)
             }
         };
+        let paired = h.is_multiple_of(6);
+        let span = 70;
         let bend = if h & 8 == 0 { 20 } else { -20 };
         let mut nodes = [
-            point(-70, 0),
+            point(-span, 0),
             point(-25, bend),
             point(25, -bend),
-            point(70, 0),
+            point(span, 0),
         ];
         let mut lakes = [
             Lake {
                 center: nodes[0],
                 radius: 22.,
+                aspect: 1.15,
                 rotated,
             },
             Lake {
                 center: nodes[3],
                 radius: 30.,
+                aspect: 1.15,
                 rotated,
             },
         ];
+        if !paired {
+            nodes = [point(0, 0); 4];
+            lakes[0].center = nodes[0];
+            lakes[0].aspect = 0.85 + ((h >> 36) % 6) as f32 * 0.1;
+            // Most candidates are modest lakes; broad lakes are occasional landmarks.
+            lakes[0].radius = match (h >> 48) % 8 {
+                0 => 80. + ((h >> 16) % 25) as f32,
+                1 | 2 => 49. + ((h >> 16) % 24) as f32,
+                _ => 24. + ((h >> 16) % 25) as f32,
+            };
+            lakes[1] = lakes[0];
+        }
         for lake in &mut lakes {
             lake.center.y = lake.shore_level(world);
         }
@@ -160,7 +178,9 @@ impl Waterway {
             lakes.swap(0, 1);
             nodes.reverse();
         }
-        if lakes[0].center.y <= SEA_LEVEL + 3 {
+        if (paired && lakes[0].center.y <= SEA_LEVEL + 3)
+            || (!paired && world.height(x, z) <= SEA_LEVEL + 3)
+        {
             return None;
         }
         // Avoid perched basins on steep sites, preserving the existing gentle-site rule.
@@ -182,12 +202,14 @@ impl Waterway {
                 .unwrap()
         };
         let low = route.iter().map(|&p| bank_min(p) - 2).min().unwrap();
-        lakes[1].center.y = lakes[1]
-            .center
-            .y
-            .min(low)
-            .min(lakes[0].center.y - 2)
-            .max(SEA_LEVEL);
+        if paired {
+            lakes[1].center.y = lakes[1]
+                .center
+                .y
+                .min(low)
+                .min(lakes[0].center.y - 2)
+                .max(SEA_LEVEL);
+        }
         let mut level = lakes[0].center.y;
         for p in &mut route {
             if lakes[1].edge(p.x, p.z) < -1. {
@@ -215,8 +237,9 @@ impl Waterway {
             }
         };
         for lake in lakes {
-            for dx in -50..=50 {
-                for dz in -50..=50 {
+            let extent = (lake.radius / lake.aspect.min(1.)).ceil() as i32 + 21;
+            for dx in -extent..=extent {
+                for dz in -extent..=extent {
                     let (x, z) = (lake.center.x + dx, lake.center.z + dz);
                     let edge = lake.edge(x, z);
                     if edge <= 18. {
@@ -290,7 +313,7 @@ impl Waterway {
                     None => {
                         height >= c.level
                             && !world
-                                .cave_column(qx, qz)
+                                .raw_cave_column(qx, qz)
                                 .is_some_and(|(lo, hi)| (lo..=hi).contains(&c.level))
                     }
                 };
@@ -321,6 +344,14 @@ impl Waterway {
             columns,
         })
     }
+}
+
+/// Shared shore shape for rendering and exact containment checks.
+pub(crate) fn pond_edge(h: u64, dx: i32, dz: i32, radius: f32) -> f32 {
+    let aspect = 0.7 + ((h >> 32) % 7) as f32 * 0.1;
+    let (u, v) = if h & 8 == 0 { (dx, dz) } else { (dz, dx) };
+    (u as f32 * aspect).hypot(v as f32 / aspect) - radius
+        + (0.3 + ((h >> 44) % 4) as f32 * 0.2) * (u as f32 * 0.7 + v as f32 * 0.5).sin()
 }
 
 fn raster_line(route: &mut Vec<IVec3>, a: IVec3, b: IVec3) {
@@ -397,13 +428,11 @@ impl World {
         if let Some(&safe) = self.waterways.lock().unwrap().ponds.get(&key) {
             return safe;
         }
-        let edge = |dx: i32, dz: i32| {
-            (dx as f32 * 0.9).hypot(dz as f32 * 1.1) - radius
-                + 0.45 * (dx as f32 * 1.3 + dz as f32 * 0.8).sin()
-        };
+        let h = hash(self.seed ^ 0x706f6f6c, cx, 0, cz);
+        let edge = |dx, dz| pond_edge(h, dx, dz, radius);
         let mut safe = true;
-        for dx in -8..=8 {
-            for dz in -8..=8 {
+        for dx in -16..=16 {
+            for dz in -16..=16 {
                 if edge(dx, dz) >= 0.
                     && SIDES.iter().any(|d| edge(dx + d.x, dz + d.z) < 0.)
                     && self.height(x + dx, z + dz) < y
@@ -434,9 +463,12 @@ mod tests {
 
     fn sample_plans(world: &World) -> Vec<Arc<Waterway>> {
         let mut found = Vec::new();
-        for cx in -5..5 {
-            for cz in -5..5 {
+        for cx in -12..12 {
+            for cz in -12..12 {
                 if let Some(plan) = world.waterway_plan(cx * CELL + 192, cz * CELL + 192) {
+                    if plan.route.len() == 1 {
+                        continue;
+                    }
                     found.push(plan);
                     if found.len() == 4 {
                         return found;
@@ -446,6 +478,43 @@ mod tests {
         }
         assert!(!found.is_empty());
         found
+    }
+
+    #[test]
+    fn standalone_lakes_vary_in_size_and_preserve_continental_channels() {
+        let w = World::new(41);
+        let mut smallest = usize::MAX;
+        let mut largest = 0;
+        for cx in -16..16 {
+            for cz in -16..16 {
+                let Some(plan) = w.waterway_plan(cx * CELL + 192, cz * CELL + 192) else {
+                    continue;
+                };
+                if plan.route.len() != 1 {
+                    continue;
+                }
+                let area = plan.columns.values().filter(|c| c.edge < 0.).count();
+                smallest = smallest.min(area);
+                largest = largest.max(area);
+                for (&(x, z), c) in &plan.columns {
+                    assert_eq!((x.div_euclid(CELL), z.div_euclid(CELL)), (cx, cz));
+                    if c.edge < 0. {
+                        assert_eq!(w.get(IVec3::new(x, c.level, z)), Block::Water);
+                    } else if w.height(x, z) < SEA_LEVEL {
+                        assert_eq!(w.get(IVec3::new(x, SEA_LEVEL, z)), Block::Water);
+                    }
+                }
+            }
+        }
+        assert!(
+            smallest < 3500,
+            "smaller standalone lakes must survive siting"
+        );
+        assert!(
+            largest > 16000,
+            "large standalone lakes must survive siting"
+        );
+        assert!(largest < 42000, "standalone lake area must remain bounded");
     }
 
     #[test]

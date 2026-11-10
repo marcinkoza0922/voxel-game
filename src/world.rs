@@ -444,10 +444,21 @@ impl World {
         let distance = (x * x + z * z).sqrt();
         let inland =
             24. + hills + ridge.powf(1.7) * 750. * ((distance - 100.).max(0.) / 500.).min(1.);
-        let exposure = smooth(((distance - 256.) / 384.).clamp(0., 1.));
+        let exposure = smooth(((distance - 192.) / 256.).clamp(0., 1.));
         let continent = noise(self.seed ^ 0x736561, x / 1200., z / 1200.);
-        let ocean = smooth(((0.48 - continent) / 0.18).clamp(0., 1.)) * exposure;
-        let basin = SEA_LEVEL as f32 - 8. - (0.48 - continent).max(0.) * 100.
+        // Bound individual ocean basins instead of only changing their frequency.
+        // Dry shoulders between basins keep a shoreline within ordinary view range.
+        let cell_x = (x / 320.).floor() as i32;
+        let cell_z = (z / 320.).floor() as i32;
+        let sea_hash = hash(self.seed ^ 0x73686f7265, cell_x, 0, cell_z);
+        let sea_x = cell_x as f32 * 320. + 144. + (sea_hash % 33) as f32;
+        let sea_z = cell_z as f32 * 320. + 144. + ((sea_hash >> 8) % 33) as f32;
+        let radius = 96. + ((sea_hash >> 16) % 33) as f32;
+        let shoreline = (noise(self.seed ^ 0x636f617374, x / 55., z / 55.) - 0.5) * 16.;
+        let shore =
+            smooth(((radius + shoreline - (x - sea_x).hypot(z - sea_z)) / 24.).clamp(0., 1.));
+        let ocean = smooth(((0.54 - continent) / 0.20).clamp(0., 1.)) * exposure * shore;
+        let basin = SEA_LEVEL as f32 - 8. - (0.54 - continent).max(0.) * 100.
             + noise(self.seed ^ 0x626564, x / 70., z / 70.) * 4.;
         let terrain = inland * (1. - ocean) + basin * ocean;
         // A warped noise contour gives continuous valleys across chunk boundaries.
@@ -456,7 +467,7 @@ impl World {
             (noise(self.seed ^ 0x72697672, (x + warp) / 260., (z - warp) / 260.) - 0.5).abs();
         // Higher terrain needs wider valley shoulders to avoid narrow wall-like banks.
         let shoulder = (0.035 + (terrain - SEA_LEVEL as f32).max(0.) * 0.0005).min(0.16);
-        let river = smooth(((0.01 + shoulder - channel) / shoulder).clamp(0., 1.)) * exposure;
+        let river = smooth(((0.018 + shoulder - channel) / shoulder).clamp(0., 1.)) * exposure;
         (terrain - (terrain - (SEA_LEVEL - 4) as f32).max(0.) * river) as i32
     }
     /// One stable candidate per 256-block cell; only gentle tundra sites survive.
@@ -537,6 +548,39 @@ impl World {
     /// A column's cave interval, shared by direct queries and chunk generation.
     /// Features fit inside 160-block cells, including their entrance ramps.
     pub(crate) fn cave_column(&self, x: i32, z: i32) -> Option<(i32, i32)> {
+        let (lo, mut hi) = self.raw_cave_column(x, z)?;
+        // Hydrology planning only uses raw geometry, so this cannot recurse.
+        if let Some((_, level)) = self.waterway_column(x, z) {
+            hi = hi.min(level - 12);
+        }
+        if !self.cave_sink(x, z) {
+            for (dx, dz) in [(0, 0), (-12, 0), (12, 0), (0, -12), (0, 12)] {
+                let height = self.height(x + dx, z + dz);
+                if height < SEA_LEVEL {
+                    hi = hi.min(SEA_LEVEL - 12);
+                } else if self
+                    .pool_block(IVec3::new(x + dx, height - 1, z + dz), height)
+                    .is_some_and(|b| b.fluid().is_some() || b == Block::Ice)
+                {
+                    hi = hi.min(height - 13);
+                }
+            }
+        }
+        (hi >= lo).then_some((lo, hi))
+    }
+
+    /// Rare cave formations may receive a natural underground waterfall.
+    fn cave_sink(&self, x: i32, z: i32) -> bool {
+        hash(
+            self.seed ^ 0xca7e_2026,
+            x.div_euclid(160),
+            0,
+            z.div_euclid(160),
+        )
+        .is_multiple_of(32)
+    }
+
+    pub(crate) fn raw_cave_column(&self, x: i32, z: i32) -> Option<(i32, i32)> {
         if (x as f64).hypot(z as f64) < 32. {
             return None;
         }
@@ -636,7 +680,18 @@ impl World {
         if let Some(water) = self.waterway_block(p, height) {
             return water;
         }
-        // Seal the upper bed before carving caves; all water is generated as sources.
+        // A rare cave that actually intersects a submerged bed receives a falling
+        // column supplied by the ordinary sea-level source above it. Other beds seal.
+        if height < SEA_LEVEL
+            && self.cave_sink(p.x, p.z)
+            && let Some((lo, hi)) = cave
+            && hi >= height - 3
+            && p.y >= lo
+            && p.y <= height
+        {
+            return Block::FlowingWater(8);
+        }
+        // Seal the upper bed before carving caves; surface water is generated as sources.
         if height <= SEA_LEVEL + 1 {
             if p.y > height && p.y <= SEA_LEVEL {
                 return Block::Water;
@@ -1265,6 +1320,114 @@ fn outcrop_top(h: u64, mut x: i32, mut z: i32) -> i32 {
 mod tests {
     use super::*;
     #[test]
+    fn open_water_keeps_land_within_the_normal_view_distance() {
+        for seed in [1, 41, 314159] {
+            let w = World::new(seed);
+            let mut checked = 0;
+            for x in (-2048..=2048).step_by(96) {
+                for z in (-2048..=2048).step_by(96) {
+                    if w.height(x, z) >= SEA_LEVEL {
+                        continue;
+                    }
+                    checked += 1;
+                    let shore = (0..16).any(|ray| {
+                        let angle = ray as f32 * std::f32::consts::TAU / 16.;
+                        (16..=144).step_by(16).any(|distance| {
+                            let qx = x + (angle.cos() * distance as f32).round() as i32;
+                            let qz = z + (angle.sin() * distance as f32).round() as i32;
+                            w.height(qx, qz) >= SEA_LEVEL
+                                && w.get(IVec3::new(qx, SEA_LEVEL, qz)).solid()
+                        })
+                    });
+                    assert!(shore, "no nearby shore at ({x}, {z}), seed={seed}");
+                }
+            }
+            assert!(checked > 30);
+        }
+    }
+
+    #[test]
+    fn ordinary_caves_leave_thick_roofs_near_surface_water() {
+        let w = World::new(41);
+        let mut checked = 0;
+        for x in (-1600..1600).step_by(8) {
+            for z in (-1600..1600).step_by(8) {
+                if w.cave_sink(x, z) {
+                    continue;
+                }
+                let Some((_, raw_hi)) = w.raw_cave_column(x, z) else {
+                    continue;
+                };
+                if raw_hi <= SEA_LEVEL - 12 {
+                    continue;
+                }
+                let near_water = [(0, 0), (-12, 0), (12, 0), (0, -12), (0, 12)]
+                    .iter()
+                    .any(|&(dx, dz)| w.height(x + dx, z + dz) < SEA_LEVEL);
+                if near_water {
+                    checked += 1;
+                    assert!(
+                        w.cave_column(x, z)
+                            .is_none_or(|(_, hi)| hi <= SEA_LEVEL - 12)
+                    );
+                    assert_ne!(w.get(IVec3::new(x, SEA_LEVEL - 1, z)), Block::Air);
+                }
+            }
+        }
+        assert!(checked > 10, "water-adjacent caves must be exercised");
+    }
+
+    #[test]
+    fn rare_submerged_cave_openings_receive_a_supplied_waterfall() {
+        let mut w = World::new(41);
+        let mut fall = None;
+        'cells: for cx in -24..24 {
+            for cz in -24..24 {
+                if !w.cave_sink(cx * 160, cz * 160) {
+                    continue;
+                }
+                for dx in (16..144).step_by(4) {
+                    for dz in (16..144).step_by(4) {
+                        let (x, z) = (cx * 160 + dx, cz * 160 + dz);
+                        let height = w.height(x, z);
+                        if height >= SEA_LEVEL {
+                            continue;
+                        }
+                        let Some((lo, hi)) = w.cave_column(x, z) else {
+                            continue;
+                        };
+                        if hi < height - 3 || lo >= height - 2 {
+                            continue;
+                        }
+                        let p = IVec3::new(x, height, z);
+                        if w.get(p) == Block::FlowingWater(8) {
+                            fall = Some((p, lo));
+                            break 'cells;
+                        }
+                    }
+                }
+            }
+        }
+        let (p, lo) = fall.expect("occasional natural underground waterfall");
+        for y in lo..=p.y {
+            assert_eq!(w.get(IVec3::new(p.x, y, p.z)), Block::FlowingWater(8));
+        }
+        assert_eq!(w.get(p + IVec3::Y), Block::Water);
+        w.wake_fluid(p);
+        for _ in 0..12 {
+            w.tick_fluids(p, false);
+        }
+        assert!(w.get(p).fluid().is_some());
+        let key = chunk(p);
+        let halo = w.halo(key);
+        let local = p - key * SIZE + IVec3::ONE;
+        assert_eq!(
+            halo[(local.x + 18 * (local.z + 18 * local.y)) as usize],
+            w.get(p)
+        );
+    }
+
+    #[test]
     fn seas_have_flat_sources_sealed_beds_and_streamed_surfaces() {
         let mut w = World::new(314159);
         let mut deep = None;
@@ -1867,10 +2030,13 @@ mod cave_tests {
                     let h = hash(seed ^ 0xca7e_2026, cx, 0, cz);
                     let x = cx * 160 + 72 + (h % 17) as i32;
                     let z = cz * 160 + 72 + ((h >> 8) % 17) as i32;
-                    let (lo, hi) = world.cave_column(x, z).unwrap();
+                    let (raw_lo, raw_hi) = world.raw_cave_column(x, z).unwrap();
                     let kind = ((h >> 20) % 3) as usize;
-                    kinds[kind] = true;
-                    assert!(hi - lo >= [4, 12, 36][kind]);
+                    assert!(raw_hi - raw_lo >= [4, 12, 36][kind]);
+                    let Some((lo, hi)) = world.cave_column(x, z) else {
+                        continue;
+                    };
+                    kinds[kind] |= hi - lo >= [4, 12, 36][kind];
                     assert_eq!(world.get(IVec3::new(x, (lo + hi) / 2, z)), Block::Air);
                     assert_eq!(world.get(IVec3::new(x, MIN_Y, z)), Block::Stone);
                     for d in 48..=60 {
