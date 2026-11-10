@@ -8,6 +8,8 @@ mod fluid;
 #[path = "../tools/frontier_review.rs"]
 mod frontier_review;
 mod game;
+#[path = "../tools/gpu_profile.rs"]
+mod gpu_profile;
 #[path = "../tools/headless.rs"]
 mod headless;
 mod hydrology;
@@ -458,7 +460,10 @@ impl ApplicationHandler for App {
                     )
                     .map_err(|e| e.to_string())?,
             );
-            let renderer = pollster::block_on(render::Renderer::new(window.clone()))?;
+            let mut renderer = pollster::block_on(render::Renderer::new(window.clone()))?;
+            if let Some(profile) = &self.profile {
+                renderer.enable_gpu_profile(profile.gpu_sender());
+            }
             Ok::<_, String>((window, renderer))
         })();
         match result {
@@ -777,6 +782,7 @@ impl ApplicationHandler for App {
                     );
                     let stream_ms = stream_start.elapsed().as_secs_f64() * 1000.;
                     r.profile_draw = self.profile.is_some();
+                    r.profile_frame = self.frames;
                     let draw_start = Instant::now();
                     if let Err(e) = r.draw(
                         &self.game,

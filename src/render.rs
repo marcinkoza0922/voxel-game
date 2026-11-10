@@ -56,6 +56,8 @@ struct Frontier {
 
 pub struct Renderer {
     pub profile_draw: bool,
+    gpu_profile: Option<crate::gpu_profile::GpuProfile>,
+    pub profile_frame: u32,
     pub draw_times: [f64; 5],
     #[cfg(feature = "native-upscalers")]
     native: crate::native_upscale::Native,
@@ -162,6 +164,9 @@ impl Renderer {
             .map_err(|e| e.to_string())?;
         let descriptor = wgpu::DeviceDescriptor {
             label: Some("Voxel device"),
+            required_features: adapter.features()
+                & (wgpu::Features::TIMESTAMP_QUERY
+                    | wgpu::Features::TIMESTAMP_QUERY_INSIDE_ENCODERS),
             ..Default::default()
         };
         #[cfg(feature = "native-upscalers")]
@@ -616,6 +621,8 @@ impl Renderer {
         );
         Ok(Self {
             profile_draw: false,
+            gpu_profile: None,
+            profile_frame: 0,
             draw_times: [0.; 5],
             #[cfg(feature = "native-upscalers")]
             native,
@@ -649,6 +656,18 @@ impl Renderer {
             frontier_roofs: HashMap::new(),
             ui: Ui::new(),
         })
+    }
+    pub fn enable_gpu_profile(
+        &mut self,
+        sender: std::sync::mpsc::Sender<crate::gpu_profile::Sample>,
+    ) {
+        self.gpu_profile = crate::gpu_profile::GpuProfile::new(&self.device, &self.queue, sender);
+    }
+    pub fn drain_gpu_profile(&self) -> Result<(), String> {
+        self.device
+            .poll(wgpu::PollType::wait_indefinitely())
+            .map_err(|e| e.to_string())?;
+        Ok(())
     }
     pub fn finish(self) {
         let _ = self.device.poll(wgpu::PollType::wait_indefinitely());
@@ -827,6 +846,12 @@ impl Renderer {
     ) -> Result<(), String> {
         let mut phase_start = self.profile_draw.then(std::time::Instant::now);
         self.draw_times = [0.; 5];
+        let gpu_slot = self
+            .gpu_profile
+            .as_ref()
+            .map(|p| p.begin(&self.device, self.profile_frame))
+            .transpose()?
+            .flatten();
         let (celestial, daylight) = sky_cycle(g.time);
         // Moonlight takes over at night; both lights follow the visible orbit.
         let sun = if celestial.y >= 0. {
@@ -1200,6 +1225,9 @@ impl Renderer {
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("Frame"),
             });
+        if let (Some(p), Some(slot)) = (&self.gpu_profile, gpu_slot) {
+            p.stamp(&mut encoder, slot, 0);
+        }
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("Shadow pass"),
@@ -1227,6 +1255,9 @@ impl Renderer {
                 pass.set_vertex_buffer(0, b.slice(..));
                 pass.draw(0..dynamic.len() as u32, 0..1);
             }
+        }
+        if let (Some(p), Some(slot)) = (&self.gpu_profile, gpu_slot) {
+            p.stamp(&mut encoder, slot, 1);
         }
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -1293,6 +1324,9 @@ impl Renderer {
                 pass.draw(m.opaque_count..m.count, 0..1);
             }
         }
+        if let (Some(p), Some(slot)) = (&self.gpu_profile, gpu_slot) {
+            p.stamp(&mut encoder, slot, 2);
+        }
         let now = std::time::Instant::now();
         #[cfg(feature = "native-upscalers")]
         if native_active {
@@ -1329,6 +1363,9 @@ impl Renderer {
             eye,
             self.settings.taa,
         );
+        if let (Some(p), Some(slot)) = (&self.gpu_profile, gpu_slot) {
+            p.stamp(&mut encoder, slot, 3);
+        }
         self.last_draw = now;
         if let Some(buffer) = &held_buffer {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -1357,6 +1394,9 @@ impl Renderer {
             pass.set_vertex_buffer(0, buffer.slice(..));
             pass.draw(0..held_mesh.len() as u32, 0..1);
         }
+        if let (Some(p), Some(slot)) = (&self.gpu_profile, gpu_slot) {
+            p.stamp(&mut encoder, slot, 4);
+        }
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("GUI pass"),
@@ -1374,6 +1414,10 @@ impl Renderer {
             pass.set_pipeline(&self.ui_pipeline);
             pass.set_vertex_buffer(0, ui_buffer.slice(..));
             pass.draw(0..self.ui.vertices.len() as u32, 0..1);
+        }
+        if let (Some(p), Some(slot)) = (&self.gpu_profile, gpu_slot) {
+            p.stamp(&mut encoder, slot, 5);
+            p.resolve(&mut encoder, slot);
         }
         let readback = capture.map(|_| {
             let stride = (self.width * 4).div_ceil(256) * 256;
@@ -1404,6 +1448,9 @@ impl Renderer {
         let commands = encoder.finish();
         self.profile_phase(&mut phase_start, 2);
         self.queue.submit(Some(commands));
+        if let (Some(p), Some(slot)) = (&self.gpu_profile, gpu_slot) {
+            p.submitted(slot, self.profile_frame);
+        }
         self.profile_phase(&mut phase_start, 3);
         if let (Some(path), Some((buffer, stride))) = (capture, readback) {
             let (tx, rx) = std::sync::mpsc::channel();

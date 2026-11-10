@@ -410,10 +410,14 @@ impl World {
         let c = self.waterway_plan(x, z)?.column(x, z)?;
         Some((c.edge, c.level))
     }
+    #[cfg(test)]
     pub(crate) fn waterway_block(&self, p: IVec3, height: i32) -> Option<Block> {
-        self.waterway_plan(p.x, p.z)?
-            .column(p.x, p.z)?
+        self.waterway_terrain_column(p.x, p.z)?
             .block(self, p, height)
+    }
+    /// Immutable water geometry reused at every height of a terrain column.
+    pub(crate) fn waterway_terrain_column(&self, x: i32, z: i32) -> Option<Column> {
+        self.waterway_plan(x, z)?.column(x, z)
     }
     pub(crate) fn pond_contained(
         &self,
@@ -478,6 +482,31 @@ mod tests {
         }
         assert!(!found.is_empty());
         found
+    }
+
+    #[test]
+    fn cached_waterway_columns_match_direct_queries_through_lakes_and_falls() {
+        let world = World::new(41);
+        let plans = sample_plans(&world);
+        let plan = &plans[0];
+        let fall = plan
+            .route
+            .windows(2)
+            .find(|pair| pair[0].y > pair[1].y)
+            .expect("fixture has a descending reach")[0];
+        for position in [plan.lakes[0].center, plan.lakes[1].center, fall] {
+            let key = crate::world::chunk(position);
+            let halo = world.halo(key);
+            for x in -1..=crate::world::SIZE {
+                for z in -1..=crate::world::SIZE {
+                    for y in -1..=crate::world::SIZE {
+                        let index = ((x + 1) + 18 * ((z + 1) + 18 * (y + 1))) as usize;
+                        let p = key * crate::world::SIZE + IVec3::new(x, y, z);
+                        assert_eq!(halo[index], world.get(p), "waterway mismatch at {p:?}");
+                    }
+                }
+            }
+        }
     }
 
     #[test]

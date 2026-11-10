@@ -1724,3 +1724,146 @@ A 64-frame native DLSS Quality moving-camera tour rendered and exited using a
 temporary world. That is a functional check; moving-view ghosting and shimmer
 have not received equivalent comparative visual validation. FSR 2 visual
 quality has not been re-evaluated for this correction.
+
+### CPU, GPU and memory profiling (2026-11-10)
+
+`--profile PATH.csv` now also writes `PATH.gpu.csv`. GPU timestamps measure
+shadow, world (sky/opaque/frontiers/fluids), temporal reconstruction and output,
+held item and UI stages, plus the span from the first stage to the last. These
+are GPU execution timeline measurements; they exclude CPU preparation, queue
+waiting before the first timestamp, presentation, uploads before the frame
+encoder and screenshot readback. Temporal timing includes native upscaling when
+that build/settings path is active. Stage boundaries use encoder timestamps;
+inter-stage GPU scheduling/barriers are included in the enclosing spans.
+
+`tools/gpu_profile.rs` requests optional timestamp capabilities exposed by the
+adapter and allocates queries only when a render profile is enabled. Four slots
+hold query/resolve/map buffers. Each draw polls callbacks without waiting;
+completed maps emit frame-ID-correlated samples to the CSV writer. A saturated
+ring emits an empty row instead of blocking. Unsupported timestamp capabilities
+produce a diagnostic and an empty GPU CSV. Map failures also emit empty rows.
+The analyzer automatically reads the sibling GPU CSV, reports missing samples
+and applies the same frame selection. Native shutdown drains the device before
+flushing the profile; headless profiling explicitly drains before its flush.
+`tools/analyze-profile.py PATH.csv --tour` summarizes CPU and GPU measurements.
+
+`python3 tools/profile-resources.py OUTPUT.csv COMMAND [ARG ...]` samples the
+child's aggregate thread CPU use and Linux RSS/high-water RSS, plus NVIDIA GPU
+load, memory-controller load, device VRAM, device power and child VRAM at 0.5 s.
+CPU 100% represents one logical core. NVIDIA load/power/device memory include
+other desktop applications; process VRAM is PID-specific. Peaks are sampled,
+including the most recently observed RSS high-water value; short-lived/final
+peaks may be missed. This measures resident memory, not allocator attribution
+or proof of a leak. It requires Linux `/proc` and `nvidia-smi`; unavailable GPU
+fields remain empty. Child output remains on stdout/stderr for caller logging.
+
+Release artifacts are in `target/performance-2026-11-10/`, at source base
+`6beed0856f3a56f3481bde784e15998c64bbbccc` plus the profiling instrumentation.
+Runs were sequential: 24-repetition deterministic CPU suite (seed 314159),
+1,800-frame native baseline tour, separate sampled CPU suite, instrumented
+1,800-frame native tour, and a 180-frame offscreen validation. Tour saves and
+settings are isolated in that directory. Native tours use 1280x800, full render
+scale, TAA, VSync on, no explicit cap and no native upscalers. Hardware is an
+RTX 3060 Ti (8 GiB), NVIDIA driver 595.112.07. No capture readback was requested.
+
+CPU stress median/p95 milliseconds: halo 5.551/8.615, surface mesh
+0.184/0.246, surface sky 1.008/1.545, checkerboard mesh 0.656/0.742,
+cave sky 0.000/1.366, twelve fluid pulses 16.415/17.181 and streaming
+relocations 108.177/115.132. Cave fixtures can be empty; consult output units.
+CPU stress sampled peak RSS was 18.87 MiB. Separate perf sampling succeeded,
+with zero lost samples. On the core PMU, waterway planning accounted for about
+23% self time across the two workers and contended mutex locking about 10%.
+The atom PMU is reported separately; percentages must not be added across PMUs.
+These are investigation candidates, not proof that any particular lock or
+waterway operation should be changed. World generation has changed since the
+prior profiling baseline, so terrain timings are not like-for-like regressions.
+
+Instrumented native tour GPU timings (milliseconds):
+
+| GPU stage | Median | p95 | Maximum |
+| --- | ---: | ---: | ---: |
+| Shadow | 0.260 | 0.400 | 0.520 |
+| World | 0.571 | 1.016 | 1.426 |
+| Temporal/output | 0.133 | 0.276 | 0.999 |
+| Held item | 0.051 | 0.074 | 0.109 |
+| UI | 0.002 | 0.004 | 0.219 |
+| Total span | 1.023 | 1.660 | 2.357 |
+
+All 1,800 GPU rows were measured, including the final frame, with no dropped
+samples. Frame interval median/p95/max was 6.072/10.975/16.109 ms; none
+exceeded 16.667 ms. Streaming/upload CPU peaked at 10.323 ms; peak resident
+chunks were 1,475. Some tour stages did not settle within their 180-frame
+window, so the GPU distribution includes partially populated scenes. Sampled
+process CPU median/p95 was 66%/238%, RSS peaked at 434 MiB and process VRAM
+at 483 MiB. Device GPU utilization median/p95 was 28%/41%. This short paced
+route does not establish sustained GPU throughput or long-term memory growth.
+The world pass is the largest measured GPU stage; terrain planning/streaming
+and pacing are more immediate CPU/frame-latency investigation targets here.
+
+Validation: formatting, clean short-format Clippy, all 151 quiet nextest tests,
+a complete native Vulkan tour and an offscreen timestamp/readback check.
+The uncapped 180-frame offscreen check produced eight measured GPU samples
+and 172 explicit unavailable rows as the CPU outran the four-slot ring. All
+frame IDs were retained and measured stage sums matched their total spans;
+this validates saturation/drop reporting without adding synchronization.
+Native-upscaler builds were not exercised in this pass.
+
+### Waterway lookup and lock investigation (2026-11-10)
+
+The expensive `waterway_plan` samples were principally repeated cached-plan
+lookups, not evidence that every query rebuilt a waterway. `natural_column`
+previously called `waterway_block` at each voxel height: that acquired the
+shared hydrology cache mutex, searched the cell map, cloned the plan Arc and
+looked up the horizontal column. Concurrent terrain workers repeated this for
+up to 5,832 positions in each 18-cube halo. Main-thread sampling and the surface
+planner also use the cache. Cache misses still build outside the mutex; this
+change does not serialize construction or change its duplicate-build policy.
+
+`TerrainColumn` now retains an optional copied hydrology `Column`, including
+negative results. Halo generation resolves it once per horizontal column
+(324 positions) and reuses it across all 18 heights. Lighting roof/occupancy
+queries and the fluid read-phase column cache also reuse it. Direct block
+queries resolve the same data afresh. Ruin priority, edits, resident chunks,
+plant support, hydrology geometry and cache eviction behavior are preserved.
+No global cache capacity increase, new long-lived cache or lock primitive change
+was needed. Additional tree/support queries can still acquire the shared cache;
+324 is the halo's base water-column lookup count, not a total query count.
+
+Artifacts are in `target/waterway-investigation/`. Preserved `voxel-before`
+and `voxel-after` release binaries permit independent reproduction without
+symbol changes when rebuilding. Sequential unsampled runs use seed 314159,
+48 measured repetitions and one excluded warmup, with identical workload output
+counts across all 336 rows. First comparison median/p95 milliseconds:
+
+| Workload | Before | After |
+| --- | ---: | ---: |
+| Four settled streaming relocations | 108.014 / 112.890 | 72.946 / 79.463 |
+| Cold terrain halo | 5.515 / 6.976 | 5.376 / 6.913 |
+| Surface sky | 1.010 / 1.559 | 0.928 / 1.439 |
+| Twelve fluid pulses | 16.382 / 16.816 | 16.638 / 17.185 |
+
+A second sequential 48-repetition comparison reproduced the result: streaming
+median/p95 was 108.879/113.428 ms before and 71.990/75.492 ms after, with
+all workload output counts again matching.
+
+The streaming median improved about 32–34%; cold halo construction barely changed
+because new fixture worlds still pay cold plan-building and terrain-sampling
+costs. Fluid timing showed no improvement in this comparison. These are local
+CPU workloads, not an FPS claim.
+
+Separate hardware sampling on the core PMU measured aggregate waterway-plan
+self time falling from 23.47% to 1.24%, and contended mutex self time from
+10.24% to 0.05%. These percentages are sampled CPU-cycle shares, not wall time
+blocked on locks, and include the relevant process threads. The baseline
+sampling run lost 39 samples; the after run lowered sampling frequency to
+999 Hz and lost none. Treat exact percentages as approximate. Along with the
+code path and unsampled timings, this supports shared per-voxel lookup traffic
+as the dominant contention source. Remaining worker costs include height,
+relief and climate sampling and distance calculations; cold waterway plan
+construction remains a separate optimization candidate.
+
+Validation: all 152 quiet nextest tests pass, including new halo/direct-query
+equality around both lake centers and a descending reach. Existing resident/edit,
+fluid, skylight and cache-eviction tests also pass. Formatting, diff whitespace
+checks and standard short-format Clippy pass. An additional all-targets Clippy
+run reports existing warnings in unrelated tests; no new warnings were found.

@@ -305,6 +305,7 @@ struct TerrainColumn {
     tree: Option<(i32, i32, i32)>,
     ruin: Option<IVec3>,
     cave: Option<(i32, i32)>,
+    water: Option<crate::hydrology::Column>,
 }
 
 pub(crate) struct SkyColumn {
@@ -325,6 +326,7 @@ impl SkyColumn {
                     self.terrain.tree,
                     self.terrain.ruin,
                     self.terrain.cave,
+                    self.terrain.water,
                 )
             });
         // Plant support never changes whether a block is opaque.
@@ -353,7 +355,14 @@ impl BlockQueries {
                     .columns
                     .entry((p.x, p.z))
                     .or_insert_with(|| world.terrain_column(p.x, p.z));
-                world.natural_column(p, column.height, column.tree, column.ruin, column.cave)
+                world.natural_column(
+                    p,
+                    column.height,
+                    column.tree,
+                    column.ruin,
+                    column.cave,
+                    column.water,
+                )
             });
         let block = if block.plant() && !self.get(world, p - IVec3::Y).dirt() {
             Block::Air
@@ -584,6 +593,7 @@ impl World {
                                 None,
                                 self.nearby_ruin(cx, cz),
                                 self.cave_column(cx, cz),
+                                self.waterway_terrain_column(cx, cz),
                             )
                             .replaceable()
                         && self.waterway_column(cx, cz).is_none()
@@ -765,6 +775,7 @@ impl World {
         tree: Option<(i32, i32, i32)>,
         ruin: Option<IVec3>,
         cave: Option<(i32, i32)>,
+        water: Option<crate::hydrology::Column>,
     ) -> Block {
         if !(MIN_Y..=MAX_Y).contains(&p.y) {
             return if p.y < MIN_Y {
@@ -799,7 +810,7 @@ impl World {
                 return Block::Air;
             }
         }
-        if let Some(water) = self.waterway_block(p, height) {
+        if let Some(water) = water.and_then(|column| column.block(self, p, height)) {
             return water;
         }
         // A rare cave that actually intersects a submerged bed receives a falling
@@ -924,6 +935,7 @@ impl World {
                 self.tree(p.x, p.z),
                 self.nearby_ruin(p.x, p.z),
                 self.cave_column(p.x, p.z),
+                self.waterway_terrain_column(p.x, p.z),
             ),
         )
     }
@@ -933,6 +945,7 @@ impl World {
             tree: self.tree(x, z),
             ruin: self.nearby_ruin(x, z),
             cave: self.cave_column(x, z),
+            water: self.waterway_terrain_column(x, z),
         }
     }
     /// Prepare one column for both roof searches and ray occupancy queries.
@@ -979,6 +992,7 @@ impl World {
                 let t = self.tree(wx, wz);
                 let ruin = self.nearby_ruin(wx, wz);
                 let cave = self.cave_column(wx, wz);
+                let water = self.waterway_terrain_column(wx, wz);
                 for y in -1..=SIZE {
                     let p = IVec3::new(wx, base.y + y, wz);
                     let block = self
@@ -986,7 +1000,7 @@ impl World {
                         .get(&p.to_array())
                         .copied()
                         .or_else(|| self.chunks.get(&chunk(p)).map(|c| c[index(p)]))
-                        .unwrap_or_else(|| self.natural_column(p, h, t, ruin, cave));
+                        .unwrap_or_else(|| self.natural_column(p, h, t, ruin, cave, water));
                     blocks[((x + 1) + 18 * ((z + 1) + 18 * (y + 1))) as usize] =
                         self.supported_plant(p, block);
                 }
