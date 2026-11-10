@@ -27,6 +27,8 @@ pub struct Completed {
     pub revision: u64,
     pub blocks: Box<[Block]>,
     pub fluid_frontier: Vec<[i32; 3]>,
+    pub physics_frontier: Vec<[i32; 3]>,
+    pub roofs: HashMap<(i32, i32), i32>,
     pub mesh: Vec<Vertex>,
 }
 pub struct Workers {
@@ -65,11 +67,21 @@ impl Workers {
                             };
                             let halo = job.snapshot.halo(job.key);
                             let mut blocks = vec![Block::Air; 4096].into_boxed_slice();
+                            let mut physics_frontier = Vec::new();
                             for y in 0..SIZE {
                                 for z in 0..SIZE {
                                     for x in 0..SIZE {
-                                        blocks[(x + SIZE * (z + SIZE * y)) as usize] = halo
+                                        let block = halo
                                             [((x + 1) + 18 * ((z + 1) + 18 * (y + 1))) as usize];
+                                        blocks[(x + SIZE * (z + SIZE * y)) as usize] = block;
+                                        if matches!(
+                                            block,
+                                            Block::Sand | Block::Gravel | Block::Leaves
+                                        ) {
+                                            physics_frontier.push(
+                                                (job.key * SIZE + IVec3::new(x, y, z)).to_array(),
+                                            );
+                                        }
                                     }
                                 }
                             }
@@ -79,13 +91,18 @@ impl Workers {
                                 &halo,
                                 &job.snapshot.torch_mounts,
                             );
-                            crate::render::apply_sky_access(&job.snapshot, &mut mesh);
+                            let roofs =
+                                crate::render::light_chunk(&job.snapshot, job.key, &mut mesh);
+                            // Stable partition preserves triangle order within each pass.
+                            crate::render::prepare_chunk_mesh(&mut mesh);
                             if results
                                 .send(Completed {
                                     key: job.key,
                                     revision: job.revision,
                                     blocks,
                                     fluid_frontier: crate::fluid::exposed_frontier(job.key, &halo),
+                                    physics_frontier,
+                                    roofs,
                                     mesh,
                                 })
                                 .is_err()

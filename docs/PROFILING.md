@@ -508,3 +508,113 @@ Existing edit/resident precedence, cached/direct queries, skylight, fluid,
 hydrology and tree tests also pass. Release build, standard short-format Clippy,
 formatting and whitespace checks pass. Golden fingerprints serialize blocks in
 stable halo order and use FNV-1a, independent of randomized hash-map iteration.
+
+
+## Movement dip investigation (2026-11-10)
+
+`tools/movement_review.rs` supplies two ignored diagnostic tests:
+
+```sh
+cargo nextest run --release --run-ignored ignored-only -E 'test(movement_cpu_review)'
+cargo nextest run --release --run-ignored ignored-only -E 'test(movement_render_review)'
+```
+
+Run them independently of other workloads. They write
+`target/movement-review.csv` and `target/movement-render-{mode}.csv` plus companion
+`.gpu.csv` files. Both use seed 314159 without accessing saves/settings. The CPU
+fixture settles radius-one terrain, grounds the player for thirty ticks, then
+records 120 fixed 60 Hz simulation ticks per mode over sixteen repetitions after
+one excluded warmup. Walking reverses after sixty ticks. CPU median/p95 ms:
+
+| Mode | Median | p95 |
+| --- | ---: | ---: |
+| Idle | 0.000541 | 0.148732 |
+| Walk | 0.000870 | 0.151050 |
+| Jump | 0.000636 | 0.149800 |
+| Walk and jump | 0.001171 | 0.160352 |
+
+Measured position ranges confirm actual movement and jumps. These full simulation
+ticks include periodic fluid/block physics; their tiny medians do not explain a
+160-to-130 FPS change (6.25 to 7.69 ms per frame) in this settled fixture.
+
+The render comparison uses four separate full-radius worlds, default TAA at
+1280x800, sixty initial idle frames, then walking/repeated jumps through frame
+359. It runs offscreen, one fixed simulation step per redraw, without presentation
+pacing. This is a short local diagnostic, not a native FPS benchmark or a reproduction
+of the player's save, resolution or scene. The sandboxed GPU attempt stalled and
+was interrupted; the GPU-enabled run completed in 6.033 seconds. Analysis excludes
+frames before 90. Stream/upload median/p95/max milliseconds:
+
+| Mode | Median | p95 | Max |
+| --- | ---: | ---: | ---: |
+| Idle | 0.1487 | 0.2028 | 0.4277 |
+| Walk | 0.1575 | 0.7351 | 4.7410 |
+| Jump | 0.1479 | 0.2242 | 0.6949 |
+| Walk and jump | 0.1575 | 0.7325 | 4.4683 |
+
+Walking crosses z=0 near frame 97 and triggers replanning. Both walking modes peak
+in stream/upload at frame 104 while accepting new chunks. Draw preparation also
+has a roughly ten-millisecond outlier at frame 103 in both walking modes; its
+specific sub-operation has not been isolated. Independently budgeted chunk
+acceptance, dispatch and GPU uploads, plus frontier maintenance, can accumulate
+within one redraw. The phase evidence supports streaming as a contributor to
+movement stutters, without establishing it as the cause of every reported dip.
+The idle and jump modes also have periodic remesh work from normal simulation.
+
+Only four to eight valid GPU timestamp rows per mode remain after the frame cut,
+because asynchronous timestamp slots can be exhausted by the unpaced loop.
+Their GPU-total medians range from 0.761 to 0.801 ms. This sparse coverage cannot
+rule out transient GPU stalls, but provides no evidence of a sustained jump-only
+GPU cost here. Native pacing and a longer route through the affected scene remain
+unmeasured. No gameplay or rendering optimization was applied based on this run.
+
+Validation: 153 quiet nextest tests pass, with the two diagnostics skipped by
+default; both diagnostics pass separately in release mode. Standard short-format
+Clippy is clean. All-target Clippy reports existing warnings in unrelated tests;
+none originate in the new helper. Formatting and whitespace checks pass.
+
+
+## Streaming spike reduction (2026-11-10)
+
+Additional test-only phase counters isolated the largest stream/upload spike to
+frontier maintenance: 3.545/3.712 ms in walking/walking-jumping, while uploads in
+those frames took 0.688/0.684 ms. Moving physics scanning and stable vertex sorting
+to workers and sharing the CPU/upload budgets alone did not remove the peak.
+The final change also supplies worker-computed 18x18 roof halos, sharing lighting
+column samples, and skips frontier traversal when readiness and roofs are unchanged.
+See [DESIGN.md](DESIGN.md) for cache/revision rules and soft-budget limitations.
+
+Preserved baseline CSVs are in `target/movement-streaming-before/`. Intermediate
+runs are in `movement-streaming-after-{1,2}/`, and two sequential final runs in
+`target/movement-streaming-final-{1,2}/`. All use the same release offscreen test,
+seed 314159, 1280x800/default TAA, and frames 90 through 359 for this comparison.
+The final profiles also include `.stream.csv` breakdowns. Stream/upload wall time
+median / p95 / max, milliseconds:
+
+| Mode | Before | Final run 1 | Final run 2 |
+| --- | ---: | ---: | ---: |
+| Idle | 0.1487 / 0.2028 / 0.4277 | 0.0009 / 0.1215 / 1.7316 | 0.0008 / 0.0879 / 0.2474 |
+| Walk | 0.1575 / 0.7351 / 4.7410 | 0.1981 / 0.5333 / 2.0299 | 0.1931 / 0.6131 / 1.4336 |
+| Jump | 0.1480 / 0.2242 / 0.6949 | 0.0009 / 0.0979 / 0.1849 | 0.0008 / 0.0968 / 0.1784 |
+| Walk and jump | 0.1576 / 0.7325 / 4.4683 | 0.1932 / 0.4852 / 1.9849 | 0.2059 / 0.5792 / 1.5488 |
+
+Walking-mode peaks fell roughly 55–70% across the two final runs. Each baseline
+walking mode had two frames above 2 ms; final run 1 had one walking frame at
+2.030 ms and none walking/jumping, and run 2 had none. The idle run-1 outlier was
+CPU world work, demonstrating that the shared deadline is not a strict cap.
+
+This trades some worker throughput and cache traffic for lower main-thread peaks.
+Walking medians increased about 0.04–0.05 ms, while p95 decreased. At the final
+frame the baseline walking modes still had 24/22 queued-or-active jobs; final
+runs had 42/45 and 42/38. These are unpaced asynchronous loops, so backlog and
+wall time also depend on scheduling; this is not evidence of equal terrain
+throughput. Roof-halo computation adds worker work and the view-bounded cache
+stores more columns. No claim is made about native FPS or eliminating every
+stutter. Separate roughly 10 ms draw-preparation outliers remain in walking
+runs and were not addressed by this streaming change.
+
+Validation: 155 quiet nextest tests pass, including new exact worker roof/cap,
+lighting, mixed fluid/opaque mesh and physics frontier checks. Both final release
+GPU diagnostic runs passed. Standard short-format Clippy, formatting and whitespace
+checks pass. Existing cave frontier, edit invalidation, stale result rejection and
+asynchronous convergence tests continue to pass.

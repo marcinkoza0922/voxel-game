@@ -372,6 +372,8 @@ pub struct World {
     pub dirty: Vec<IVec3>,
     pub revision: u64,
     pub(crate) roof_dirty: HashSet<(i32, i32)>,
+    // Roof snapshots from this poll only; the renderer consumes them immediately.
+    pub(crate) stream_roofs: HashMap<(i32, i32), i32>,
     center: IVec3,
     radius: i32,
     desired: HashSet<IVec3>,
@@ -433,6 +435,7 @@ impl World {
             dirty: vec![],
             revision: 0,
             roof_dirty: HashSet::new(),
+            stream_roofs: HashMap::new(),
             center: IVec3::splat(i32::MAX),
             radius: -1,
             desired: HashSet::new(),
@@ -1117,6 +1120,20 @@ impl World {
         desired
     }
     pub fn stream(&mut self, pos: Vec3, radius: i32) -> Vec<IVec3> {
+        self.stream_until(
+            pos,
+            radius,
+            std::time::Instant::now() + std::time::Duration::from_millis(2),
+        )
+    }
+    /// Poll and dispatch without waiting; stop between chunks at the shared deadline.
+    pub(crate) fn stream_until(
+        &mut self,
+        pos: Vec3,
+        radius: i32,
+        deadline: std::time::Instant,
+    ) -> Vec<IVec3> {
+        self.stream_roofs.clear();
         let c = chunk(pos.floor().as_ivec3());
         let mut removed = vec![];
         let radius = radius.max(0);
@@ -1203,9 +1220,8 @@ impl World {
         let workers = self
             .workers
             .get_or_insert_with(crate::streaming::Workers::new);
-        let accept_start = std::time::Instant::now();
         while self.meshes.len() < crate::streaming::UPLOAD_BACKLOG
-            && accept_start.elapsed() < std::time::Duration::from_millis(2)
+            && std::time::Instant::now() < deadline
         {
             let Some(result) = workers.receive() else {
                 break;
@@ -1233,17 +1249,8 @@ impl World {
             if !self.chunks.contains_key(&result.key) {
                 self.fluid_pending.extend(result.fluid_frontier);
             }
-            for (i, b) in result.blocks.iter().enumerate() {
-                if matches!(b, Block::Sand | Block::Gravel | Block::Leaves) {
-                    let p = result.key * SIZE
-                        + IVec3::new(
-                            i as i32 % SIZE,
-                            i as i32 / (SIZE * SIZE),
-                            i as i32 / SIZE % SIZE,
-                        );
-                    self.physics_pending.insert(p.to_array());
-                }
-            }
+            self.physics_pending.extend(result.physics_frontier);
+            self.stream_roofs.extend(result.roofs);
             self.chunks.insert(result.key, result.blocks);
             self.meshes.retain(|(key, _)| *key != result.key);
             self.meshes.push((result.key, result.mesh));
@@ -1254,10 +1261,9 @@ impl World {
                 .sort_by_key(|p| ((*p - c).length_squared(), p.x, p.y, p.z));
         }
         // A bounded backlog keeps workers running between redraws.
-        let dispatch_start = std::time::Instant::now();
         while self.plan_ready
             && self.active.len() < crate::streaming::MAX_OUTSTANDING
-            && dispatch_start.elapsed() < std::time::Duration::from_millis(2)
+            && std::time::Instant::now() < deadline
         {
             let Some(i) = self.pending.iter().position(|k| !self.active.contains(k)) else {
                 break;
@@ -1928,7 +1934,8 @@ mod tests {
         wait_for_chunk(&mut w, pos, key);
         assert_eq!(w.get(edit), Block::Planks);
         let data = w.meshes.iter().find(|(k, _)| *k == key).unwrap();
-        let expected = crate::render::mesh_chunk(&w, key);
+        let mut expected = crate::render::mesh_chunk(&w, key);
+        crate::render::prepare_chunk_mesh(&mut expected);
         assert_eq!(
             bytemuck::cast_slice::<_, u8>(&data.1),
             bytemuck::cast_slice::<_, u8>(&expected)
@@ -1943,6 +1950,46 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn streamed_physics_frontier_and_mixed_mesh_match_direct_queries() {
+        use std::collections::BTreeSet;
+        let mut w = World::new(42);
+        let key = IVec3::new(-1, 60, 1);
+        let base = key * SIZE;
+        for (offset, block) in [
+            Block::Sand,
+            Block::Gravel,
+            Block::Leaves,
+            Block::Water,
+            Block::Stone,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            w.set(base + IVec3::new(offset as i32 * 2, 2, 2), block);
+        }
+        // Discard the edit wakeups so this verifies the worker's scan alone.
+        w.physics_pending.clear();
+        wait_for_chunk(&mut w, (base + IVec3::splat(8)).as_vec3(), key);
+        let expected: BTreeSet<_> = (0..3)
+            .map(|i| (base + IVec3::new(i * 2, 2, 2)).to_array())
+            .collect();
+        let actual: BTreeSet<_> = w
+            .physics_pending
+            .iter()
+            .copied()
+            .filter(|p| chunk(IVec3::from_array(*p)) == key)
+            .collect();
+        assert_eq!(actual, expected);
+        let mut expected = crate::render::mesh_chunk(&w, key);
+        crate::render::prepare_chunk_mesh(&mut expected);
+        let actual = &w.meshes.iter().find(|(k, _)| *k == key).unwrap().1;
+        assert_eq!(
+            bytemuck::cast_slice::<_, u8>(actual),
+            bytemuck::cast_slice::<_, u8>(&expected)
+        );
     }
     #[test]
     fn resident_edit_remesh_survives_stream_replanning() {
@@ -1959,7 +2006,8 @@ mod tests {
             w.meshes.clear();
             w.stream(moved, 1);
             if let Some((_, mesh)) = w.meshes.iter().find(|(k, _)| *k == key) {
-                let expected = crate::render::mesh_chunk(&w, key);
+                let mut expected = crate::render::mesh_chunk(&w, key);
+                crate::render::prepare_chunk_mesh(&mut expected);
                 assert_eq!(
                     bytemuck::cast_slice::<_, u8>(mesh),
                     bytemuck::cast_slice::<_, u8>(&expected)
@@ -2000,7 +2048,8 @@ mod tests {
                 .all(|k| (k.x - key.x).abs() <= 1 && (k.z - key.z).abs() <= 1)
         );
         assert_eq!(w.chunks[&key][index(edit)], Block::Planks);
-        let expected = crate::render::mesh_chunk(&w, key);
+        let mut expected = crate::render::mesh_chunk(&w, key);
+        crate::render::prepare_chunk_mesh(&mut expected);
         let actual = &w.meshes.iter().find(|(k, _)| *k == key).unwrap().1;
         assert_eq!(
             bytemuck::cast_slice::<_, u8>(actual),

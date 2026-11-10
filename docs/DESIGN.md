@@ -32,7 +32,7 @@ The slice uses `winit 0.30`, `wgpu 27`, `glam` for primitive vector/matrix math,
 
 The initial ECS is a small, single-archetype component store: generational entity IDs index reusable slots containing position, health, level and AI cooldown. Creature behavior and physics run in explicit simulation systems. This is deliberately smaller than a general archetype/query framework. More component stores and scheduling can be added when multiple entity classes require them. Creatures are transient and respawn after loading; player state, discoveries, recipe counts, tool wear, torches, time and block edits persist.
 
-Terrain chunks are 16x16x16. Stream radius is ten chunks horizontally (160 blocks along each axis). Each horizontal chunk column samples all 256 terrain heights and streams from one chunk below its lowest surface through its highest surface plus tree canopy, without clamping mountains to player elevation. A five-by-five horizontal area additionally streams two chunks above/below the player for cave exploration. Streaming replans on player chunk or radius changes and evicts chunks outside the desired set. Jobs are ordered by distance with deterministic ties; obsolete mesh jobs are discarded and remaining mesh jobs reprioritized near the player. Two persistent CPU workers generate chunk blocks and meshes together from a shared one-block halo. At most 64 jobs, including completed results, are outstanding per world. Workers run continuously from that backlog between redraws; completed results and pending GPU uploads each have a 32-mesh capacity. Result acceptance, snapshot dispatch and GPU uploads each have a two-millisecond soft budget per call, stopping between whole chunks. Workers receive immutable seed/local-edit snapshots and never access authoritative state or GPU resources. The main thread polls without waiting, accepts only still-desired results matching the current edit revision, and retries invalidated jobs. Revision checks are conservatively world-wide: unrelated edits can also trigger retries. Evicted results are discarded. Pending resident remeshes survive stream replanning; boundary edits invalidate diagonal neighbors for AO. Worker channels close and threads join on world destruction, bounded by outstanding jobs. A dedicated planner computes terrain column bounds and desired chunk sets, with one outstanding request/result; obsolete plans are rejected and the latest view is requested next. Priority sorting, edit snapshot copying, residency updates and GPU uploads remain synchronous. Sampling is deterministic whether or not a chunk is resident. Surface relief is regional: flat plains have at most three blocks of underlying relief, hills rise to roughly 66, mountains to roughly 326, and very rare mega mountains can approach 1,376. Mountain growth is suppressed near spawn. The full legal range is -512..1535. Mountain surfaces within the view radius can render at any generated elevation. Horizontal fog fades between 112 and 160 blocks; the camera far plane is 1,024 blocks to include tall nearby peaks. Conservative chunk AABB tests independently cull camera and sun-shadow draws. CPU meshing uses a one-block halo with shared column height/tree data (324 column evaluations instead of up to 5,832 for an unloaded halo), shared-face culling and diagonal-aware corner AO. LOD and greedy meshing remain future performance work; this iteration retains exact voxel geometry and existing voxel geometry/save format compatibility. Rendering uses a 2048-square sun depth map with 3x3 comparison filtering, a day/night intensity cycle, fog, and the nearest sixteen warm torch lights. Held torches occupy one light slot. Placed torches expire after 600 simulation seconds, and placement is capped at 256 active torches.
+Terrain chunks are 16x16x16. Stream radius is ten chunks horizontally (160 blocks along each axis). Each horizontal chunk column samples all 256 terrain heights and streams from one chunk below its lowest surface through its highest surface plus tree canopy, without clamping mountains to player elevation. A five-by-five horizontal area additionally streams two chunks above/below the player for cave exploration. Streaming replans on player chunk or radius changes and evicts chunks outside the desired set. Jobs are ordered by distance with deterministic ties; obsolete mesh jobs are discarded and remaining mesh jobs reprioritized near the player. Two persistent CPU workers generate chunk blocks and meshes together from a shared one-block halo. At most 64 jobs, including completed results, are outstanding per world. Workers run continuously from that backlog between redraws; completed results and pending GPU uploads each have a 32-mesh capacity. Result acceptance and snapshot dispatch share a deadline, stopping between whole chunks. CPU-only polls allow two milliseconds; rendering reserves the first millisecond for CPU streaming and uploads until a shared two-millisecond deadline. Frontier maintenance remains coherent in the same call and can overrun the soft deadline. Workers receive immutable seed/local-edit snapshots and never access authoritative state or GPU resources. The main thread polls without waiting, accepts only still-desired results matching the current edit revision, and retries invalidated jobs. Revision checks are conservatively world-wide: unrelated edits can also trigger retries. Evicted results are discarded. Pending resident remeshes survive stream replanning; boundary edits invalidate diagonal neighbors for AO. Worker channels close and threads join on world destruction, bounded by outstanding jobs. A dedicated planner computes terrain column bounds and desired chunk sets, with one outstanding request/result; obsolete plans are rejected and the latest view is requested next. Priority sorting, edit snapshot copying, residency updates and GPU uploads remain synchronous. Sampling is deterministic whether or not a chunk is resident. Surface relief is regional: flat plains have at most three blocks of underlying relief, hills rise to roughly 66, mountains to roughly 326, and very rare mega mountains can approach 1,376. Mountain growth is suppressed near spawn. The full legal range is -512..1535. Mountain surfaces within the view radius can render at any generated elevation. Horizontal fog fades between 112 and 160 blocks; the camera far plane is 1,024 blocks to include tall nearby peaks. Conservative chunk AABB tests independently cull camera and sun-shadow draws. CPU meshing uses a one-block halo with shared column height/tree data (324 column evaluations instead of up to 5,832 for an unloaded halo), shared-face culling and diagonal-aware corner AO. LOD and greedy meshing remain future performance work; this iteration retains exact voxel geometry and existing voxel geometry/save format compatibility. Rendering uses a 2048-square sun depth map with 3x3 comparison filtering, a day/night intensity cycle, fog, and the nearest sixteen warm torch lights. Held torches occupy one light slot. Placed torches expire after 600 simulation seconds, and placement is capped at 256 active torches.
 
 The owned GUI is an immediate-mode triangle builder with rectangle buttons, pointer hit regions, a built-in 5x7 font and resolution-aware scaling. The pack has a 27-slot backpack, nine real hotbar slots, shaped crafting, a recipe pattern guide, a furnace view and attribute allocation. Escape menus and lost focus pause simulation. Opening the pack pauses movement and survival while furnace processing continues. Crafting recipes are instant transactions; furnaces process automatically over five seconds per item. Tables and furnaces must be within three blocks. A wood bedroll recipe substitutes for the later wool economy. Leaves supply berries as a renewable slice food source. Husks provide combat and meat; animals and audio are deferred. All visuals are code-native voxel geometry and glyphs, so no asset authoring tools or generated raster assets were used.
 
@@ -975,9 +975,9 @@ short Clippy, formatting and diff checks pass.
 Two CPU mesh workers now consume a shared bounded job backlog continuously,
 with at most 64 outstanding jobs including completed results. Completed CPU
 results use a 32-slot blocking channel, and accepted meshes awaiting GPU upload
-are separately capped at 32. The main thread uses independent two-millisecond
-soft budgets for accepting results, dispatching snapshots and uploading meshes;
-budgets stop between whole chunks, so a single expensive chunk can overrun.
+are separately capped at 32. The initial implementation used independent two-millisecond soft budgets. The
+2026-11-10 movement follow-up below replaces those with shared deadlines; a
+single expensive chunk and coherent frontier maintenance can still overrun.
 Backpressure bounds memory while permitting many completions between redraws.
 World mesh output persists until consumed, replacing older queued meshes for the
 same key. Dirty meshes are removed before upload, and edit revision validation
@@ -1529,3 +1529,48 @@ implementation cover three seeds, negative boundaries, surface/subterranean and
 distant terrain. Existing direct/halo, lighting, fluid, resident/edit and hydrology
 equivalence tests remain in place. See [PROFILING.md](PROFILING.md) for before/after
 measurements and validation.
+
+### Movement performance diagnostics (2026-11-10)
+
+`tools/movement_review.rs` provides opt-in ignored nextest diagnostics for idle,
+walking, repeated jumping and walking/jumping comparisons. The CPU review settles
+radius-one terrain before timing 120 fixed simulation steps per mode, with sixteen
+measured repetitions and one excluded warmup. The render review settles the full
+view before profiling 360 offscreen frames per mode at 1280x800 with default TAA,
+including sixty initial idle frames. It records existing CPU phase/GPU timestamp
+CSVs and exercises normal streaming during movement. Both use separate seeded
+worlds without reading or writing player saves/settings. They are observations,
+not timing assertions; they are excluded from normal test runs. See
+[PROFILING.md](PROFILING.md) for commands, measurements and scope limitations.
+
+
+### Reducing movement streaming spikes (2026-11-10)
+
+Terrain workers now prepare physics wakeup positions while extracting chunk
+blocks and stably group opaque vertices before transparent vertices. The main
+thread accepts these lists and uploads already ordered geometry. Lighting and
+frontier roof calculations share each job's `SkyAccess` column samples. Each
+completed job supplies a full 18x18 roof halo, sufficient for every face of its
+chunk's streaming cap. Roof snapshots are accepted only after the same desired
+chunk and edit-revision checks as geometry; rejected jobs cannot populate the
+renderer cache. `World::stream_roofs` is cleared at each poll and drained by the
+renderer immediately. Renderer roof retention follows the existing bounded view
+cache, and authoritative edited columns still refresh/invalidate caps normally.
+This avoids cold terrain-column queries when newly uploaded chunks need caps.
+
+CPU acceptance and snapshot dispatch share a deadline rather than accumulating
+separate budgets. Rendering allows them the first millisecond, then uploads until
+two milliseconds from the start of the world update. CPU-only callers use a
+shared two-millisecond budget. These remain soft limits checked between chunks;
+planning acceptance, eviction, an individual chunk and frontier coherence can
+still overrun. Uploads retain time to make progress under result backpressure.
+Frontier masks are traversed only after readiness, eviction or roof changes.
+Frontier membership still follows GPU readiness, including empty chunks, and
+updates synchronously so the change cannot temporarily expose unstreamed caves.
+
+The movement diagnostic also writes `.stream.csv` phase breakdowns for roof
+invalidation, CPU world work/eviction, mesh uploads, and frontier maintenance.
+These extra renderer counters compile only in tests. Tests check mixed opaque/
+fluid mesh equality, physics wakeups from worker results, and exact roof/cap and
+vertex-light equivalence across edits and negative coordinates. Measurements and
+remaining limitations are in [PROFILING.md](PROFILING.md).

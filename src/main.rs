@@ -1018,3 +1018,7 @@ fn main() {
         std::process::exit(1);
     }
 }
+
+#[cfg(test)]
+#[path = "../tools/movement_review.rs"]
+mod movement_review;

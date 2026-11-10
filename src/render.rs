@@ -59,6 +59,8 @@ pub struct Renderer {
     gpu_profile: Option<crate::gpu_profile::GpuProfile>,
     pub profile_frame: u32,
     pub draw_times: [f64; 5],
+    #[cfg(test)]
+    pub stream_times: [f64; 4],
     #[cfg(feature = "native-upscalers")]
     native: crate::native_upscale::Native,
     last_draw: std::time::Instant,
@@ -624,6 +626,8 @@ impl Renderer {
             gpu_profile: None,
             profile_frame: 0,
             draw_times: [0.; 5],
+            #[cfg(test)]
+            stream_times: [0.; 4],
             #[cfg(feature = "native-upscalers")]
             native,
             last_draw: std::time::Instant::now(),
@@ -758,12 +762,24 @@ impl Renderer {
         }
     }
     pub fn update_world(&mut self, w: &mut World, pos: Vec3) {
+        let start = std::time::Instant::now();
         // Mining below an unchanged roof cannot change a frontier. Refresh only
         // edited block columns already referenced by the bounded roof cache.
         let changed = refresh_frontier_roofs(w, &mut self.frontier_roofs);
+        let mut refresh_frontiers = !changed.is_empty();
         invalidate_frontiers(&mut self.frontiers, &changed);
-        let removed = w.stream(pos, VIEW_RADIUS);
+        #[cfg(test)]
+        let roofs_done = std::time::Instant::now();
+        // Reserve the second millisecond for GPU uploads, so accepting a busy
+        // result queue cannot indefinitely starve visible chunk progress.
+        let removed = w.stream_until(
+            pos,
+            VIEW_RADIUS,
+            start + std::time::Duration::from_millis(1),
+        );
+        self.frontier_roofs.extend(w.stream_roofs.drain());
         if !removed.is_empty() {
+            refresh_frontiers = true;
             let center = crate::world::chunk(pos.floor().as_ivec3());
             self.frontier_roofs.retain(|&(x, z), _| {
                 (x.div_euclid(SIZE) - center.x).abs() <= VIEW_RADIUS + 1
@@ -775,14 +791,15 @@ impl Renderer {
             self.ready_chunks.remove(&k);
             self.frontiers.remove(&k);
         }
-        let upload_start = std::time::Instant::now();
-        while !w.meshes.is_empty() && upload_start.elapsed() < std::time::Duration::from_millis(2) {
-            let (k, mut data) = w.meshes.remove(0);
+        #[cfg(test)]
+        let world_done = std::time::Instant::now();
+        let deadline = start + std::time::Duration::from_millis(2);
+        while !w.meshes.is_empty() && std::time::Instant::now() < deadline {
+            let (k, data) = w.meshes.remove(0);
             if !w.loaded(k) {
                 continue;
             }
-            self.ready_chunks.insert(k);
-            data.sort_by_key(|v| v.tile[2] < -4.5);
+            refresh_frontiers |= self.ready_chunks.insert(k);
             let opaque_count = data.partition_point(|v| v.tile[2] >= -4.5) as u32;
             if data.is_empty() {
                 self.meshes.remove(&k);
@@ -803,30 +820,44 @@ impl Renderer {
                 );
             }
         }
+        #[cfg(test)]
+        let uploads_done = std::time::Instant::now();
         // Empty meshes are ready too: an all-air cave chunk must not be sealed
         // merely because it has no triangles. Rebuild only changed frontiers.
-        for &key in &self.ready_chunks {
-            let mask = frontier_mask(&self.ready_chunks, key);
-            if mask == 0 {
-                self.frontiers.remove(&key);
-                continue;
+        if refresh_frontiers {
+            for &key in &self.ready_chunks {
+                let mask = frontier_mask(&self.ready_chunks, key);
+                if mask == 0 {
+                    self.frontiers.remove(&key);
+                    continue;
+                }
+                if self.frontiers.get(&key).is_some_and(|f| f.mask == mask) {
+                    continue;
+                }
+                let data = mesh_frontier_cached(w, key, mask, &mut self.frontier_roofs);
+                let mesh = (!data.is_empty()).then(|| Mesh {
+                    buffer: self
+                        .device
+                        .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                            label: Some("Underground streaming frontier"),
+                            contents: bytemuck::cast_slice(&data),
+                            usage: wgpu::BufferUsages::VERTEX,
+                        }),
+                    count: data.len() as u32,
+                    opaque_count: data.len() as u32,
+                });
+                self.frontiers.insert(key, Frontier { mask, mesh });
             }
-            if self.frontiers.get(&key).is_some_and(|f| f.mask == mask) {
-                continue;
-            }
-            let data = mesh_frontier_cached(w, key, mask, &mut self.frontier_roofs);
-            let mesh = (!data.is_empty()).then(|| Mesh {
-                buffer: self
-                    .device
-                    .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                        label: Some("Underground streaming frontier"),
-                        contents: bytemuck::cast_slice(&data),
-                        usage: wgpu::BufferUsages::VERTEX,
-                    }),
-                count: data.len() as u32,
-                opaque_count: data.len() as u32,
-            });
-            self.frontiers.insert(key, Frontier { mask, mesh });
+        }
+        #[cfg(test)]
+        {
+            self.stream_times = [
+                roofs_done.duration_since(start),
+                world_done.duration_since(roofs_done),
+                uploads_done.duration_since(world_done),
+                uploads_done.elapsed(),
+            ]
+            .map(|d| d.as_secs_f64() * 1000.);
         }
     }
     fn profile_phase(&mut self, start: &mut Option<std::time::Instant>, phase: usize) {
@@ -1640,6 +1671,11 @@ fn chunk_visible(view: Mat4, key: IVec3) -> bool {
         })
     })
 }
+/// Group opaque triangles before transparent ones while retaining pass order.
+pub(crate) fn prepare_chunk_mesh(mesh: &mut [Vertex]) {
+    mesh.sort_by_key(|v| v.tile[2] < -4.5);
+}
+
 #[cfg(test)]
 pub fn mesh_chunk(w: &World, k: IVec3) -> Vec<Vertex> {
     let mut mesh = mesh_halo(w.seed, k, &w.halo(k), &w.torch_mounts);
@@ -1656,6 +1692,12 @@ struct SkyAccess<'a> {
     exposure: HashMap<IVec3, f32>,
 }
 impl SkyAccess<'_> {
+    fn light_mesh(&mut self, mesh: &mut [Vertex]) {
+        for vertex in mesh {
+            let sample = Vec3::from_array(vertex.pos) + Vec3::from_array(vertex.normal) * 0.02;
+            vertex.sky_access = self.sample(sample.floor().as_ivec3());
+        }
+    }
     fn open_sky(&mut self, cell: IVec3) -> bool {
         let column = self
             .columns
@@ -1740,10 +1782,31 @@ pub fn apply_sky_access(w: &World, mesh: &mut [Vertex]) {
         opaque: HashMap::new(),
         exposure: HashMap::new(),
     };
-    for vertex in mesh {
-        let sample = Vec3::from_array(vertex.pos) + Vec3::from_array(vertex.normal) * 0.02;
-        vertex.sky_access = sky.sample(sample.floor().as_ivec3());
+    sky.light_mesh(mesh);
+}
+
+/// Workers reuse lighting columns and supply the full chunk/neighbor roof halo,
+/// so newly uploaded frontiers do not synchronously sample terrain columns.
+pub(crate) fn light_chunk(w: &World, key: IVec3, mesh: &mut [Vertex]) -> HashMap<(i32, i32), i32> {
+    let mut sky = SkyAccess {
+        world: w,
+        columns: HashMap::new(),
+        opaque: HashMap::new(),
+        exposure: HashMap::new(),
+    };
+    sky.light_mesh(mesh);
+    let base = key * SIZE;
+    let mut roofs = HashMap::with_capacity(18 * 18);
+    for x in base.x - 1..=base.x + SIZE {
+        for z in base.z - 1..=base.z + SIZE {
+            let column = sky
+                .columns
+                .entry((x, z))
+                .or_insert_with(|| w.sky_column(x, z));
+            roofs.insert((x, z), column.roof);
+        }
     }
+    roofs
 }
 pub fn mesh_halo(
     seed: u64,
@@ -2449,6 +2512,35 @@ fn held_model(out: &mut Vec<Vertex>, g: &Game) {
 #[cfg(test)]
 mod sky_tests {
     use super::*;
+
+    #[test]
+    fn worker_roofs_cover_frontiers_and_preserve_lighting_after_edits() {
+        let mut world = World::new(42);
+        let key = IVec3::new(-1, 2, 0);
+        let edit = IVec3::new(-1, 70, 4);
+        for block in [Block::Air, Block::Stone, Block::Air] {
+            world.set(edit, block);
+            let mut mesh = mesh_halo(world.seed, key, &world.halo(key), &world.torch_mounts);
+            let mut expected = mesh.clone();
+            apply_sky_access(&world, &mut expected);
+            let mut roofs = light_chunk(&world, key, &mut mesh);
+            assert_eq!(
+                bytemuck::cast_slice::<_, u8>(&mesh),
+                bytemuck::cast_slice::<_, u8>(&expected)
+            );
+            assert_eq!(roofs.len(), 18 * 18);
+            assert_eq!(roofs[&(edit.x, edit.z)], world.sky_roof(edit.x, edit.z));
+            for frontier in [key, key - IVec3::Y * 4] {
+                let cached = mesh_frontier_cached(&world, frontier, 63, &mut roofs);
+                let fresh = mesh_frontier(&world, frontier, 63);
+                assert_eq!(
+                    bytemuck::cast_slice::<_, u8>(&cached),
+                    bytemuck::cast_slice::<_, u8>(&fresh)
+                );
+                assert_eq!(roofs.len(), 18 * 18, "no synchronous roof queries needed");
+            }
+        }
+    }
 
     #[test]
     fn frontier_cache_reuses_unchanged_roofs_and_preserves_distant_caps() {
