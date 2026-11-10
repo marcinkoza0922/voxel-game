@@ -471,9 +471,10 @@ bounds and use the regular mining, particles and world-drop systems. They break
 in 0.12 seconds by hand or tool without consuming tool durability. Tall grass
 drops one wheat seed at one in eight seeded coordinates; flowers always drop
 one item of their color. Breaking plants writes ordinary air edits so they stay
-removed across streaming and reload. Removing/changing their grass support also
-removes the plant. Sampling suppresses natural plants above legacy support edits.
-Flower items can be replanted on grass, and each crafts into one matching dye
+removed across streaming and reload. Removing their dirt support or replacing it with non-dirt
+removes the plant. Bare and grass-covered dirt both support plants. Sampling
+checks the actual supporting block, including natural outcrops and saved edits.
+Flower items can be replanted on either form of dirt, and each crafts into one matching dye
 in any personal/table crafting cell. Seeds and dyes are collectible ingredients;
 wheat cultivation and dye application remain future systems. Flowers, seeds and
 dyes have distinct inventory/drop icons; held flowers use the 3D plant mesh.
@@ -658,3 +659,36 @@ Shift disables this. Shift walking checks support at every horizontal collision
 substep on both axes and stops at ledges, including diagonal approaches. Space
 continues to provide manual jumping. Regression tests cover daylight, night, roofs,
 torches, automatic climbing, and diagonal edge protection.
+
+## Grassland detail
+
+Grassland keeps open sightlines, with existing tall-grass patches supplemented by
+meadow-clustered flowers and sparse berry shrubs between meadows. Existing flower
+colors, harvesting and planting rules remain in use. Low stone outcrops use one
+seeded candidate per 32-block cell (one third qualify), a small Manhattan-radius
+footprint, and a gentle grassland surface check. They use ordinary mineable stone;
+direct queries and chunk halo generation share the same rules. As with earlier
+terrain additions, untouched generated terrain changes while saved edits win.
+
+Small groups of up to three sheep appear on clear grassland surfaces near the
+player, checked every 18 seconds after the initial four-second delay. At most six
+sheep are active, independently of the hostile cap. They graze, wander slowly,
+avoid nearby players, step over terrain and never attack or block sleep. Sheep
+have 16 health and male/female names; males have small horns. Their code-native
+model has a woolly body, four animated legs and a lowered grazing head. They use
+the existing meat drop and cooking loop. Sheep, like other active creatures, are
+transient and despawn beyond 90 blocks; breeding, wool collection and persistent
+livestock are future work. No external assets or helper tools are required.
+
+
+## Plant soil support and future biome soils
+
+Plants require a dirt block directly below them, whether bare or grass-covered.
+Placement, direct sampling, chunk halos and support removal share this rule;
+stone, wood, sand and snow do not support plants. Switching between bare and
+covered dirt preserves plants.
+
+Future biomes may have differently colored dirt blocks. These variants should
+function like ordinary dirt, including plant support, grass cover, digging and
+placement behavior. Color is a biome distinction rather than a separate soil
+mechanic. Biome-specific dirt colors are planned, not implemented yet.

@@ -324,8 +324,8 @@ impl Game {
                 if adjacent == hit || self.world.get(adjacent) != Block::Air {
                     return;
                 }
-                if block.plant() && self.world.get(adjacent - IVec3::Y) != Block::Grass {
-                    self.say("Flowers need grass-covered dirt beneath them");
+                if block.plant() && !self.world.get(adjacent - IVec3::Y).dirt() {
+                    self.say("Plants need dirt beneath them");
                     return;
                 }
                 let pos = Vec3::from_array(self.player.pos);
@@ -365,11 +365,9 @@ impl Game {
     }
     pub fn sleep(&mut self) {
         let p = Vec3::from_array(self.player.pos).floor().as_ivec3();
-        if self
-            .entities
-            .iter()
-            .any(|(_, m)| m.pos.distance(Vec3::from_array(self.player.pos)) < 12.)
-        {
+        if self.entities.iter().any(|(_, m)| {
+            m.kind.hostile() && m.pos.distance(Vec3::from_array(self.player.pos)) < 12.
+        }) {
             self.say("A hostile creature is too close to sleep");
             return;
         }
@@ -891,7 +889,54 @@ impl Game {
         self.spawn_timer -= dt;
         if self.spawn_timer <= 0. {
             self.spawn_timer = 18.;
-            if self.entities.iter().count() < 5 {
+            if self
+                .entities
+                .iter()
+                .filter(|(_, m)| !m.kind.hostile())
+                .count()
+                < 6
+            {
+                let h = crate::world::hash(
+                    self.world.seed ^ 0x7368656570,
+                    (self.time * 10000.) as i32,
+                    0,
+                    0,
+                );
+                let angle = (h % 628) as f32 / 100.;
+                let remaining = 6 - self
+                    .entities
+                    .iter()
+                    .filter(|(_, m)| !m.kind.hostile())
+                    .count();
+                for member in 0..remaining.min(3) as i32 {
+                    let x = (player.x + angle.sin() * 26.) as i32 + member * 2;
+                    let z = (player.z + angle.cos() * 26.) as i32;
+                    let y = self.world.height(x, z) + 1;
+                    let pos = Vec3::new(x as f32 + 0.5, y as f32 + 0.01, z as f32 + 0.5);
+                    if self.world.biome(x, z) == Biome::Grassland
+                        && self.world.get(IVec3::new(x, y - 1, z)) == Block::Grass
+                        && !collides(&self.world, pos)
+                    {
+                        self.entities.spawn(Mob {
+                            kind: MobKind::Sheep {
+                                male: member % 2 == 0,
+                            },
+                            pos,
+                            health: 16.,
+                            cooldown: 0.,
+                            level: 1,
+                        });
+                    }
+                }
+            }
+
+            if self
+                .entities
+                .iter()
+                .filter(|(_, m)| m.kind.hostile())
+                .count()
+                < 5
+            {
                 let n = (self.time * 10000.) as i32;
                 let h = crate::world::hash(self.world.seed, n, 0, 0);
                 let angle = (h % 628) as f32 / 100.;
@@ -931,13 +976,28 @@ impl Game {
             mob.cooldown = (mob.cooldown - dt).max(0.);
             let diff = player - mob.pos;
             let dist = diff.length();
-            if dist < 18. && dist > 1.4 {
-                let speed = if matches!(mob.kind, MobKind::Guardian(_)) {
+            let sheep = !mob.kind.hostile();
+            let phase = self.time * 1200. + mob.pos.x * 0.07 + mob.pos.z * 0.05;
+            let direction = if sheep {
+                if dist < 3. {
+                    -diff
+                } else {
+                    Vec3::new(phase.sin(), 0., phase.cos())
+                }
+            } else {
+                diff
+            };
+            if (sheep && (dist < 3. || phase.sin() > 0.35)) || (!sheep && dist < 18. && dist > 1.4)
+            {
+                let speed = if sheep {
+                    0.65
+                } else if matches!(mob.kind, MobKind::Guardian(_)) {
                     2.2
                 } else {
                     1.7
                 };
-                let movement = Vec3::new(diff.x, 0., diff.z).normalize_or_zero() * dt * speed;
+                let movement =
+                    Vec3::new(direction.x, 0., direction.z).normalize_or_zero() * dt * speed;
                 for axis in [0, 2] {
                     let mut p = mob.pos;
                     p[axis] += movement[axis];
@@ -954,7 +1014,8 @@ impl Game {
             if !collides(&self.world, down) {
                 mob.pos = down;
             }
-            if dist < 1.8
+            if mob.kind.hostile()
+                && dist < 1.8
                 && mob.cooldown == 0.
                 && self
                     .world
@@ -1020,6 +1081,28 @@ pub fn collides(world: &World, pos: Vec3) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn sheep_are_passive_and_daylight_spawning_is_bounded() {
+        let mut g = Game::new(314159);
+        let pos = Vec3::from_array(g.player.pos);
+        g.entities.spawn(Mob {
+            kind: MobKind::Sheep { male: false },
+            pos: pos + Vec3::X,
+            health: 16.,
+            cooldown: 0.,
+            level: 1,
+        });
+        let health = g.player.health;
+        g.spawn_timer = 100.;
+        g.update_mobs(0.1);
+        assert_eq!(g.player.health, health);
+        assert!(g.entities.iter().all(|(_, m)| !m.kind.hostile()));
+        for _ in 0..20 {
+            g.spawn_timer = 0.;
+            g.update_mobs(0.);
+        }
+        assert!(g.entities.iter().filter(|(_, m)| !m.kind.hostile()).count() <= 6);
+    }
     #[test]
     fn spawning_requires_darkness_and_respects_torches() {
         let mut g = sky_fixture();

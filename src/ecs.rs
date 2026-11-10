@@ -8,12 +8,18 @@ pub struct Entity {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MobKind {
     Husk,
+    Sheep { male: bool },
     Guardian([i32; 3]),
 }
 impl MobKind {
+    pub fn hostile(self) -> bool {
+        !matches!(self, Self::Sheep { .. })
+    }
     pub fn name(self) -> &'static str {
         match self {
             Self::Husk => "Husk",
+            Self::Sheep { male: true } => "Sheep (male)",
+            Self::Sheep { male: false } => "Sheep (female)",
             Self::Guardian(_) => "Ruin guardian",
         }
     }

@@ -43,6 +43,9 @@ impl Block {
     pub fn solid(self) -> bool {
         !matches!(self, Self::Air | Self::Torch) && !self.plant()
     }
+    pub fn dirt(self) -> bool {
+        matches!(self, Self::Dirt | Self::Grass)
+    }
     pub fn plant(self) -> bool {
         matches!(self, Self::TallGrass | Self::Shrub) || self.flower_index().is_some()
     }
@@ -178,11 +181,16 @@ fn plant_hit(seed: u64, p: IVec3, block: Block, origin: Vec3, dir: Vec3, reach: 
 }
 pub fn vegetation_block(seed: u64, support: IVec3) -> Block {
     let h = vegetation_hash(seed, support);
-    // Keep flower abundance independent of the much sparser grass objects.
-    if !h.is_multiple_of(5) && (h >> 32).is_multiple_of(13) {
+    let meadow = noise(
+        seed ^ 0x6d656164,
+        support.x as f32 / 24.,
+        support.z as f32 / 24.,
+    );
+    // Flowers gather in meadows, with occasional blooms between them.
+    if !h.is_multiple_of(5) && (h >> 32).is_multiple_of(if meadow > 0.55 { 8 } else { 43 }) {
         return FLOWERS[((h >> 48) % 6) as usize];
     }
-    if (h >> 20).is_multiple_of(47) {
+    if meadow < 0.48 && (h >> 20).is_multiple_of(61) {
         return Block::Shrub;
     }
     let patch = noise(
@@ -469,6 +477,24 @@ impl World {
         if p.y > MIN_Y + 3 && cave.is_some_and(|(lo, hi)| (lo..=hi).contains(&p.y)) {
             return Block::Air;
         }
+        // Sparse, low outcrops: one candidate per 32-block cell, limited to gentle grassland.
+        if p.y >= height && p.y <= height + 2 && self.biome(p.x, p.z) == Biome::Grassland {
+            let cx = p.x.div_euclid(32);
+            let cz = p.z.div_euclid(32);
+            let h = hash(self.seed ^ 0x726f636b, cx, 0, cz);
+            if h.is_multiple_of(3) {
+                let rx = cx * 32 + 5 + ((h >> 8) % 22) as i32;
+                let rz = cz * 32 + 5 + ((h >> 24) % 22) as i32;
+                let distance = (p.x - rx).abs() + (p.z - rz).abs();
+                if distance <= 2 {
+                    let base = self.height(rx, rz);
+                    if (height - base).abs() <= 1 && p.y <= base + if distance == 0 { 2 } else { 1 }
+                    {
+                        return Block::Stone;
+                    }
+                }
+            }
+        }
         if p.y > height {
             if let Some((tx, ty, tz)) = tree {
                 if p.x == tx && p.z == tz && p.y <= ty + 5 {
@@ -533,12 +559,7 @@ impl World {
         )
     }
     fn supported_plant(&self, p: IVec3, b: Block) -> Block {
-        if b.plant()
-            && self
-                .edits
-                .get(&(p - IVec3::Y).to_array())
-                .is_some_and(|support| *support != Block::Grass)
-        {
+        if b.plant() && !self.get(p - IVec3::Y).dirt() {
             Block::Air
         } else {
             b
@@ -575,7 +596,7 @@ impl World {
         if !(MIN_Y + 1..=MAX_Y).contains(&p.y) {
             return false;
         }
-        if b != Block::Grass && self.get(p + IVec3::Y).plant() {
+        if !b.dirt() && self.get(p + IVec3::Y).plant() {
             self.set(p + IVec3::Y, Block::Air);
         }
         self.edits.insert(p.to_array(), b);
@@ -871,6 +892,29 @@ impl World {
 mod tests {
     use super::*;
     #[test]
+    fn grassland_outcrops_are_sparse_and_match_chunk_halos() {
+        let w = World::new(314159);
+        let mut rocks = Vec::new();
+        for x in -64..64 {
+            for z in -64..64 {
+                let p = IVec3::new(x, w.height(x, z) + 1, z);
+                if w.get(p) == Block::Stone {
+                    assert_eq!(w.biome(x, z), Biome::Grassland);
+                    rocks.push(p);
+                }
+            }
+        }
+        assert!(!rocks.is_empty() && rocks.len() < 128 * 128 / 50);
+        for p in rocks.iter().step_by(7) {
+            let key = chunk(*p);
+            let local = *p - key * SIZE;
+            assert_eq!(
+                w.halo(key)[((local.x + 1) + 18 * ((local.z + 1) + 18 * (local.y + 1))) as usize],
+                Block::Stone
+            );
+        }
+    }
+    #[test]
     fn cached_surface_plans_match_fresh_worlds_and_stay_bounded() {
         let mut cached = World::new(314159);
         for pos in [
@@ -1106,6 +1150,33 @@ mod expansion_tests {
 mod vegetation_tests {
     use super::*;
     #[test]
+    fn all_plants_require_dirt_in_queries_and_halos() {
+        let mut w = World::new(314159);
+        let p = IVec3::new(0, 100, 0);
+        for support in [
+            Block::Dirt,
+            Block::Grass,
+            Block::Stone,
+            Block::Sand,
+            Block::Snow,
+            Block::Log,
+            Block::Air,
+        ] {
+            for plant in [Block::TallGrass, Block::Shrub, Block::RedFlower] {
+                w.set(p - IVec3::Y, support);
+                w.set(p, plant);
+                let expected = if support.dirt() { plant } else { Block::Air };
+                assert_eq!(w.get(p), expected);
+                let local = p - chunk(p) * SIZE;
+                assert_eq!(
+                    w.halo(chunk(p))
+                        [((local.x + 1) + 18 * ((local.z + 1) + 18 * (local.y + 1))) as usize],
+                    expected
+                );
+            }
+        }
+    }
+    #[test]
     fn plants_are_non_solid_selectable_and_lose_support() {
         let mut w = World::new(314159);
         let p = IVec3::new(-16, 100, 16);
@@ -1149,6 +1220,8 @@ mod vegetation_tests {
         world.set(support, Block::Grass);
         world.set(support + IVec3::Y, Block::Shrub);
         world.set(support, Block::Dirt);
+        assert_eq!(world.get(support + IVec3::Y), Block::Shrub);
+        world.set(support, Block::Stone);
         assert_eq!(world.get(support + IVec3::Y), Block::Air);
     }
     #[test]

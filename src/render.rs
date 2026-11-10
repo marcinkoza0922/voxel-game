@@ -584,6 +584,52 @@ impl Renderer {
         for (_, m) in g.entities.iter() {
             let p = m.pos;
             let creature_start = dynamic.len();
+            if let crate::ecs::MobKind::Sheep { male } = m.kind {
+                box_mesh(
+                    &mut dynamic,
+                    p + Vec3::new(-0.36, 0.42, -0.49),
+                    Vec3::new(0.72, 0.65, 0.98),
+                    [0.86, 0.84, 0.75],
+                );
+                let grazing = (g.time * 1200. + p.x * 0.07 + p.z * 0.05).sin() <= 0.35;
+                let head_y = if grazing { 0.42 } else { 0.85 };
+                box_mesh(
+                    &mut dynamic,
+                    p + Vec3::new(-0.22, head_y, -0.76),
+                    Vec3::new(0.44, 0.39, 0.42),
+                    [0.42, 0.37, 0.31],
+                );
+                for x in [-0.29, 0.15] {
+                    for z in [-0.37, 0.22] {
+                        let step = (g.time * 6000. + x * 8. + z * 6.).sin() * 0.035;
+                        box_mesh(
+                            &mut dynamic,
+                            p + Vec3::new(x, step.max(0.), z),
+                            Vec3::new(0.14, 0.46, 0.16),
+                            [0.32, 0.29, 0.25],
+                        );
+                    }
+                }
+                for x in [-0.21, 0.13] {
+                    box_mesh(
+                        &mut dynamic,
+                        p + Vec3::new(x, head_y + 0.24, -0.775),
+                        Vec3::new(0.08, 0.07, 0.025),
+                        [0.08, 0.07, 0.06],
+                    );
+                }
+                if male {
+                    for x in [-0.3, 0.21] {
+                        box_mesh(
+                            &mut dynamic,
+                            p + Vec3::new(x, head_y + 0.25, -0.6),
+                            Vec3::new(0.09, 0.19, 0.16),
+                            [0.57, 0.49, 0.35],
+                        );
+                    }
+                }
+                continue;
+            }
             let guardian = matches!(m.kind, crate::ecs::MobKind::Guardian(_));
             box_mesh(
                 &mut dynamic,
