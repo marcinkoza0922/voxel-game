@@ -844,6 +844,9 @@ resolution; it is not labeled DLSS or FSR.
 `cargo run` remains SDK-free. `tools/run-native.sh` runs the same game with the
 `native-upscalers` Cargo feature, enabling actual NVIDIA NGX DLSS Super Resolution
 (and DLAA at 100%) and AMD FidelityFX FSR **2**, not frame generation or FSR 4.
+Use `tools/run-native.sh --release` for a release-optimized build; without that
+leading option the launcher uses the development profile. Remaining arguments
+are passed to the game, for example `tools/run-native.sh --release --new`.
 Selecting SDK upscalers in a build without the feature reports why unavailable
 and retains the working renderer. Unsupported GPUs/runtimes and invalid SDK
 render ranges are similarly reported instead of silently claiming SDK rendering.

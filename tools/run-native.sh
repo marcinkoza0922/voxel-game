@@ -2,6 +2,11 @@
 # Build/run with official native DLSS and FSR 2 SDKs; caches downloads in target/.
 set -euo pipefail
 cd "$(dirname "$0")/.."
+cargo_args=()
+if [[ "${1:-}" == "--release" ]]; then
+    cargo_args+=(--release)
+    shift
+fi
 SDK_CACHE="$PWD/target/native-sdk"
 mkdir -p "$SDK_CACHE"
 if [[ -z "${DLSS_SDK:-}" ]]; then
@@ -25,4 +30,4 @@ for library in "$DLSS_RUNTIME"/libnvidia-ngx-*.so.*; do
     ln -sf "$library" "$SDK_CACHE/runtime/${name%%.so.*}.so"
 done
 export LD_LIBRARY_PATH="$SDK_CACHE/runtime${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
-exec cargo run --features native-upscalers -- "$@"
+exec cargo run "${cargo_args[@]}" --features native-upscalers -- "$@"
