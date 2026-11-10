@@ -44,6 +44,7 @@ pub enum Block {
     FlowingLava(u8),
     Obsidian,
     Ice,
+    Gravel,
 }
 impl Block {
     pub fn solid(self) -> bool {
@@ -108,6 +109,7 @@ impl Block {
             Self::Furnace => [0.29, 0.31, 0.34],
             Self::Table => [0.49, 0.31, 0.16],
             Self::Torch => [1., 0.65, 0.18],
+            Self::Gravel => [0.52, 0.49, 0.44],
             Self::Sand => [0.76, 0.69, 0.47],
             Self::Bed => [0.63, 0.24, 0.20],
             Self::Iron => [0.59, 0.54, 0.49],
@@ -144,6 +146,7 @@ impl Block {
             Self::Furnace => "Furnace",
             Self::Table => "Crafting table",
             Self::Torch => "Torch",
+            Self::Gravel => "Gravel",
             Self::Sand => "Sand",
             Self::Bed => "Bedroll",
             Self::Iron => "Iron ore",
@@ -336,6 +339,7 @@ impl BlockQueries {
 pub struct World {
     pub seed: u64,
     pub edits: BTreeMap<[i32; 3], Block>,
+    pub(crate) physics_pending: std::collections::BTreeSet<[i32; 3]>,
     pub fluid_pending: std::collections::BTreeSet<[i32; 3]>,
     pub torch_mounts: BTreeMap<[i32; 3], [i32; 3]>,
     chunks: HashMap<IVec3, Box<[Block]>>,
@@ -395,6 +399,7 @@ impl World {
             edits: BTreeMap::new(),
             torch_mounts: BTreeMap::new(),
             fluid_pending: Default::default(),
+            physics_pending: Default::default(),
             chunks: HashMap::new(),
             pending: VecDeque::new(),
             dirty: vec![],
@@ -455,11 +460,10 @@ impl World {
         self.ruin_in_cell(x.div_euclid(256), z.div_euclid(256))
     }
     fn tree(&self, x: i32, z: i32) -> Option<(i32, i32, i32)> {
-        if self.biome(x, z) == Biome::Tundra {
-            return None;
-        }
         let tx = x.div_euclid(7);
         let tz = z.div_euclid(7);
+        let mut best = None;
+        let mut distance = i32::MAX;
         for a in tx - 1..=tx + 1 {
             for b in tz - 1..=tz + 1 {
                 let h = hash(self.seed ^ 834, a, 0, b);
@@ -470,9 +474,23 @@ impl World {
                 } else {
                     19
                 };
-                if h.is_multiple_of(chance) && (x - cx).abs() <= 2 && (z - cz).abs() <= 2 {
+                if h.is_multiple_of(chance)
+                    && self.biome(cx, cz) != Biome::Tundra
+                    && (x - cx).abs() <= 3
+                    && (z - cz).abs() <= 3
+                {
                     let height = self.height(cx, cz);
-                    if self.waterway_column(cx, cz).is_none()
+                    let root = IVec3::new(cx, height + 1, cz);
+                    if self
+                        .natural_column(
+                            root,
+                            height,
+                            None,
+                            self.nearby_ruin(cx, cz),
+                            self.cave_column(cx, cz),
+                        )
+                        .replaceable()
+                        && self.waterway_column(cx, cz).is_none()
                         && self
                             .pool_block(IVec3::new(cx, height, cz), height)
                             .is_none()
@@ -480,12 +498,16 @@ impl World {
                             .cave_column(cx, cz)
                             .is_some_and(|(lo, hi)| (lo..=hi).contains(&height))
                     {
-                        return Some((cx, height, cz));
+                        let d = (x - cx).pow(2) + (z - cz).pow(2);
+                        if d < distance {
+                            distance = d;
+                            best = Some((cx, height, cz));
+                        }
                     }
                 }
             }
         }
-        None
+        best
     }
     /// A column's cave interval, shared by direct queries and chunk generation.
     /// Features fit inside 160-block cells, including their entrance ramps.
@@ -614,11 +636,28 @@ impl World {
         }
         if p.y > height {
             if let Some((tx, ty, tz)) = tree {
-                if p.x == tx && p.z == tz && p.y <= ty + 5 {
+                let h = hash(self.seed ^ 0x74726565, tx, 0, tz);
+                let tall = 5 + (h % 5) as i32;
+                let dx = p.x - tx;
+                let dz = p.z - tz;
+                let dy = p.y - ty;
+                let branch_y = tall - 2;
+                let axis_x = h & 8 == 0;
+                let branch = dy == branch_y
+                    && if axis_x {
+                        dz == 0 && dx.abs() <= 2
+                    } else {
+                        dx == 0 && dz.abs() <= 2
+                    };
+                if (dx == 0 && dz == 0 && dy <= tall) || branch {
                     return Block::Log;
                 }
-                if (ty + 3..=ty + 6).contains(&p.y)
-                    && (p.x - tx).abs() + (p.z - tz).abs() + (p.y - ty - 4).abs() < 5
+                let radius = 2 + ((h >> 5) % 2) as i32;
+                let crown = dx.abs() + dz.abs() + (dy - tall + 1).abs();
+                if dy >= tall - 3
+                    && dy <= tall + 1
+                    && crown <= radius + 1
+                    && (crown <= 2 || !hash(h, dx, dy, dz).is_multiple_of(7))
                 {
                     return Block::Leaves;
                 }
@@ -750,6 +789,7 @@ impl World {
             self.set(p + IVec3::Y, Block::Air);
         }
         self.wake_fluid(p);
+        self.wake_physics(p);
         self.edits.insert(p.to_array(), b);
         if b != Block::Torch {
             self.torch_mounts.remove(&p.to_array());
@@ -979,14 +1019,18 @@ impl World {
             }
             self.pending.retain(|k| *k != result.key);
             for (i, b) in result.blocks.iter().enumerate() {
-                if b.fluid().is_some() {
+                if b.fluid().is_some() || matches!(b, Block::Sand | Block::Gravel | Block::Leaves) {
                     let p = result.key * SIZE
                         + IVec3::new(
                             i as i32 % SIZE,
                             i as i32 / (SIZE * SIZE),
                             i as i32 / SIZE % SIZE,
                         );
-                    self.fluid_pending.insert(p.to_array());
+                    if b.fluid().is_some() {
+                        self.fluid_pending.insert(p.to_array());
+                    } else {
+                        self.physics_pending.insert(p.to_array());
+                    }
                 }
             }
             self.chunks.insert(result.key, result.blocks);
@@ -1819,5 +1863,165 @@ mod sky_column_tests {
                 }
             }
         }
+    }
+}
+
+impl World {
+    pub(crate) fn wake_physics(&mut self, p: IVec3) {
+        self.physics_pending.insert(p.to_array());
+        for d in [
+            IVec3::X,
+            IVec3::NEG_X,
+            IVec3::Y,
+            IVec3::NEG_Y,
+            IVec3::Z,
+            IVec3::NEG_Z,
+        ] {
+            self.physics_pending.insert((p + d).to_array());
+        }
+    }
+
+    /// Bounded active frontier; one falling voxel step per 200ms pulse.
+    pub fn tick_block_physics(&mut self, center: IVec3, pulse: u32) {
+        let nearby: Vec<_> = self
+            .physics_pending
+            .iter()
+            .copied()
+            .filter(|p| (IVec3::from_array(*p) - center).abs().max_element() <= 64)
+            .collect();
+        let count = nearby.len();
+        let ready: Vec<_> = nearby
+            .into_iter()
+            .cycle()
+            .skip(if count == 0 {
+                0
+            } else {
+                pulse as usize * 256 % count
+            })
+            .take(count.min(256))
+            .collect();
+        let mut queries = BlockQueries::default();
+        let mut supported = HashSet::new();
+        let mut changes = Vec::new();
+        for key in ready {
+            self.physics_pending.remove(&key);
+            let p = IVec3::from_array(key);
+            let b = queries.get(self, p);
+            if matches!(b, Block::Sand | Block::Gravel) && p.y > MIN_Y + 1 {
+                let below = queries.get(self, p - IVec3::Y);
+                if below.replaceable() {
+                    changes.push((p, Block::Air));
+                    changes.push((p - IVec3::Y, b));
+                }
+            } else if b == Block::Leaves && supported.contains(&p) {
+                self.physics_pending.insert(key);
+            } else if b == Block::Leaves {
+                let mut seen = HashSet::from([p]);
+                let mut todo = VecDeque::from([p]);
+                let mut attached = false;
+                while let Some(q) = todo.pop_front() {
+                    for d in [
+                        IVec3::X,
+                        IVec3::NEG_X,
+                        IVec3::Y,
+                        IVec3::NEG_Y,
+                        IVec3::Z,
+                        IVec3::NEG_Z,
+                    ] {
+                        let n = q + d;
+                        match queries.get(self, n) {
+                            Block::Log => {
+                                attached = true;
+                                break;
+                            }
+                            Block::Leaves if seen.insert(n) => todo.push_back(n),
+                            _ => {}
+                        }
+                    }
+                    if attached || seen.len() >= 4096 {
+                        break;
+                    }
+                }
+                // Large unresolved components remain alive and retry later.
+                if attached || !todo.is_empty() {
+                    supported.extend(seen);
+                    self.physics_pending.insert(key);
+                } else if hash(self.seed ^ pulse as u64, p.x, p.y, p.z).is_multiple_of(16) {
+                    changes.push((p, Block::Air));
+                } else {
+                    self.physics_pending.insert(key);
+                }
+            }
+        }
+        drop(queries);
+        for (p, b) in changes {
+            self.set(p, b);
+        }
+    }
+}
+
+#[cfg(test)]
+mod vegetation_physics_tests {
+    use super::*;
+
+    #[test]
+    fn sediment_falls_and_keeps_its_material() {
+        for block in [Block::Sand, Block::Gravel] {
+            let mut w = World::new(41);
+            let p = IVec3::new(0, 200, 0);
+            w.set(p - IVec3::Y * 3, Block::Stone);
+            w.set(p - IVec3::Y, Block::Water);
+            w.set(p, block);
+            for tick in 0..30 {
+                w.tick_block_physics(p, tick);
+            }
+            assert_eq!(w.get(p), Block::Air);
+            assert_eq!(w.get(p - IVec3::Y * 2), block);
+        }
+    }
+
+    #[test]
+    fn leaves_follow_support_chains_and_decay_after_wood_is_removed() {
+        let mut w = World::new(41);
+        let p = IVec3::new(15, 200, -16);
+        w.set(p, Block::Log);
+        for x in 1..=8 {
+            w.set(p + IVec3::X * x, Block::Leaves);
+        }
+        for tick in 0..100 {
+            w.tick_block_physics(p, tick);
+        }
+        for x in 1..=8 {
+            assert_eq!(w.get(p + IVec3::X * x), Block::Leaves);
+        }
+        w.set(p, Block::Air);
+        w.tick_block_physics(p, 100);
+        assert!((1..=8).any(|x| w.get(p + IVec3::X * x) == Block::Leaves));
+        for tick in 101..600 {
+            w.tick_block_physics(p, tick);
+        }
+        for x in 1..=8 {
+            assert_eq!(w.get(p + IVec3::X * x), Block::Air);
+        }
+    }
+
+    #[test]
+    fn trees_have_varied_heights_and_roots_across_biomes() {
+        let w = World::new(41);
+        let mut roots = HashSet::new();
+        let mut heights = HashSet::new();
+        for x in (-400..400).step_by(3) {
+            for z in (-400..400).step_by(3) {
+                if let Some((tx, ty, tz)) = w.tree(x, z) {
+                    if roots.insert((tx, tz)) {
+                        assert_ne!(w.biome(tx, tz), Biome::Tundra);
+                        assert_eq!(w.get(IVec3::new(tx, ty + 1, tz)), Block::Log);
+                        heights.insert(5 + hash(w.seed ^ 0x74726565, tx, 0, tz) % 5);
+                    }
+                }
+            }
+        }
+        assert!(roots.len() > 100);
+        assert_eq!(heights.len(), 5);
     }
 }

@@ -1205,3 +1205,38 @@ column-cache, edit revision and resident-remesh checks.
 A separate 1,800-frame offscreen tour also completed successfully, including
 startup, relocation and final blocking settlement, with no queued/active work
 or pending uploads at exit (`target/performance-fix/headless.csv`).
+
+### Tree variation, pond banks and block physics
+
+Tree candidates are admitted by their root biome and terrain support, rather
+than the biome of each canopy column. Nearest-root selection gives trunks
+priority where neighboring crowns overlap. Root hashes vary oak height (five
+to nine blocks), branch orientation, crown radius and foliage gaps. Roots in
+water, cave openings, ruins and rock outcrops are rejected. Direct queries,
+lighting, worker generation and halos share the same tree geometry.
+
+Small ponds use perturbed elliptical shores and stepped shallow/deep beds.
+Water ponds mix patches of sand, gravel and dirt; lava retains stone containment.
+Cold ponds retain ice over water. Sand and gravel have distinct inventory items,
+placement, drops and procedural material tiles. New item variants are appended
+to preserve existing item ordering; serde names keep existing saves readable.
+Generated terrain changes also affect previously visited unedited terrain.
+
+A separate active block frontier runs every 200ms near the player (64-block
+range, at most 256 cells per pulse, rotating selection). Sand and gravel fall
+one voxel per pulse through replaceable blocks, including water; edits wake
+neighbors and fluid flow. Leaves search face-connected leaf chains for any log,
+including branch logs. Unsupported leaves have a one-in-sixteen decay chance
+per processed pulse; they disappear without drops. Searches share query and
+supported-leaf caches within a pulse, cap individual searches at 4096 cells,
+and conservatively retain unresolved large components for later checks.
+Supported leaves stay scheduled so removing wood eventually rechecks the entire
+canopy. Streamed sediment/leaves and restored edits seed the frontier. Simulation
+changes use normal world edits for persistence, mesh invalidation and lighting.
+
+Validation: quiet nextest regressions cover varied tree heights and valid roots,
+falling sand/gravel through water, leaf support across chunk boundaries and
+through long leaf chains, gradual decay after wood removal, irregular mixed
+pond sediment, and existing cold-pond/halo behavior. All 120 quiet nextest tests,
+short Clippy, formatting and diff checks pass. No visual window review was
+performed for these terrain changes.

@@ -550,6 +550,10 @@ impl Game {
         if self.fluid_timer <= 0. {
             self.fluid_timer += 0.2;
             self.fluid_pulse = self.fluid_pulse.wrapping_add(1);
+            self.world.tick_block_physics(
+                Vec3::from_array(self.player.pos).floor().as_ivec3(),
+                self.fluid_pulse,
+            );
             self.world.tick_fluids(
                 Vec3::from_array(self.player.pos).floor().as_ivec3(),
                 self.fluid_pulse.is_multiple_of(3),
@@ -910,12 +914,14 @@ impl Game {
                     Block::Smelter => Some(Item::Smelter),
                     Block::Copper => Some(Item::CopperOre),
                     Block::Coal => Some(Item::Coal),
-                    Block::Dirt | Block::Grass | Block::Sand | Block::Snow => Some(Item::Dirt),
+                    Block::Dirt | Block::Grass | Block::Snow => Some(Item::Dirt),
                     Block::Planks => Some(Item::Planks),
                     Block::Table => Some(Item::Table),
                     Block::Furnace => Some(Item::Furnace),
                     Block::Bed => Some(Item::Bed),
                     Block::Torch => Some(Item::Torch),
+                    Block::Sand => Some(Item::Sand),
+                    Block::Gravel => Some(Item::Gravel),
                     Block::Leaves => Some(Item::Berries),
                     _ => None,
                 }

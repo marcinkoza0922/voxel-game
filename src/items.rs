@@ -53,8 +53,10 @@ pub enum Item {
     IronWaterBucket,
     IronLavaBucket,
     Obsidian,
+    Sand,
+    Gravel,
 }
-pub const ITEMS: [Item; 49] = [
+pub const ITEMS: [Item; 51] = [
     Item::Log,
     Item::Planks,
     Item::Stick,
@@ -104,6 +106,8 @@ pub const ITEMS: [Item; 49] = [
     Item::IronWaterBucket,
     Item::IronLavaBucket,
     Item::Obsidian,
+    Item::Sand,
+    Item::Gravel,
 ];
 pub const FLOWER_ITEMS: [Item; 6] = [
     Item::RedFlower,
@@ -175,6 +179,8 @@ impl Item {
             Self::CopperWaterBucket => "Copper water bucket",
             Self::IronWaterBucket => "Iron water bucket",
             Self::IronLavaBucket => "Iron lava bucket",
+            Self::Sand => "Sand",
+            Self::Gravel => "Gravel",
             Self::Obsidian => "Obsidian",
             Self::WheatSeeds => "Wheat seeds",
             Self::RedFlower => "Red flower",
@@ -227,6 +233,8 @@ impl Item {
             Self::WhiteFlower => Block::WhiteFlower,
             Self::PinkFlower => Block::PinkFlower,
             Self::BlueFlower => Block::BlueFlower,
+            Self::Sand => Block::Sand,
+            Self::Gravel => Block::Gravel,
             Self::Obsidian => Block::Obsidian,
             Self::Log => Block::Log,
             Self::Planks => Block::Planks,

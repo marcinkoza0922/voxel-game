@@ -214,6 +214,7 @@ pub fn read(path: &Path) -> Result<Option<Game>, String> {
     g.world.edits = save.edits.into_iter().map(|e| (e.pos, e.block)).collect();
     for p in g.world.edits.keys().copied().collect::<Vec<_>>() {
         g.world.wake_fluid(glam::IVec3::from_array(p));
+        g.world.wake_physics(glam::IVec3::from_array(p));
     }
     if save.version < 3 && !save.furnaces.is_empty() {
         return Err("Legacy save contains unsupported placed furnace state".into());
