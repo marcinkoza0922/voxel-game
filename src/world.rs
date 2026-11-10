@@ -523,19 +523,18 @@ impl World {
         if p.y > MIN_Y + 3 && cave.is_some_and(|(lo, hi)| (lo..=hi).contains(&p.y)) {
             return Block::Air;
         }
-        // Sparse, low outcrops: one candidate per 32-block cell, limited to gentle grassland.
-        if p.y >= height && p.y <= height + 2 && self.biome(p.x, p.z) == Biome::Grassland {
-            let cx = p.x.div_euclid(32);
-            let cz = p.z.div_euclid(32);
+        // Keep each formation inside its cell so neighboring outcrops stay separated.
+        if p.y >= height && p.y <= height + 4 && self.biome(p.x, p.z) == Biome::Grassland {
+            let cx = p.x.div_euclid(48);
+            let cz = p.z.div_euclid(48);
             let h = hash(self.seed ^ 0x726f636b, cx, 0, cz);
             if h.is_multiple_of(3) {
-                let rx = cx * 32 + 5 + ((h >> 8) % 22) as i32;
-                let rz = cz * 32 + 5 + ((h >> 24) % 22) as i32;
-                let distance = (p.x - rx).abs() + (p.z - rz).abs();
-                if distance <= 2 {
+                let rx = cx * 48 + 10 + ((h >> 8) % 28) as i32;
+                let rz = cz * 48 + 10 + ((h >> 24) % 28) as i32;
+                let top = outcrop_top(h, p.x - rx, p.z - rz);
+                if top > 0 {
                     let base = self.height(rx, rz);
-                    if (height - base).abs() <= 1 && p.y <= base + if distance == 0 { 2 } else { 1 }
-                    {
+                    if (height - base).abs() <= 1 && p.y <= base + top {
                         return Block::Stone;
                     }
                 }
@@ -965,9 +964,63 @@ impl World {
     }
 }
 
+// Union of offset, elliptical lobes avoids the repeated diamond-and-cap silhouette.
+// Zero means outside the footprint; positive values are heights above the ground.
+fn outcrop_top(h: u64, mut x: i32, mut z: i32) -> i32 {
+    for _ in 0..((h >> 40) & 3) {
+        (x, z) = (-z, x);
+    }
+    if (h >> 42) & 1 != 0 {
+        x = -x;
+    }
+    let size = ((h >> 44) & 1) as i32;
+    let lobes: &[(i32, i32, i32, i32, i32)] = match (h >> 48) % 5 {
+        0 => &[(0, 0, 2 + size, 2, 3), (1, 0, 2, 2, 2)],
+        1 => &[(0, 0, 3 + size, 2 + size, 1), (-1, 0, 2, 2, 2)],
+        2 => &[(-1, 0, 3 + size, 1 + size, 2), (2, 0, 2, 1, 3)],
+        3 => &[(-2, 0, 1 + size, 2, 3), (2, 1, 1 + size, 2, 2)],
+        _ => &[(-2, -1, 2, 2, 2), (1, 1, 2 + size, 2, 3), (2, -2, 1, 1, 1)],
+    };
+    lobes.iter().fold(0, |top, &(cx, cz, rx, rz, height)| {
+        let distance = (x - cx).pow(2) * rz * rz + (z - cz).pow(2) * rx * rx;
+        let radius = rx * rx * rz * rz;
+        if distance > radius {
+            top
+        } else {
+            // Broad tops and uneven shoulders instead of a mandatory single-block peak.
+            top.max(height - i32::from(distance * 3 > radius * 2 && height > 1))
+        }
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn outcrop_shapes_have_distinct_footprints_and_broad_tops() {
+        let mut shapes = HashSet::new();
+        for family in 0..5_u64 {
+            for size in 0..2_u64 {
+                let h = (family << 48) | (size << 44);
+                let mut shape = Vec::new();
+                for x in -10..=10 {
+                    for z in -10..=10 {
+                        let top = outcrop_top(h, x, z);
+                        if top > 0 {
+                            assert!(x.abs() <= 5 && z.abs() <= 5);
+                            assert!((1..=3).contains(&top));
+                            shape.push((x, z, top));
+                        }
+                    }
+                }
+                let peak = shape.iter().map(|p| p.2).max().unwrap();
+                assert!(shape.iter().filter(|p| p.2 == peak).count() > 1);
+                shapes.insert(shape);
+            }
+        }
+        assert_eq!(shapes.len(), 10);
+    }
+
     #[test]
     fn grassland_outcrops_are_sparse_and_match_chunk_halos() {
         let w = World::new(314159);

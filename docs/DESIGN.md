@@ -665,8 +665,11 @@ torches, automatic climbing, and diagonal edge protection.
 Grassland keeps open sightlines, with existing tall-grass patches supplemented by
 meadow-clustered flowers and sparse berry shrubs between meadows. Existing flower
 colors, harvesting and planting rules remain in use. Low stone outcrops use one
-seeded candidate per 32-block cell (one third qualify), a small Manhattan-radius
-footprint, and a gentle grassland surface check. They use ordinary mineable stone;
+seeded candidate per 48-block cell (one third qualify), with centers inset ten
+blocks to keep neighboring formations apart. Five families of elliptical lobes
+produce rounded boulders, broad slabs, ridges, split rocks and uneven clusters,
+with seeded size, rotation and reflection variations and heights of one to three
+blocks. A gentle grassland surface check keeps them grounded. They use ordinary mineable stone;
 direct queries and chunk halo generation share the same rules. As with earlier
 terrain additions, untouched generated terrain changes while saved edits win.
 
