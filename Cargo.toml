@@ -42,3 +42,8 @@ opt-level = 1
 
 [profile.dev.package."*"]
 opt-level = 2
+
+# Preserve function names and call stacks for perf/flamegraph.
+[profile.release]
+debug = 1
+strip = false

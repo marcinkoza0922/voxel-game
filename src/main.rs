@@ -19,6 +19,8 @@ mod render;
 mod save;
 mod settings;
 mod streaming;
+#[path = "../tools/stress.rs"]
+mod stress;
 mod temporal;
 mod ui;
 mod world;
@@ -34,6 +36,7 @@ use winit::{
 };
 
 struct Options {
+    stress: bool,
     headless: bool,
     title: bool,
     settings_path: PathBuf,
@@ -52,6 +55,7 @@ struct Options {
 }
 fn options() -> Result<Options, String> {
     let mut o = Options {
+        stress: false,
         headless: false,
         title: false,
         settings_path: PathBuf::from("saves/settings.json"),
@@ -73,6 +77,7 @@ fn options() -> Result<Options, String> {
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
+            "--stress" => o.stress = true,
             "--headless" => o.headless = true,
             "--title" => o.title = true,
             "--settings" => {
@@ -117,7 +122,7 @@ fn options() -> Result<Options, String> {
             }
             "--help" | "-h" => {
                 println!(
-                    "Voxel Adventure\n  --headless     render offscreen without display/audio (default 240 frames)\n  --new          create a separate fresh save with a random seed\n  --seed N       seed for a new world (default 314159)\n  --save PATH    world file (default saves/world.json)\n  --smoke        headless gameplay/persistence check; uses a temporary save\n  --frames N     render N frames then save and exit\n  --capture PATH save final frame as PPM (defaults to 240 frames)\n  --tour         scripted camera relocations for streaming measurements\n  --playtest     run headless mechanics course and progression expedition\n  --expedition   run controlled headless progression expedition\n  --profile PATH write frame timings and chunk backlog as CSV\n  --mute         disable sound playback\n  --pack         start with the inventory open\n  --title        show title screen (also supports headless previews)\n  --settings PATH graphics settings JSON (default saves/settings.json)\n\nWASD move; mouse look; Space jump; double-tap W sprint; Shift walk\nLMB mine/attack; RMB place/eat/use; wheel or 1-9 select\nE inventory/crafting/stats; R sleep near bed; F5 save; Esc menu"
+                    "Voxel Adventure\n  --stress       CPU stress suite; --frames sets repetitions (default 12), --profile writes samples\n  --headless     render offscreen without display/audio (default 240 frames)\n  --new          create a separate fresh save with a random seed\n  --seed N       seed for a new world (default 314159)\n  --save PATH    world file (default saves/world.json)\n  --smoke        headless gameplay/persistence check; uses a temporary save\n  --frames N     render N frames then save and exit\n  --capture PATH save final frame as PPM (defaults to 240 frames)\n  --tour         scripted camera relocations for streaming measurements\n  --playtest     run headless mechanics course and progression expedition\n  --expedition   run controlled headless progression expedition\n  --profile PATH write frame timings and chunk backlog as CSV\n  --mute         disable sound playback\n  --pack         start with the inventory open\n  --title        show title screen (also supports headless previews)\n  --settings PATH graphics settings JSON (default saves/settings.json)\n\nWASD move; mouse look; Space jump; double-tap W sprint; Shift walk\nLMB mine/attack; RMB place/eat/use; wheel or 1-9 select\nE inventory/crafting/stats; R sleep near bed; F5 save; Esc menu"
                 );
                 std::process::exit(0);
             }
@@ -884,6 +889,13 @@ fn saved_worlds(current: &std::path::Path, settings: &std::path::Path) -> Vec<Pa
 
 fn run() -> Result<(), String> {
     let mut options = options()?;
+    if options.stress {
+        return stress::run(
+            options.seed,
+            options.frames.unwrap_or(12),
+            options.profile.as_deref(),
+        );
+    }
     if options.playtest {
         playtest::run()?;
         return expedition::run();

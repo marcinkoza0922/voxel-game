@@ -1388,36 +1388,25 @@ pub const SKY_REACH: i32 = 12;
 
 struct SkyAccess<'a> {
     world: &'a World,
-    roofs: HashMap<(i32, i32), i32>,
+    columns: HashMap<(i32, i32), crate::world::SkyColumn>,
     opaque: HashMap<IVec3, bool>,
     exposure: HashMap<IVec3, f32>,
 }
 impl SkyAccess<'_> {
     fn open_sky(&mut self, cell: IVec3) -> bool {
-        let w = self.world;
-        let roof = self.roofs.entry((cell.x, cell.z)).or_insert_with(|| {
-            let top = w
-                .edits
-                .keys()
-                .filter(|p| p[0] == cell.x && p[2] == cell.z)
-                .map(|p| p[1])
-                .max()
-                .unwrap_or(crate::world::MIN_Y)
-                .max(w.height(cell.x, cell.z) + 16);
-            (crate::world::MIN_Y..=top.min(crate::world::MAX_Y))
-                .rev()
-                .find(|y| {
-                    let b = w.get(IVec3::new(cell.x, *y, cell.z));
-                    b.solid() && b != Block::Leaves
-                })
-                .unwrap_or(crate::world::MIN_Y)
-        });
-        cell.y > *roof
+        let column = self
+            .columns
+            .entry((cell.x, cell.z))
+            .or_insert_with(|| self.world.sky_column(cell.x, cell.z));
+        cell.y > column.roof
     }
     fn blocked(&mut self, cell: IVec3) -> bool {
         *self.opaque.entry(cell).or_insert_with(|| {
-            let b = self.world.get(cell);
-            b.solid() && b != Block::Leaves
+            let column = self
+                .columns
+                .entry((cell.x, cell.z))
+                .or_insert_with(|| self.world.sky_column(cell.x, cell.z));
+            column.blocked(self.world, cell)
         })
     }
     fn sample(&mut self, cell: IVec3) -> f32 {
@@ -1444,6 +1433,11 @@ impl SkyAccess<'_> {
                     let direction = Vec3::new(x as f32, rise, z as f32).normalize();
                     for step in 1..SKY_REACH * 2 {
                         let distance = step as f32 * 0.5;
+                        let falloff = 1. - distance / SKY_REACH as f32;
+                        let candidate = 0.65 * falloff * falloff;
+                        if candidate <= value {
+                            break;
+                        }
                         let p = (cell.as_vec3() + Vec3::splat(0.5) + direction * distance)
                             .floor()
                             .as_ivec3();
@@ -1451,8 +1445,7 @@ impl SkyAccess<'_> {
                             break;
                         }
                         if self.open_sky(p) {
-                            let falloff = 1. - distance / SKY_REACH as f32;
-                            value = value.max(0.65 * falloff * falloff);
+                            value = candidate;
                             break;
                         }
                     }
@@ -1466,7 +1459,7 @@ impl SkyAccess<'_> {
 pub fn spawn_sky_light(world: &World, time: f32, pos: Vec3) -> f32 {
     let mut sky = SkyAccess {
         world,
-        roofs: HashMap::new(),
+        columns: HashMap::new(),
         opaque: HashMap::new(),
         exposure: HashMap::new(),
     };
@@ -1476,7 +1469,7 @@ pub fn spawn_sky_light(world: &World, time: f32, pos: Vec3) -> f32 {
 pub fn apply_sky_access(w: &World, mesh: &mut [Vertex]) {
     let mut sky = SkyAccess {
         world: w,
-        roofs: HashMap::new(),
+        columns: HashMap::new(),
         opaque: HashMap::new(),
         exposure: HashMap::new(),
     };
@@ -2205,6 +2198,90 @@ mod sky_tests {
         assert!(sky_cycle(0.5).0.y.abs() < 0.00001);
     }
     #[test]
+    fn optimized_skylight_matches_original_queries_and_rays() {
+        for seed in [42, 314159, 987654] {
+            let mut world = World::new(seed);
+            let y = world.height(-16, 16) + 30;
+            for x in -20..=0 {
+                for z in 12..=20 {
+                    world.set(IVec3::new(x, y + 3, z), Block::Stone);
+                }
+            }
+            world.set(IVec3::new(-16, y + 80, 16), Block::Leaves);
+            world.set(IVec3::new(-16, y + 90, 16), Block::Stone);
+            world.set(IVec3::new(-16, y + 90, 16), Block::Air);
+            let mut sky = SkyAccess {
+                world: &world,
+                columns: HashMap::new(),
+                opaque: HashMap::new(),
+                exposure: HashMap::new(),
+            };
+            // Reference roof uses the original direct World::get scan.
+            let mut roofs = HashMap::new();
+            for x in -32..=12 {
+                for z in 0..=32 {
+                    let top = world
+                        .edits
+                        .keys()
+                        .filter(|p| p[0] == x && p[2] == z)
+                        .map(|p| p[1])
+                        .max()
+                        .unwrap_or(crate::world::MIN_Y)
+                        .max(world.height(x, z) + 16)
+                        .min(crate::world::MAX_Y);
+                    let roof = (crate::world::MIN_Y..=top)
+                        .rev()
+                        .find(|&y| {
+                            let b = world.get(IVec3::new(x, y, z));
+                            b.solid() && b != Block::Leaves
+                        })
+                        .unwrap_or(crate::world::MIN_Y);
+                    assert_eq!(world.sky_roof(x, z), roof);
+                    roofs.insert((x, z), roof);
+                }
+            }
+            for x in -20..=0 {
+                for dy in [-50, 0, 2, 4] {
+                    let cell = IVec3::new(x, y + dy, 16);
+                    let open = |p: IVec3| p.y > roofs[&(p.x, p.z)];
+                    let mut expected: f32 = if open(cell) { 1. } else { 0. };
+                    if expected == 0. {
+                        for (dx, dz) in [
+                            (1, 0),
+                            (-1, 0),
+                            (0, 1),
+                            (0, -1),
+                            (1, 1),
+                            (1, -1),
+                            (-1, 1),
+                            (-1, -1),
+                        ] {
+                            for rise in [0., 0.5] {
+                                let dir = Vec3::new(dx as f32, rise, dz as f32).normalize();
+                                for step in 1..SKY_REACH * 2 {
+                                    let distance = step as f32 * 0.5;
+                                    let p = (cell.as_vec3() + Vec3::splat(0.5) + dir * distance)
+                                        .floor()
+                                        .as_ivec3();
+                                    let block = world.get(p);
+                                    if block.solid() && block != Block::Leaves {
+                                        break;
+                                    }
+                                    if open(p) {
+                                        let falloff = 1. - distance / SKY_REACH as f32;
+                                        expected = expected.max(0.65 * falloff * falloff);
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    assert_eq!(sky.sample(cell), expected, "seed={seed}, cell={cell}");
+                }
+            }
+        }
+    }
+    #[test]
     fn sky_access_blocks_caves_and_tracks_roof_edits() {
         let mut world = World::new(42);
         let y = world.height(0, 0) + 30;
@@ -2238,7 +2315,7 @@ mod sky_tests {
         }
         let mut sky = SkyAccess {
             world: &world,
-            roofs: HashMap::new(),
+            columns: HashMap::new(),
             opaque: HashMap::new(),
             exposure: HashMap::new(),
         };
@@ -2254,7 +2331,7 @@ mod sky_tests {
         }
         let mut sky = SkyAccess {
             world: &world,
-            roofs: HashMap::new(),
+            columns: HashMap::new(),
             opaque: HashMap::new(),
             exposure: HashMap::new(),
         };

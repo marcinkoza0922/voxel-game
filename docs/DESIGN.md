@@ -893,3 +893,119 @@ the title without advancing or saving the preview world. Combine `--settings`
 with an isolated preferences file to exercise graphics settings without changing
 normal preferences. Native debugging required an unrestricted driver run; a
 sandboxed native attempt crashed, while unrestricted FSR and DLSS completed.
+
+## CPU stress and sampling tools
+
+`cargo run --release -- --stress --frames 12 --profile target/cpu.csv`
+runs deterministic CPU workloads without creating a window, reading settings or
+accessing saves. `--seed` selects the terrain seed; `--frames` is the positive
+repetition count in this mode (default 12). One complete warmup is excluded.
+Samples rotate through four fixed surface locations, so distributions include
+terrain variation. CSV rows contain workload, repetition index, wall milliseconds
+and output units (halo cells, vertices, final fluid edits, or peak resident chunks).
+The console prints median/p95/max; timings are observations, not CI speed gates.
+
+`tools/stress.rs` measures halo generation, surface meshing, surface sky access,
+a synthetic checkerboard mesh, cave sky access, twelve fluid pulses from 512
+sources, and settled radius-one streaming through adjacent chunks and a distant
+teleport and return. Setup is outside each timer. Streaming includes planning,
+worker generation/lighting, polling and one-millisecond sleeps; it has a
+60-second deadline per repetition. Cave fixtures can be empty for some seeds;
+consult vertex units before comparing lighting timings. This is CPU coverage;
+it does not measure GPU execution, uploads or full render-radius throughput.
+
+`tools/profile-cpu.sh [output-directory] [repetitions]` builds release, records
+compiler/OS/git metadata, saves CSV and summaries, then attempts a separate
+`perf record --call-graph dwarf` run and writes a flat self-time report. Release
+builds retain line tables for symbolized stacks. Perf permission failures are
+reported in `perf-error.txt` while baseline timings remain available. For flame
+graphs, use `cargo flamegraph --release -- --stress --frames 12` where sampling
+permissions allow it. Sampling overhead is excluded from the baseline CSV.
+
+For end-to-end render profiling, existing `--headless --tour --frames 1800
+--save /tmp/unique-world.json --profile target/render.csv --settings
+/tmp/isolated-settings.json` exercises the full scripted route with isolated
+files (the save must not exist). `tools/analyze-profile.py target/render.csv`
+summarizes it. Headless tour relocation frames deliberately wait for terrain
+settlement; analyze these separately from steady frames. Draw timings measure
+CPU submission/presentation waits, not GPU timestamp durations.
+
+Validation (2026-11-09): formatting, short Clippy and all 110 quiet nextest
+tests pass. Release stress completed 24 measured repetitions after warmup.
+Final baseline median/p95 milliseconds: halo 0.636/0.828, surface mesh
+0.326/0.498, surface sky 5.287/19.083, checkerboard 1.437/1.878,
+cave sky 5.388/37.843, twelve fluid pulses 149.931/151.824, and four
+settled streaming relocations 164.044/168.869. These are local wall-time
+observations; earlier runs varied substantially with machine load. Output is
+in `target/performance/{cpu.csv,summary.txt,environment.txt}`. Perf recording
+was attempted with user-space cycles both sandboxed and unrestricted, but
+host performance-counter access was denied; no sampled call graph was obtained.
+
+The offscreen 1,800-frame tour completed outside the sandbox (the sandboxed
+attempt stalled and was interrupted). `target/performance-render.csv` contains
+all frames: CPU draw/submission median 0.363 ms, p95 1.326 ms; peak residency
+1,284 chunks; longest stream settlement 2,215.413 ms. This run overlapped an
+initial CPU stress pass, so treat it as stress coverage rather than an isolated
+render benchmark. Interval timings describe the preceding frame, so a settlement
+at frame 1620 appears in interval 1621. GPU timestamps were not collected.
+
+### Skylight CPU optimization
+
+`World::sky_roof` computes height, tree, ruin and cave metadata once per roof
+column, then reuses it while scanning downward. It preserves edit/resident-chunk
+precedence and the previous scan bounds. Edits are searched by the BTreeMap's
+x-coordinate range instead of scanning all edits for every roof. Plant support
+resolution is unnecessary here because plants cannot block skylight. Roofs remain
+cached only within one lighting operation, so edits cannot leave stale light.
+
+Indirect rays stop once their remaining distance-based contribution cannot
+exceed the brightest opening already found. Ray positions, wall checks and
+brightness rules are otherwise unchanged. A regression compares optimized roof
+queries and exposure against the original direct sampling and full ray traversal
+across three seeds, negative coordinates, cave depths, roof openings, leaves and
+removed high edits. All 111 quiet nextest tests, formatting and short Clippy pass.
+
+A fresh release comparison with 24 measured repetitions each (seed 314159) is
+in `target/performance/lighting-{before,after}.{csv,txt}`. Median/p95 ms changed:
+surface lighting 5.654/21.000 -> 1.214/8.991; cave lighting 6.288/39.734 ->
+2.368/15.680; settled streaming 170.369/175.045 -> 113.970/117.777. This is
+roughly 79% less median surface-lighting time, 62% less cave-lighting time and
+33% less streaming time on this machine. Unchanged workloads show some load
+variation, so these are local observations, not fixed performance guarantees.
+No new GPU measurement was needed: vertex exposure is checked for exact equality.
+
+Further candidates, not implemented: share procedural column metadata across
+occupancy ray queries, precompute ray offsets, and use a bounded dense occupancy
+cache in chunk workers. Persistent cross-mesh lighting caches would also need
+careful edit invalidation; current per-operation caches avoid that complexity.
+
+### Shared occupancy column metadata
+
+Skylight now stores `World::SkyColumn` values per horizontal coordinate for each
+lighting operation. Each value holds height, tree, ruin and cave inputs plus the
+roof result. Both roof scans and uncached ray occupancy cells use these inputs,
+avoiding repeated procedural metadata generation at different heights in the
+same column. Occupancy still checks authoritative edits first, resident chunks
+second, and procedural terrain last. Plants and leaves retain their previous
+light-transmission behavior. Caches are discarded after each operation, so this
+adds no persistent invalidation requirements or shared worker synchronization.
+
+The original roof/exposure equivalence test still passes. A new occupancy test
+compares direct world queries at negative, boundary and distant coordinates
+across three seeds, generated terrain, deliberately different resident chunks,
+and stone/air/leaf/water/plant edits. All 112 quiet nextest tests, short Clippy,
+formatting and diff checks pass.
+
+The fresh 24-repetition release comparison is recorded in
+`target/performance/occupancy-{before,after}.{csv,txt}`. Cave-lighting median/p95
+fell from 1.669/9.161 to 0.667/4.745 ms (60%/48% reduction). Surface lighting
+changed from 0.889/5.269 to 0.916/6.025 ms, with no demonstrated improvement;
+settled streaming changed from 94.985/101.296 to 102.851/118.247 ms. Other
+unchanged workloads also varied substantially between runs, so this result
+supports faster cave occupancy sampling, not an overall streaming speedup.
+Column metadata sharing is now implemented; precomputed ray offsets and bounded
+dense occupancy storage remain possible future work.
+A 48-repetition confirmation (`occupancy-after-confirm.{csv,txt}`) measured
+cave-lighting median 0.669 ms and p95 5.918 ms, surface median 0.853 ms,
+and streaming median 98.972 ms, reinforcing the cave improvement while
+showing continuing tail and machine-load variability.

@@ -267,6 +267,29 @@ pub struct Edit {
     pub block: Block,
 }
 
+/// Immutable procedural inputs shared by all skylight queries in a column.
+pub(crate) struct SkyColumn {
+    height: i32,
+    tree: Option<(i32, i32, i32)>,
+    ruin: Option<IVec3>,
+    cave: Option<(i32, i32)>,
+    pub roof: i32,
+}
+impl SkyColumn {
+    pub fn blocked(&self, world: &World, p: IVec3) -> bool {
+        let block = world
+            .edits
+            .get(&p.to_array())
+            .copied()
+            .or_else(|| world.chunks.get(&chunk(p)).map(|c| c[index(p)]))
+            .unwrap_or_else(|| {
+                world.natural_column(p, self.height, self.tree, self.ruin, self.cave)
+            });
+        // Plant support never changes whether a block is opaque.
+        block.solid() && block != Block::Leaves
+    }
+}
+
 pub struct World {
     pub seed: u64,
     pub edits: BTreeMap<[i32; 3], Block>,
@@ -602,6 +625,34 @@ impl World {
                 self.cave_column(p.x, p.z),
             ),
         )
+    }
+    /// Prepare one column for both roof searches and ray occupancy queries.
+    pub(crate) fn sky_column(&self, x: i32, z: i32) -> SkyColumn {
+        let mut column = SkyColumn {
+            height: self.height(x, z),
+            tree: self.tree(x, z),
+            ruin: self.nearby_ruin(x, z),
+            cave: self.cave_column(x, z),
+            roof: MIN_Y,
+        };
+        let top = self
+            .edits
+            .range([x, i32::MIN, i32::MIN]..=[x, i32::MAX, i32::MAX])
+            .filter(|(p, _)| p[2] == z)
+            .map(|(p, _)| p[1])
+            .max()
+            .unwrap_or(MIN_Y)
+            .max(column.height + 16)
+            .min(MAX_Y);
+        column.roof = (MIN_Y..=top)
+            .rev()
+            .find(|&y| column.blocked(self, IVec3::new(x, y, z)))
+            .unwrap_or(MIN_Y);
+        column
+    }
+    #[cfg(test)]
+    pub fn sky_roof(&self, x: i32, z: i32) -> i32 {
+        self.sky_column(x, z).roof
     }
     fn supported_plant(&self, p: IVec3, b: Block) -> Block {
         if b.plant() && !self.get(p - IVec3::Y).dirt() {
@@ -1515,6 +1566,49 @@ mod cave_tests {
                 world.get(IVec3::new(2, world.height(2, 2), 2)),
                 Block::Grass
             );
+        }
+    }
+}
+
+#[cfg(test)]
+mod sky_column_tests {
+    use super::*;
+
+    #[test]
+    fn cached_occupancy_matches_world_queries_with_edits_and_resident_chunks() {
+        for seed in [42, 314159, 987654] {
+            let mut world = World::new(seed);
+            for (x, z) in [(-17, -16), (0, 0), (255, 256)] {
+                let y = world.height(x, z);
+                for resident in [false, true] {
+                    if resident {
+                        // Deliberately different from procedural terrain to verify precedence.
+                        world.chunks.insert(
+                            chunk(IVec3::new(x, y, z)),
+                            vec![Block::Planks; 4096].into_boxed_slice(),
+                        );
+                    }
+                    for block in [
+                        Block::Stone,
+                        Block::Air,
+                        Block::Leaves,
+                        Block::Water,
+                        Block::RedFlower,
+                    ] {
+                        world.set(IVec3::new(x, y + 1, z), block);
+                        let column = world.sky_column(x, z);
+                        for dy in -64..=32 {
+                            let p = IVec3::new(x, y + dy, z);
+                            let expected = world.get(p);
+                            assert_eq!(
+                                column.blocked(&world, p),
+                                expected.solid() && expected != Block::Leaves,
+                                "seed={seed} p={p} resident={resident} edit={block:?}"
+                            );
+                        }
+                    }
+                }
+            }
         }
     }
 }
