@@ -26,6 +26,7 @@ pub struct Completed {
     pub key: IVec3,
     pub revision: u64,
     pub blocks: Box<[Block]>,
+    pub fluid_frontier: Vec<[i32; 3]>,
     pub mesh: Vec<Vertex>,
 }
 pub struct Workers {
@@ -84,6 +85,7 @@ impl Workers {
                                     key: job.key,
                                     revision: job.revision,
                                     blocks,
+                                    fluid_frontier: crate::fluid::exposed_frontier(job.key, &halo),
                                     mesh,
                                 })
                                 .is_err()
@@ -148,6 +150,7 @@ struct PlanRequest {
     center: IVec3,
     radius: i32,
     bounds: Bounds,
+    waterways: crate::hydrology::SharedCache,
 }
 pub struct Plan {
     pub center: IVec3,
@@ -171,6 +174,7 @@ impl Planner {
                 while let Ok(request) = requests.recv() {
                     let mut world = World::new(request.seed);
                     world.surface_bounds = request.bounds;
+                    world.waterways = request.waterways;
                     let desired = world.plan_surface(request.center, request.radius);
                     if results
                         .send(Plan {
@@ -192,7 +196,14 @@ impl Planner {
             thread: Some(thread),
         }
     }
-    pub fn request(&self, seed: u64, center: IVec3, radius: i32, bounds: Bounds) {
+    pub fn request(
+        &self,
+        seed: u64,
+        center: IVec3,
+        radius: i32,
+        bounds: Bounds,
+        waterways: crate::hydrology::SharedCache,
+    ) {
         self.sender
             .as_ref()
             .unwrap()
@@ -201,6 +212,7 @@ impl Planner {
                 center,
                 radius,
                 bounds,
+                waterways,
             })
             .unwrap_or_else(|_| panic!("terrain planner queue unavailable"));
     }

@@ -12,6 +12,35 @@ const NEIGHBORS: [IVec3; 6] = [
     IVec3::NEG_Y,
 ];
 
+/// Only exposed sources, contacts and existing flow need an initial pulse.
+/// The worker's halo includes neighboring chunks, even when they are unloaded.
+pub(crate) fn exposed_frontier(key: IVec3, halo: &[Block]) -> Vec<[i32; 3]> {
+    let at = |p: IVec3| halo[(p.x + 1 + 18 * (p.z + 1 + 18 * (p.y + 1))) as usize];
+    let mut frontier = Vec::new();
+    for y in 0..crate::world::SIZE {
+        for z in 0..crate::world::SIZE {
+            for x in 0..crate::world::SIZE {
+                let p = IVec3::new(x, y, z);
+                let Some((lava, level)) = at(p).fluid() else {
+                    continue;
+                };
+                let exposed = NEIGHBORS.iter().any(|d| {
+                    let b = at(p + *d);
+                    if let Some((kind, _)) = b.fluid() {
+                        kind != lava
+                    } else {
+                        *d != IVec3::Y && b.replaceable()
+                    }
+                });
+                if level != 0 || exposed {
+                    frontier.push((key * crate::world::SIZE + p).to_array());
+                }
+            }
+        }
+    }
+    frontier
+}
+
 impl World {
     pub fn fluid_at(&self, pos: glam::Vec3) -> Option<(bool, u8)> {
         let p = pos.floor().as_ivec3();
@@ -70,13 +99,21 @@ impl World {
 
     /// At most 512 frontier cells per pulse; distant frontiers sleep until approached.
     pub fn tick_fluids(&mut self, center: IVec3, lava_tick: bool) {
+        let cursor = self.fluid_cursor.unwrap_or([i32::MIN; 3]);
         let ready: Vec<_> = self
             .fluid_pending
-            .iter()
+            .range((
+                std::ops::Bound::Excluded(cursor),
+                std::ops::Bound::Unbounded,
+            ))
+            .chain(self.fluid_pending.range(..=cursor))
             .copied()
             .filter(|p| (IVec3::from_array(*p) - center).abs().max_element() <= 64)
             .take(512)
             .collect();
+        if let Some(&last) = ready.last() {
+            self.fluid_cursor = Some(last);
+        }
         let mut candidates = std::collections::BTreeSet::new();
         for key in ready {
             self.fluid_pending.remove(&key);
@@ -135,7 +172,8 @@ impl World {
                 let below = queries.get(self, p - IVec3::Y);
                 let renewable = !lava
                     && neighbors.iter().filter(|b| **b == Block::Water).count() >= 2
-                    && (below.solid() || below == Block::Water);
+                    && (below.solid() || below == Block::Water)
+                    && !self.natural_fall(p);
                 let level = if old == source || renewable {
                     Some(0)
                 } else if queries
@@ -151,7 +189,11 @@ impl World {
                             let n = p + *d;
                             let (kind, level) = queries.get(self, n).fluid()?;
                             let floor = queries.get(self, n - IVec3::Y);
-                            if kind != lava || !(floor.solid() || floor.fluid() == Some((lava, 0)))
+                            // A falling/flowing column landing in a pool must
+                            // join that pool, not spread a raised layer over it.
+                            if kind != lava
+                                || !(floor.solid()
+                                    || (level == 0 && floor.fluid() == Some((lava, 0))))
                             {
                                 return None;
                             }
@@ -188,83 +230,6 @@ impl World {
         }
     }
 
-    /// Inland lake pairs joined by a winding river, contained within 384-block cells.
-    /// A shared elevation keeps source water settled; beds and banks seal caves.
-    pub(crate) fn waterway_column(&self, px: i32, pz: i32) -> Option<(f32, i32)> {
-        let cx = px.div_euclid(384);
-        let cz = pz.div_euclid(384);
-        let h = hash(self.seed ^ 0x7269_7665, cx, 0, cz);
-        if !h.is_multiple_of(2) {
-            return None;
-        }
-        let x = cx * 384 + 144 + ((h >> 8) % 96) as i32;
-        let z = cz * 384 + 144 + ((h >> 24) % 96) as i32;
-        if x.abs() < 160 && z.abs() < 160 {
-            return None;
-        }
-        let (u, v) = if h & 4 == 0 {
-            (px - x, pz - z)
-        } else {
-            (pz - z, px - x)
-        };
-        if u.abs() > 106 || v.abs() > 48 {
-            return None;
-        }
-        let u = u as f32;
-        let v = v as f32;
-        let bend = if h & 8 == 0 { 20. } else { -20. };
-        let nodes = [(-70., 0.), (-25., bend), (25., -bend), (70., 0.)];
-        let mut edge = f32::INFINITY;
-        for pair in nodes.windows(2) {
-            let (a, b) = (pair[0], pair[1]);
-            let (dx, dz) = (b.0 - a.0, b.1 - a.1);
-            let t = ((u - a.0) * dx + (v - a.1) * dz) / (dx * dx + dz * dz);
-            let t = t.clamp(0., 1.);
-            edge = edge.min((u - a.0 - t * dx).hypot(v - a.1 - t * dz) - 5.);
-        }
-        // Broader, irregular lake basins at both ends of the river.
-        for (a, radius) in [(-70., 22.), (70., 30.)] {
-            let shore = 1.5 * (u * 0.19 + v * 0.13).sin();
-            edge = edge.min((u - a).hypot(v * 1.15) - radius - shore);
-        }
-        if edge > 2. {
-            return None;
-        }
-        let level = self.height(x, z) - 2;
-        for (a, b) in nodes {
-            let (dx, dz) = if h & 4 == 0 {
-                (a as i32, b as i32)
-            } else {
-                (b as i32, a as i32)
-            };
-            if (self.height(x + dx, z + dz) - level).abs() > 18 {
-                return None;
-            }
-        }
-        Some((edge, level))
-    }
-
-    pub(crate) fn waterway_block(&self, p: IVec3, height: i32) -> Option<Block> {
-        let (edge, level) = self.waterway_column(p.x, p.z)?;
-        let depth = if edge < -12. {
-            7
-        } else if edge < -3. {
-            4
-        } else {
-            2
-        };
-        if p.y < level - 8 || p.y > height.max(level) + 7 {
-            return None;
-        }
-        Some(if p.y <= level - depth || (edge >= 0. && p.y <= level) {
-            Block::Sand
-        } else if p.y <= level {
-            Block::Water
-        } else {
-            Block::Air
-        })
-    }
-
     /// Irregular sediment-lined ponds (stone-lined lava) outside the protected spawn.
     pub(crate) fn pool_block(&self, p: IVec3, height: i32) -> Option<Block> {
         if p.x.abs() < 32 && p.z.abs() < 32 {
@@ -287,6 +252,9 @@ impl World {
             return None;
         }
         let y = self.height(x, z);
+        if y <= crate::world::SEA_LEVEL + 4 || !self.pond_contained(cx, cz, x, z, y, radius) {
+            return None;
+        }
         // Reject the whole pool on steep terrain, keeping a complete containing rim.
         if [(-5, -5), (-5, 5), (5, -5), (5, 5)]
             .iter()
@@ -300,7 +268,7 @@ impl World {
         }
         let floor = y - 2 - i32::from(edge < -1.8);
         if p.y <= floor || edge >= 0. {
-            return (p.y <= y - i32::from(edge < 0.)).then_some(if lava {
+            return (p.y <= height.min(y - i32::from(edge < 0.))).then_some(if lava {
                 Block::Stone
             } else {
                 match hash(
@@ -350,6 +318,167 @@ mod tests {
         }
     }
     #[test]
+    fn untouched_lake_spillways_activate_when_streamed() {
+        let mut w = World::new(41);
+        let (source, spill) = crate::water_review::find_spill(&w).expect("natural lake spillway");
+        assert!(w.edits.is_empty());
+        let start = std::time::Instant::now();
+        loop {
+            w.stream(source.as_vec3(), 1);
+            w.meshes.clear();
+            let [_, queued, active] = w.stream_counts();
+            if queued + active == 0 {
+                break;
+            }
+            assert!(
+                start.elapsed().as_secs() < 10,
+                "spillway streaming timed out"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        assert!(w.fluid_pending.contains(&spill.to_array()));
+        let pending = std::mem::take(&mut w.fluid_pending);
+        // An unchanged resident remesh must not requeue the entire body of water.
+        w.dirty.push(crate::world::chunk(source));
+        let start = std::time::Instant::now();
+        loop {
+            w.stream(source.as_vec3(), 1);
+            w.meshes.clear();
+            let [_, queued, active] = w.stream_counts();
+            if queued + active == 0 {
+                break;
+            }
+            assert!(start.elapsed().as_secs() < 10, "spillway remesh timed out");
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        assert!(w.fluid_pending.is_empty());
+        w.fluid_pending = pending;
+        advance(&mut w, source, 60);
+        assert_eq!(w.get(spill - IVec3::Y), Block::FlowingWater(8));
+        assert_eq!(w.get(source), Block::Water);
+    }
+
+    #[test]
+    fn shoreline_level_cache_is_bounded_and_does_not_change_generation() {
+        let w = World::new(41);
+        let (source, _) = crate::water_review::find_spill(&w).unwrap();
+        let before = w.waterway_column(source.x, source.z);
+        for cx in -16..16 {
+            for cz in -16..16 {
+                let h = hash(w.seed ^ 0x7269_7665, cx, 0, cz);
+                w.waterway_column(
+                    cx * 384 + 144 + ((h >> 8) % 96) as i32,
+                    cz * 384 + 144 + ((h >> 24) % 96) as i32,
+                );
+                assert!(w.waterway_cache_len() <= 64);
+            }
+        }
+        assert_eq!(w.waterway_column(source.x, source.z), before);
+        assert_eq!(World::new(41).waterway_column(source.x, source.z), before);
+    }
+
+    #[test]
+    fn lake_banks_blend_into_terrain_without_retaining_walls() {
+        let mut checked_bank = false;
+        let mut sloped_bank = false;
+        for seed in [1, 41, 314159] {
+            let w = World::new(seed);
+            for cx in -4..4 {
+                for cz in -4..4 {
+                    let h = hash(w.seed ^ 0x7269_7665, cx, 0, cz);
+                    let x = cx * 384 + 144 + ((h >> 8) % 96) as i32;
+                    let z = cz * 384 + 144 + ((h >> 24) % 96) as i32;
+                    if w.waterway_column(x, z).is_none() {
+                        continue;
+                    }
+                    for dx in (-124..=124).step_by(4) {
+                        for dz in (-124..=124).step_by(4) {
+                            let (px, pz) = (x + dx, z + dz);
+                            let Some((edge, level)) = w.waterway_column(px, pz) else {
+                                continue;
+                            };
+                            if edge < 0. || level == crate::world::SEA_LEVEL {
+                                continue;
+                            }
+                            checked_bank = true;
+                            let height = w.height(px, pz);
+                            // No solid bank may be generated above the original ground.
+                            assert!(matches!(
+                                w.waterway_block(IVec3::new(px, height + 1, pz), height),
+                                None | Some(Block::Air)
+                            ));
+                            if (1.0..10.0).contains(&edge) && height > level + 3 {
+                                let above_shore = IVec3::new(px, height, pz);
+                                sloped_bank |=
+                                    w.waterway_block(above_shore, height) == Some(Block::Air);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        assert!(checked_bank, "contained lake shores must be generated");
+        assert!(sloped_bank, "high shores must be carved into a broad slope");
+    }
+
+    #[test]
+    fn busy_frontiers_cannot_starve_waterfalls() {
+        let (mut w, p) = basin();
+        let source = p + IVec3::Y * 4;
+        w.set(source, Block::Water);
+        let busy: Vec<_> = (-20..=-10)
+            .flat_map(|x| (200..=240).flat_map(move |y| [-16, -15].map(|z| [x, y, z])))
+            .collect();
+        for _ in 0..6 {
+            // Simulate continuing activity at lexicographically earlier positions.
+            w.fluid_pending.extend(busy.iter().copied());
+            w.tick_fluids(p, true);
+        }
+        assert_eq!(w.get(source - IVec3::Y), Block::FlowingWater(8));
+    }
+
+    #[test]
+    fn exposed_sources_spill_over_ledges_across_chunk_boundaries_and_drain() {
+        let (mut w, p) = basin(); // Source sits at x=15, z=-16.
+        for y in 182..=199 {
+            w.set(
+                IVec3::new(16, y, -16),
+                if y == 182 { Block::Stone } else { Block::Air },
+            );
+        }
+        w.set(p, Block::Water);
+        w.fluid_pending.clear();
+        // Simulate first chunk acceptance, with the spill into an unloaded neighbor.
+        let key = crate::world::chunk(p);
+        let frontier = exposed_frontier(key, &w.halo(key));
+        assert!(frontier.contains(&p.to_array()));
+        w.fluid_pending.extend(frontier);
+        advance(&mut w, p, 60);
+        assert_eq!(w.get(IVec3::new(16, 184, -16)), Block::FlowingWater(8));
+        w.set(p, Block::Air);
+        advance(&mut w, p, 160);
+        assert!(w.edits.values().all(|b| b.fluid().is_none()));
+    }
+
+    #[test]
+    fn settled_ocean_interiors_do_not_seed_the_frontier() {
+        let mut halo = vec![Block::Water; 18 * 18 * 18];
+        // An open water surface above this full chunk is also settled.
+        for z in 0..18 {
+            for x in 0..18 {
+                halo[x + 18 * (z + 18 * 17)] = Block::Air;
+            }
+        }
+        assert!(exposed_frontier(IVec3::ZERO, &halo).is_empty());
+        // A downward opening on the adjacent chunk must wake the edge source.
+        halo[17 + 18 * (1 + 18)] = Block::Air;
+        assert!(exposed_frontier(IVec3::ZERO, &halo).contains(&[15, 0, 0]));
+        // Contact on the upper face still wakes lava/water reactions.
+        halo[1 + 18 * (1 + 18 * 17)] = Block::Lava;
+        assert!(exposed_frontier(IVec3::ZERO, &halo).contains(&[0, 15, 0]));
+    }
+
+    #[test]
     fn water_spreads_seven_blocks_across_chunks_and_drains() {
         let (mut w, p) = basin();
         w.set(p, Block::Water);
@@ -377,6 +506,21 @@ mod tests {
         advance(&mut w, p, 90);
         assert_eq!(w.get(p), Block::Air);
     }
+    #[test]
+    fn waterfalls_land_in_water_without_spreading_a_raised_layer_over_the_pool() {
+        let (mut w, p) = basin();
+        for dx in -2..=2 {
+            for dz in -2..=2 {
+                w.set(p + IVec3::new(dx, 0, dz), Block::Water);
+            }
+        }
+        w.set(p + IVec3::Y * 5, Block::Water);
+        advance(&mut w, p, 60);
+        assert_eq!(w.get(p + IVec3::Y), Block::FlowingWater(8));
+        assert_eq!(w.get(p + IVec3::Y + IVec3::X), Block::Air);
+        assert_eq!(w.get(p + IVec3::X), Block::Water);
+    }
+
     #[test]
     fn two_sources_fill_supported_water_but_not_open_air_or_lava() {
         let (mut w, p) = basin();
@@ -495,7 +639,9 @@ mod tests {
                 let h = hash(w.seed ^ 0x7269_7665, cx, 0, cz);
                 let x = cx * 384 + 144 + ((h >> 8) % 96) as i32;
                 let z = cz * 384 + 144 + ((h >> 24) % 96) as i32;
-                let level = w.height(x, z) - 2;
+                let Some((_, level)) = w.waterway_column(x, z) else {
+                    continue;
+                };
                 for (i, u) in [0, 70].into_iter().enumerate() {
                     let (px, pz) = if h & 4 == 0 { (x + u, z) } else { (x, z + u) };
                     let p = IVec3::new(px, level, pz);
@@ -507,7 +653,11 @@ mod tests {
                         found[i] = true;
                         assert_eq!(w.get(p - IVec3::Y), Block::Water);
                         assert_eq!(w.get(p + IVec3::Y), Block::Air);
-                        assert_eq!(w.get(p - IVec3::Y * 8), Block::Sand);
+                        let bed = (1..=64)
+                            .map(|depth| w.get(p - IVec3::Y * depth))
+                            .find(|b| b.fluid().is_none())
+                            .expect("sealed lake/river bed");
+                        assert_eq!(bed, Block::Sand);
                         let k = crate::world::chunk(p);
                         let halo = w.halo(k);
                         for y in -1..=16 {
@@ -582,8 +732,10 @@ mod tests {
                 let z = cz * 64 + 16 + ((h >> 24) % 32) as i32;
                 let p = IVec3::new(x, w.height(x, z) - 1, z);
                 match w.get(p) {
-                    Block::Water => water = Some(p),
-                    Block::Lava => lava = Some(p),
+                    Block::Water if w.pool_block(p, p.y + 1) == Some(Block::Water) => {
+                        water = Some(p)
+                    }
+                    Block::Lava if w.pool_block(p, p.y + 1) == Some(Block::Lava) => lava = Some(p),
                     _ => {}
                 }
                 if water.is_some() && lava.is_some() {
@@ -603,7 +755,10 @@ mod tests {
                 w.get(p - IVec3::Y * 2),
                 Block::Stone | Block::Sand | Block::Gravel | Block::Dirt
             ));
-            assert!(w.get(p + IVec3::X * 5).solid());
+            assert!(
+                (1..=7).any(|dx| w.get(p + IVec3::X * dx).solid()),
+                "pond must have a containing rim"
+            );
         }
     }
 }

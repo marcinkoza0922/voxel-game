@@ -720,9 +720,13 @@ harvest. This is an approximation of Minecraft-style behavior: no conserved
 volume, pressure, slope-search routing, fluid currents, waterlogging, fire
 spread or exact edition-specific water/lava reaction rules.
 
-The ordered frontier provides deterministic bounded work. Cells beyond 64 blocks
-on any axis sleep until approached. Changed blocks wake themselves and six
-neighbors; accepting streamed chunks seeds their fluid cells. Loading a save
+The ordered frontier provides deterministic bounded work, with a rotating key
+cursor so continuing activity at one end cannot starve spillways at the other.
+Cells beyond 64 blocks on any axis sleep until approached. Changed blocks wake
+themselves and six neighbors; first acceptance of streamed chunks seeds exposed
+sources, existing flow and fluid contacts from the worker's halo. Quiet interiors
+and open air above a water surface do not need updates; resident remeshes do not
+reseed fluids. Loading a save
 rebuilds the frontier around saved edits. Settled fluids require no ongoing full
 world scan. Streamed meshes retain ordinary edit revision checks. A growing flow
 can invalidate in-flight mesh work; a pulse is not guaranteed to process every
@@ -742,16 +746,21 @@ item and does not automatically regrow; breaking it exposes the water below.
 Seeded 384-block cells can also contain two irregular inland lakes (roughly 40–60
 blocks across) connected by a winding, roughly ten-block-wide river. Candidate
 sites reject steep endpoint/river elevations and stay outside the starting area.
-Each system shares a level water surface, has shallows and deeper lake centers,
-and uses sand banks and a sealed bed down to eight blocks below the surface.
+Each system has an upper lake, a descending river and a lower receiving lake.
+Rim heights and the lowest channel bank determine their elevations. Wet paths
+are continuous across terraces and waterfall drops, with source water in the
+channel and supplied falling water at vertical transitions. Shore aprons blend
+into native terrain without raising retaining walls; other lake shores stay
+closed. Beds have three sediment blocks over a stable stone foundation.
 These larger bodies remain liquid in every biome, including tundra. Waterways
 override small pools and caves; ruins retain priority. Trees whose roots would
 intersect waterways or pools are suppressed. Streaming bounds include lake beds
 and elevated water surfaces. Direct queries and chunk halos use identical seeded
 sampling; player edits still override generated water and ice. Existing unedited
 terrain gains these features on load. Rivers currently connect local lake pairs;
-there is no global drainage network, current simulation, seasonal freeze/thaw,
-ocean generation or underground lava-lake generation.
+there is no global drainage network, current simulation, seasonal freeze/thaw
+or underground lava-lake generation. Continental oceans and sea-level river
+valleys are described below.
 
 Tests cover frozen and warm ponds, breaking ice to expose liquid, liquid tundra
 rivers/lakes, basin beds, and agreement between chunk halos and direct queries.
@@ -1240,3 +1249,147 @@ through long leaf chains, gradual decay after wood removal, irregular mixed
 pond sediment, and existing cold-pond/halo behavior. All 120 quiet nextest tests,
 short Clippy, formatting and diff checks pass. No visual window review was
 performed for these terrain changes.
+
+
+### Continental water and river valleys
+
+Terrain now blends the existing hills/mountains into broad seeded ocean basins
+using a 1,200-block continental noise scale. A warped 260-block noise contour
+cuts winding river valleys to four blocks below the shared sea level (highest
+source voxel Y=24). Rivers are procedural valleys, without drainage simulation;
+connections and routes follow noise rather than a watershed graph. The first
+256 blocks around the origin retain their original heights, with a smooth
+transition to full continental/river shaping at radius 640. Deep ocean beds
+vary with a separate noise field; nearby exposed shores use sand and gravel.
+
+Empty surface columns below sea level receive water sources up to Y=24.
+The upper four bed blocks are sealed sediment before cave carving, preventing
+surface water from spawning into open cave entrances. Oceans and these rivers
+remain liquid in cold biomes. Existing inland lake/river pairs and small ponds
+remain, with low-elevation candidates rejected to avoid replacing the shared
+water surface. Trees and ruins reject submerged roots/sites. Surface streaming
+bounds include sea level even when the seabed lies several chunks beneath it.
+Direct queries, worker generation and halos share these rules; saved edits
+continue to override generation. Existing saves reconstruct unedited terrain
+with the new generator, so shorelines may change around saved builds.
+Underground aquifers and elevated lake water tables remain future work.
+
+Validation: all 123 quiet nextest tests, short Clippy and formatting/diff checks
+pass. New checks cover continental river carving, deep/shallow source-water
+columns, sealed sediment beds, sea-surface streaming, halo/query consistency,
+edit precedence and dry spawn heights across seeds. No windowed visual review
+was performed for this change.
+
+
+### Waterfalls and natural lake shores
+
+Generated water now wakes at exposed side/downward edges and opposing-fluid
+contacts using the worker's existing 18-cube halo, including unresident neighbor
+chunks. Flowing cells also wake for supply/drainage checks. Remesh acceptance
+preserves the existing frontier instead of adding every settled source again.
+The 512-entry pulse budget advances a deterministic rotating key cursor; a busy
+lower-key region cannot indefinitely delay another nearby outlet. Existing
+fall-first rules create falling columns over ledges and horizontal runoff when
+they reach support. These cascades use ordinary persistent flow edits, and drain
+when their supplying source is removed. The existing 64-block activation range
+still limits distant simulation.
+
+Inland lake levels previously depended on the center height and could leave
+raised sand retaining walls or large water sheets above lower surrounding ground.
+The generator now samples both lake rims and both sides of the connecting river
+at roughly block spacing. Their lowest sampled elevation caps the common water
+level (at most one block above that sample); unsuitable low/steep sites are
+rejected. A per-World deterministic cache holds at most 128 cell levels, including
+rejections, to avoid repeating rim sampling for every block or column. Evicting
+cache entries changes no geometry. Aprons carve slopes rather than raise walls;
+pond rims also never add sediment above the original ground. Continental river
+valley shoulders widen with surrounding relief to avoid narrow walls through
+high terrain. Aquifers and watershed simulation remain deferred.
+
+`tools/water_review.rs` adds `cargo run -- --water-review --seed 41`. It finds an
+untouched lake outlet, activates it through normal chunk streaming, advances 90
+fluid pulses, checks falling water, positions a camera and renders one offscreen
+Vulkan frame. It always writes its own `target/water-review/world.json` and
+`waterfall.ppm`, with isolated settings in the same directory; normal saves are
+not loaded or overwritten. The review uses fixed output paths and a single
+stationary frame. The preview can be reopened
+using `cargo run -- --save target/water-review/world.json --frames 900`.
+
+Validation: all 129 quiet nextest tests, short Clippy, formatting and diff checks
+pass. Regressions cover frontier fairness, unloaded-neighbor ledge flow and
+subsequent drainage, quiet ocean interiors, upper-face fluid contacts, untouched
+lake activation through streaming, resident remeshes without reseeding, banks
+that never rise above native terrain, near-shore water elevation, and bounded
+level-cache eviction/determinism. An ore check now samples below the local ground
+height because widened valleys can lie well below an adjacent ruin. The seed-41
+review rendered successfully and was visually inspected: its lake sits within
+sloping shores and spills into a stepped cascade, without a suspended water
+sheet. Its source is (-2764, 30, -2130), with overflow toward positive X.
+
+The full mechanics playtest and controlled progression expedition also pass,
+including crafting, combat, exploration, natural ruin encounters and save reload.
+
+
+### Contained lake-to-lake drainage
+
+`hydrology` replaces unplanned inland spillways with deterministic local drainage
+systems inside the existing 384-block cells. Each accepted pair has an upper lake
+and a lower receiving lake. Exact rasterized rim samples cap lake elevations two
+blocks below surrounding land. The existing winding corridor is rasterized into
+a four-connected voxel path; its water elevation never increases downstream.
+The lower lake is lowered to accept the channel's lowest bank-supported level,
+with sea level as a floor so it can merge with continental water. Very low or
+steep upper sites, wet footprints intersecting ruins, and any actual shore
+column that would permit an unplanned spill are rejected.
+
+Every channel column contains generated source water, independent of the fluid
+solver's seven-block spreading range or the player's activation distance. At
+steps, supplied flowing/falling columns join the higher surface to the lower
+channel, which continues into the receiving lake. Source renewal is suppressed
+within those planned vertical falls so the solver cannot dam a cascade with
+new stationary source cells. Falling/flowing water that lands on source water
+joins the pool without spreading an elevated layer across its surface; only
+sources can supply horizontal flow while supported by a fluid source, while
+all levels can spread on solid support. Explicitly placed sources and ordinary bucket flow
+retain their existing rules. This is a local drainage topology, without global
+watershed routing, erosion, currents or water-volume conservation.
+
+Lake/channel shores carve broad aprons into existing land, never build above it,
+and preserve the higher bank where neighboring reaches at different elevations
+have overlapping aprons. Otherwise a lower reach's apron could cut through a
+higher reach's containment and recreate field runoff. Submerged dry aprons defer
+to continental sea water. Three sediment layers over a stone foundation seal the
+beds above caves and keep generated sand/gravel from collapsing into them.
+Small isolated water/lava pools require a complete containing rim and remain
+closed ponds. Dynamic spill/flow still responds normally when the player edits
+banks or places water elsewhere.
+
+The bounded immutable-plan cache holds up to 64 waterway cells and 128 pond-site
+checks, with FIFO eviction. Main-thread queries, CPU worker snapshots and the
+background surface planner share it through an Arc/Mutex; plans build outside
+the lock and deterministic duplicate results are harmless. Eviction changes no
+blocks. Surface streaming bounds include beds and the full height of falling
+columns. All sampling and saved-edit precedence remain shared across direct
+queries, halos, lighting and workers. Existing saved block/fluid edits retain
+priority; untouched generated water and shores change on load.
+
+`tools/water_review.rs` now locates a planned cascade and reports the upstream
+and receiving lake centers. In addition to the isolated world and waterfall
+render, it writes `target/water-review/watercourse.ppm`, a top-down diagnostic of
+actual wet columns over the whole cell. The seed-41 review connects upper lake
+(-2934, 31, -2138) to lower lake (-2794, 26, -2138) along a 221-column route.
+Its waterfall source is (-2821, 31, -2126). Both the plan view and the Vulkan
+render were inspected: the river reaches its receiving lake and the fall lands
+inside the lower wet channel, with no stream ending on a field.
+
+Validation: all 133 quiet nextest tests, short Clippy, formatting and diff checks
+pass. New regressions sample multiple systems across seeds 1, 41 and 314159:
+non-increasing, four-connected wet routes reach both lake centers; every source
+edge meets solid containment or another wet column; beds stay sealed; and fluid
+simulation over the whole route produces no runoff onto dry fields or dried
+river stretches. Existing waterfall streaming, halo, cache eviction, bucket
+flow and drainage tests remain in place. Pond tests select actual ponds and
+check their containing rim rather than relying on a fixed five-block radius.
+A separate regression checks that a waterfall landing in a pool does not spread
+a raised sheet over the pool's surface. The complete mechanics playtest and
+controlled progression expedition also pass with the new drainage generation.
