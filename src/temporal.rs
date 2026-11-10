@@ -330,10 +330,12 @@ impl Temporal {
         queue: &wgpu::Queue,
         encoder: &mut wgpu::CommandEncoder,
         output: &wgpu::TextureView,
-        camera: Mat4,
+        stable_camera: Mat4,
         eye: glam::Vec3,
         enabled: bool,
     ) {
+        let jitter = self.jitter(enabled);
+        let camera = Mat4::from_translation(jitter.extend(0.)) * stable_camera;
         let delta = self.previous_eye - eye;
         let valid = enabled && self.valid && delta.length_squared() < 16.;
         queue.write_buffer(
@@ -343,7 +345,13 @@ impl Temporal {
                 inverse: camera.inverse().to_cols_array_2d(),
                 previous: self.previous.to_cols_array_2d(),
                 eye_delta: [delta.x, delta.y, delta.z, 0.],
-                flags: [valid as u32 as f32, 0., 0., 0.],
+                flags: [
+                    valid as u32 as f32,
+                    jitter.x * 0.5,
+                    -jitter.y * 0.5,
+                    stationary_history(valid, stable_camera, self.previous, eye, self.previous_eye)
+                        as u32 as f32,
+                ],
             }),
         );
         let index = (self.frame % 2) as usize;
@@ -363,7 +371,7 @@ impl Temporal {
         ] {
             self.pass(device, encoder, target, source, history, pipeline);
         }
-        self.previous = camera;
+        self.previous = stable_camera;
         self.previous_eye = eye;
         self.valid = true;
         self.frame = self.frame.wrapping_add(1);
@@ -372,5 +380,52 @@ impl Temporal {
 impl Params {
     fn zero() -> Self {
         bytemuck::Zeroable::zeroed()
+    }
+}
+
+// Only an identical view has identity screen reprojection. Any motion must use
+// depth-tested reprojection, including subpixel motion and history resets.
+fn stationary_history(
+    valid: bool,
+    camera: Mat4,
+    previous: Mat4,
+    eye: glam::Vec3,
+    previous_eye: glam::Vec3,
+) -> bool {
+    valid && camera == previous && eye == previous_eye
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stationary_history_requires_identical_view_and_valid_history() {
+        let eye = glam::Vec3::new(220., 31., -233.);
+        let camera = Mat4::perspective_rh(75_f32.to_radians(), 1.6, 0.05, 1024.)
+            * Mat4::look_at_rh(eye, eye + glam::Vec3::Z, glam::Vec3::Y);
+        assert!(stationary_history(true, camera, camera, eye, eye));
+        assert!(!stationary_history(false, camera, camera, eye, eye));
+        assert!(!stationary_history(
+            true,
+            camera,
+            camera,
+            eye + glam::Vec3::X * 0.0001,
+            eye
+        ));
+        assert!(!stationary_history(
+            true,
+            Mat4::from_rotation_y(0.00001) * camera,
+            camera,
+            eye,
+            eye
+        ));
+        assert!(!stationary_history(
+            true,
+            Mat4::from_scale(glam::Vec3::new(1.001, 1., 1.)) * camera,
+            camera,
+            eye,
+            eye
+        ));
     }
 }

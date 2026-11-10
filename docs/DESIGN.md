@@ -1580,3 +1580,49 @@ Mining fix validation: formatting, Clippy with warnings denied, all 149 quiet
 nextest tests, gameplay/persistence smoke and automated playtest/expedition
 passed. Offscreen captures of the current save and the original entrance fixture
 completed; the entrance still has no blue opening. User saves were read only.
+
+### Stationary TAA edge shimmer
+
+The built-in TAA resolve now samples the jittered scene at the offset corresponding
+to each fixed output pixel and stores history with an unjittered camera matrix.
+Previously both output and history inherited the current Halton offset, making
+high-contrast voxel edges shimmer even with a frozen camera and simulation.
+Stationary views retain 95 percent accepted history with a 0.03 neighborhood
+clipping margin to preserve subpixel coverage. The renderer passes the original
+unjittered camera directly to TAA, so exact view comparisons do not depend on
+floating point cancellation of jitter. With an identical view and valid history,
+output pixels reuse their exact history UV and bypass reprojection depth rejection:
+jitter samples on different sides of a silhouette must not repeatedly invalidate
+that pixel. Neighborhood color clipping still rejects stale colors. Any camera
+translation, rotation, projection change or invalid history restores depth-tested
+reprojection and the tighter, difference-dependent clipping/weight. Native
+upscaler motion/reprojection is unchanged.
+
+`tools/still_review.rs`, invoked with `cargo run -- --still-review --save PATH
+--capture DIRECTORY`, loads the save read only, settles streaming offscreen,
+applies saved graphics settings, and freezes camera and simulation. It renders
+64 frames by default and captures the last sixteen as PPM files; `--frames N`
+changes the duration (minimum sixteen). It bypasses window/audio
+initialization and never writes the world. Without `--capture`, the directory is
+`target/still-review`.
+
+Against `saves/world-36.json`, at 1280×800 with its TAA settings, mean absolute
+adjacent-frame RGB change in the terrain rectangle x=0..760, y=360..700 fell
+from 1.4196 to 0.5435 (about 62 percent). This measures temporal stability in a
+frozen scene, not elimination of every aliasing artifact or moving-view quality.
+A projection regression covers fixed history across different jitter offsets.
+Formatting, Clippy, all 150 quiet nextest tests, gameplay/persistence smoke and
+playtest/expedition passed. Frozen GPU captures validated the shader at runtime;
+user save files were not modified.
+
+Follow-up validation of identity stationary reprojection used a temporary fixture
+with the original snowy camera/time from world-36 and TAA explicitly enabled in
+a temporary settings file (the current user settings had TAA disabled). Across
+frames 240–255, the same terrain rectangle measured 0.03734 mean absolute RGB
+change and maximum channel change 12, versus 0.54346 and 94 after the first fix.
+This is about 93 percent less remaining mean variation; it is not a claim of
+pixel-identical frames. The latest saved camera was also captured with TAA
+explicitly enabled. Exact-view regression coverage checks history invalidation,
+small translations, rotations and projection changes. Clippy, all 150 nextest
+tests and a 64-frame headless moving-camera tour passed. User saves/settings
+were read only.

@@ -843,14 +843,13 @@ impl Renderer {
         let native_active = false;
         let jitter = self.temporal.jitter(self.settings.taa || native_active);
         let jitter_matrix = Mat4::from_translation(Vec3::new(jitter.x, jitter.y, 0.));
-        let camera_view = jitter_matrix
-            * Mat4::perspective_rh(
-                75_f32.to_radians(),
-                self.width as f32 / self.height as f32,
-                0.05,
-                1024.,
-            )
-            * Mat4::look_at_rh(eye, eye + g.player.direction(), Vec3::Y);
+        let stable_camera = Mat4::perspective_rh(
+            75_f32.to_radians(),
+            self.width as f32 / self.height as f32,
+            0.05,
+            1024.,
+        ) * Mat4::look_at_rh(eye, eye + g.player.direction(), Vec3::Y);
+        let camera_view = jitter_matrix * stable_camera;
         let center = eye.floor();
         let light_view = Mat4::orthographic_rh(-80., 80., -80., 80., 0.1, 250.)
             * Mat4::look_at_rh(center + sun * 120., center, Vec3::Y);
@@ -1310,7 +1309,7 @@ impl Renderer {
                 &self.queue,
                 &mut encoder,
                 &view,
-                camera_view,
+                stable_camera,
                 eye,
                 self.settings.taa,
             );
@@ -1321,7 +1320,7 @@ impl Renderer {
             &self.queue,
             &mut encoder,
             &view,
-            camera_view,
+            stable_camera,
             eye,
             self.settings.taa,
         );
