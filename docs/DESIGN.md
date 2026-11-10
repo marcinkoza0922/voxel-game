@@ -1009,3 +1009,59 @@ A 48-repetition confirmation (`occupancy-after-confirm.{csv,txt}`) measured
 cave-lighting median 0.669 ms and p95 5.918 ms, surface median 0.853 ms,
 and streaming median 98.972 ms, reinforcing the cave improvement while
 showing continuing tail and machine-load variability.
+
+### Profiling rerun (2026-11-09)
+
+`target/performance-rerun/` records a fresh release CPU run (24 repetitions,
+seed 314159) and a subsequent isolated 1,800-frame offscreen tour. CPU workload
+median/p95 ms: halo 0.430/0.823, surface mesh 0.236/0.452, surface sky
+0.954/6.265, checkerboard 0.859/2.254, cave sky 0.854/10.463, twelve fluid
+pulses 107.043/169.862, four settled relocations 98.194/124.865.
+The stress reporter uses the upper middle sample for even-sized medians.
+
+Tour steady frames (excluding relocation/final settlement) measured draw CPU
+wall time median 0.510 ms, p95 1.611 ms and max 83.974 ms. Simulation max
+was 0.917 ms. Initial settlement took 1,434.973 ms; distant relocations/return
+1,056.949–1,329.602 ms; adjacent moves 58.418–91.903 ms. Peak residency
+was 1,284 chunks. Settlement is deliberately blocking in the headless runner;
+these durations are terrain readiness latency, not native-window frame stalls.
+GPU execution timestamps remain unmeasured.
+
+Hardware sampling succeeded outside the sandbox with `perf record -e cycles:u
+--user-callchains --call-graph dwarf`. The explicit user-callchain option is
+needed with this host's `perf_event_paranoid=2`; user-only counting worked
+without it, but recording failed. The helper now includes this flag. The sampled
+run is separate from baseline timing. Its core-PMU flat self-time report shows
+main-thread hypot 16.75%, height 16.26%, biome 9.61%, floorf 4.50%, tree
+3.16%; worker samples also highlight meshing, height/biome/waterway generation
+and skylight. These percentages describe this mixed synthetic workload and
+include fixture setup, not the game's frame budget. Repeated procedural terrain
+queries are the strongest CPU optimization candidate; fluid pulses and terrain
+readiness are the largest measured workload costs. Raw samples and report are
+`target/performance-rerun/perf.{data}` and `perf-report.txt`.
+
+### Per-pulse fluid query cache
+
+`World::tick_fluids` uses a fresh `world::BlockQueries` cache during its read
+phase. Each queried cell is resolved once, including plant support; uncached
+procedural cells share height/tree/ruin/cave inputs through `TerrainColumn` per
+horizontal coordinate. Edits still override resident chunks, which override
+procedural terrain. Skylight uses the same column-input constructor without
+changing its roof/opacity rules. Fluid frontier ordering, the 512-cell budget,
+lava scheduling and simultaneous commits are unchanged. The cache is dropped
+before committing changes, so no persistent edit invalidation is required.
+Its size follows cells queried by this pulse, rather than world travel history.
+
+A regression compares fresh and repeated cached reads with `World::get` across
+three seeds, negative/chunk-boundary/distant coordinates, cave and surface
+heights, world bounds, deliberately different resident chunks, fluid/air/leaf/
+plant edits and supported/unsupported plants. All 113 quiet nextest tests,
+short Clippy, formatting and diff checks pass.
+
+Fresh release measurements (48 repetitions, seed 314159, one excluded warmup)
+are in `target/performance-rerun/fluid-{before,after}.{csv,txt}`. Twelve-pulse
+median/p95 fell from 91.712/126.552 to 23.315/24.722 ms (75%/80% reduction).
+Every workload's output units match between runs. Other workloads were slower
+in the after run, consistent with machine-load variation; settled streaming
+changed from 93.534/109.694 to 111.570/114.769 ms. This demonstrates faster
+fluid stress updates, not a streaming or general frame-rate improvement.

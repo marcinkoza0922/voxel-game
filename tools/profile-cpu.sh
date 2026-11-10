@@ -16,7 +16,7 @@ cargo build --release
 # Always produce usable workload timings, even when perf counters are restricted.
 target/release/voxel-game --stress --seed 314159 --frames "$repetitions" --profile "$out/cpu.csv" | tee "$out/summary.txt"
 if command -v perf >/dev/null; then
-    if perf record -q -e cycles:u --call-graph dwarf -o "$out/perf.data" -- \
+    if perf record -q -e cycles:u --user-callchains --call-graph dwarf -o "$out/perf.data" -- \
         target/release/voxel-game --stress --seed 314159 --frames "$repetitions" > "$out/perf-run.txt" 2> "$out/perf-error.txt"; then
         perf report --stdio --no-children -i "$out/perf.data" --percent-limit 1 > "$out/perf-report.txt"
         printf 'Call stacks: %s/perf-report.txt (raw: perf.data)\n' "$out"

@@ -86,21 +86,25 @@ impl World {
                 candidates.insert((p + d).to_array());
             }
         }
+        let mut queries = crate::world::BlockQueries::default();
         let mut changes = Vec::new();
         for key in candidates {
             let p = IVec3::from_array(key);
             if !(MIN_Y + 1..=MAX_Y).contains(&p.y) {
                 continue;
             }
-            let old = self.get(p);
+            let old = queries.get(self, p);
             if !old.replaceable() {
                 continue;
             }
-            let neighbors = SIDES.map(|d| self.get(p + d));
+            let neighbors = SIDES.map(|d| queries.get(self, p + d));
             if old.fluid().is_some_and(|(lava, _)| lava)
-                && NEIGHBORS
-                    .iter()
-                    .any(|d| self.get(p + *d).fluid().is_some_and(|(lava, _)| !lava))
+                && NEIGHBORS.iter().any(|d| {
+                    queries
+                        .get(self, p + *d)
+                        .fluid()
+                        .is_some_and(|(lava, _)| !lava)
+                })
             {
                 changes.push((
                     p,
@@ -121,21 +125,21 @@ impl World {
                     if old.fluid().is_some()
                         || NEIGHBORS
                             .iter()
-                            .any(|d| self.get(p + *d).fluid().is_some_and(|(l, _)| l))
+                            .any(|d| queries.get(self, p + *d).fluid().is_some_and(|(l, _)| l))
                     {
                         self.fluid_pending.insert(key);
                     }
                     continue;
                 }
                 let source = if lava { Block::Lava } else { Block::Water };
-                let below = self.get(p - IVec3::Y);
+                let below = queries.get(self, p - IVec3::Y);
                 let renewable = !lava
                     && neighbors.iter().filter(|b| **b == Block::Water).count() >= 2
                     && (below.solid() || below == Block::Water);
                 let level = if old == source || renewable {
                     Some(0)
-                } else if self
-                    .get(p + IVec3::Y)
+                } else if queries
+                    .get(self, p + IVec3::Y)
                     .fluid()
                     .is_some_and(|(l, _)| l == lava)
                 {
@@ -145,8 +149,8 @@ impl World {
                         .iter()
                         .filter_map(|d| {
                             let n = p + *d;
-                            let (kind, level) = self.get(n).fluid()?;
-                            let floor = self.get(n - IVec3::Y);
+                            let (kind, level) = queries.get(self, n).fluid()?;
+                            let floor = queries.get(self, n - IVec3::Y);
                             if kind != lava || !(floor.solid() || floor.fluid() == Some((lava, 0)))
                             {
                                 return None;
@@ -178,6 +182,7 @@ impl World {
                 changes.push((p, next));
             }
         }
+        drop(queries); // The cached snapshot ends before committing changes.
         for (p, b) in changes {
             self.set(p, b);
         }
