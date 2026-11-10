@@ -757,6 +757,7 @@ impl ApplicationHandler for App {
                         glam::Vec3::from_array(self.game.player.pos),
                     );
                     let stream_ms = stream_start.elapsed().as_secs_f64() * 1000.;
+                    r.profile_draw = self.profile.is_some();
                     let draw_start = Instant::now();
                     if let Err(e) = r.draw(
                         &self.game,
@@ -786,6 +787,7 @@ impl ApplicationHandler for App {
                             self.game.world.stream_counts(),
                             self.focused,
                             self.pack || self.paused,
+                            r.draw_times,
                         ) {
                             self.error = Some(format!("Profile write failed: {e}"));
                             self.exit(event_loop);

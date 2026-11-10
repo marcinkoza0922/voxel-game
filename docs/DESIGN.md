@@ -18,7 +18,7 @@ The player approved deterministic seeded chunk streaming and persistent player s
 
 ## Slice boundaries and evolution
 
-Advanced metallurgy, magic/gems, breeding, quests, logistics, electricity, automation, extra biomes and multiplayer are future work. Existing station/recipe/item registries and separate simulation should accommodate them. The slice has finite render distance but not a finite horizontal map. Terrain generation and CPU meshing run on bounded background workers using immutable jobs. Stream planning and GPU uploads remain on the main thread. Save format versions reject unsupported data rather than silently discarding it.
+Advanced metallurgy, magic/gems, breeding, quests, logistics, electricity, automation, extra biomes and multiplayer are future work. Existing station/recipe/item registries and separate simulation should accommodate them. The slice has finite render distance but not a finite horizontal map. Terrain generation and CPU meshing run on bounded background workers using immutable jobs. Terrain column planning runs on a separate bounded background thread; result acceptance and GPU uploads have main-thread time budgets. Save format versions reject unsupported data rather than silently discarding it.
 
 ## Validation
 
@@ -32,7 +32,7 @@ The slice uses `winit 0.30`, `wgpu 27`, `glam` for primitive vector/matrix math,
 
 The initial ECS is a small, single-archetype component store: generational entity IDs index reusable slots containing position, health, level and AI cooldown. Creature behavior and physics run in explicit simulation systems. This is deliberately smaller than a general archetype/query framework. More component stores and scheduling can be added when multiple entity classes require them. Creatures are transient and respawn after loading; player state, discoveries, recipe counts, tool wear, torches, time and block edits persist.
 
-Terrain chunks are 16x16x16. Stream radius is ten chunks horizontally (160 blocks along each axis). Each horizontal chunk column samples all 256 terrain heights and streams from one chunk below its lowest surface through its highest surface plus tree canopy, without clamping mountains to player elevation. A five-by-five horizontal area additionally streams two chunks above/below the player for cave exploration. Streaming replans on player chunk or radius changes and evicts chunks outside the desired set. Jobs are ordered by distance with deterministic ties; obsolete mesh jobs are discarded and remaining mesh jobs reprioritized near the player. Two persistent CPU workers generate chunk blocks and meshes together from a shared one-block halo. At most two jobs, including completed results, are outstanding per world; thus a redraw accepts/uploads at most two meshes. Workers receive immutable seed/local-edit snapshots and never access authoritative state or GPU resources. The main thread polls without waiting, accepts only still-desired results matching the current edit revision, and retries invalidated jobs. Revision checks are conservatively world-wide: unrelated edits can also trigger retries. Evicted results are discarded. Pending resident remeshes survive stream replanning; boundary edits invalidate diagonal neighbors for AO. Worker channels close and threads join on world destruction, bounded by outstanding jobs. Stream planning, priority sorting, edit snapshot copying and GPU uploads remain synchronous. Sampling is deterministic whether or not a chunk is resident. Surface heights are roughly 24–800, with mountain growth suppressed near spawn. The full legal range is -512..1535. Mountain surfaces within the view radius can render at any generated elevation. Horizontal fog fades between 112 and 160 blocks; the camera far plane is 1,024 blocks to include tall nearby peaks. Conservative chunk AABB tests independently cull camera and sun-shadow draws. CPU meshing uses a one-block halo with shared column height/tree data (324 column evaluations instead of up to 5,832 for an unloaded halo), shared-face culling and diagonal-aware corner AO. LOD and greedy meshing remain future performance work; this iteration retains exact voxel geometry and existing terrain generation/save compatibility. Rendering uses a 2048-square sun depth map with 3x3 comparison filtering, a day/night intensity cycle, fog, and the nearest sixteen warm torch lights. Held torches occupy one light slot. Placed torches expire after 600 simulation seconds, and placement is capped at 256 active torches.
+Terrain chunks are 16x16x16. Stream radius is ten chunks horizontally (160 blocks along each axis). Each horizontal chunk column samples all 256 terrain heights and streams from one chunk below its lowest surface through its highest surface plus tree canopy, without clamping mountains to player elevation. A five-by-five horizontal area additionally streams two chunks above/below the player for cave exploration. Streaming replans on player chunk or radius changes and evicts chunks outside the desired set. Jobs are ordered by distance with deterministic ties; obsolete mesh jobs are discarded and remaining mesh jobs reprioritized near the player. Two persistent CPU workers generate chunk blocks and meshes together from a shared one-block halo. At most 64 jobs, including completed results, are outstanding per world. Workers run continuously from that backlog between redraws; completed results and pending GPU uploads each have a 32-mesh capacity. Result acceptance, snapshot dispatch and GPU uploads each have a two-millisecond soft budget per call, stopping between whole chunks. Workers receive immutable seed/local-edit snapshots and never access authoritative state or GPU resources. The main thread polls without waiting, accepts only still-desired results matching the current edit revision, and retries invalidated jobs. Revision checks are conservatively world-wide: unrelated edits can also trigger retries. Evicted results are discarded. Pending resident remeshes survive stream replanning; boundary edits invalidate diagonal neighbors for AO. Worker channels close and threads join on world destruction, bounded by outstanding jobs. A dedicated planner computes terrain column bounds and desired chunk sets, with one outstanding request/result; obsolete plans are rejected and the latest view is requested next. Priority sorting, edit snapshot copying, residency updates and GPU uploads remain synchronous. Sampling is deterministic whether or not a chunk is resident. Surface heights are roughly 24–800, with mountain growth suppressed near spawn. The full legal range is -512..1535. Mountain surfaces within the view radius can render at any generated elevation. Horizontal fog fades between 112 and 160 blocks; the camera far plane is 1,024 blocks to include tall nearby peaks. Conservative chunk AABB tests independently cull camera and sun-shadow draws. CPU meshing uses a one-block halo with shared column height/tree data (324 column evaluations instead of up to 5,832 for an unloaded halo), shared-face culling and diagonal-aware corner AO. LOD and greedy meshing remain future performance work; this iteration retains exact voxel geometry and existing terrain generation/save compatibility. Rendering uses a 2048-square sun depth map with 3x3 comparison filtering, a day/night intensity cycle, fog, and the nearest sixteen warm torch lights. Held torches occupy one light slot. Placed torches expire after 600 simulation seconds, and placement is capped at 256 active torches.
 
 The owned GUI is an immediate-mode triangle builder with rectangle buttons, pointer hit regions, a built-in 5x7 font and resolution-aware scaling. The pack has a 27-slot backpack, nine real hotbar slots, shaped crafting, a recipe pattern guide, a furnace view and attribute allocation. Escape menus and lost focus pause simulation. Opening the pack pauses movement and survival while furnace processing continues. Crafting recipes are instant transactions; furnaces process automatically over five seconds per item. Tables and furnaces must be within three blocks. A wood bedroll recipe substitutes for the later wool economy. Leaves supply berries as a renewable slice food source. Husks provide combat and meat; animals and audio are deferred. All visuals are code-native voxel geometry and glyphs, so no asset authoring tools or generated raster assets were used.
 
@@ -1077,3 +1077,131 @@ Every workload's output units match between runs. Other workloads were slower
 in the after run, consistent with machine-load variation; settled streaming
 changed from 93.534/109.694 to 111.570/114.769 ms. This demonstrates faster
 fluid stress updates, not a streaming or general frame-rate improvement.
+
+
+### Windowed profiling follow-up (2026-11-09)
+
+`--profile` now appends five CPU wall-time columns: `draw_prepare_ms`
+(dynamic geometry, lighting and UI), `surface_acquire_ms`, `draw_encode_ms`
+(including encoder finish), `queue_submit_ms`, and `present_capture_ms`
+(including optional capture readback). Phase clocks run only with profiling
+enabled. These remain CPU timings, not GPU execution timestamps. The analyzer
+accepts older CSVs, reports intervals exceeding common frame budgets, and
+attributes the five worst intervals to the preceding frame's phases. The
+remaining interval time includes event-loop/pacing waits and uninstrumented
+work, not necessarily a stall. `--tour` additionally reports settlement and
+ending queue counts per 180-frame stage; only use it for tour recordings.
+
+Fresh release native Wayland tours (seed 314159, isolated saves/preferences)
+and a separate 3,600-frame perf sampling run are in
+`target/performance-followup/`. The unsampled original 1,800-frame tour had
+interval median/p95/max 6.061/6.902/12.499 ms, with no intervals above
+16.667 ms. The instrumented repeat measured 6.081/6.669/20.640 ms,
+with three intervals above 16.667 ms. Its three worst intervals followed
+distant relocations: synchronous stream/upload consumed 18.619, 16.746 and
+15.635 ms. Streaming replans still evaluate all 256 heights and waterway
+inputs for every newly visible horizontal chunk column on the main thread,
+then evict, rebuild desired sets and sort jobs. Moving that planning work off
+the main thread or budgeting it is a strong hitch-reduction candidate.
+
+Detailed median/p95 CPU draw phases (ms): preparation 0.294/0.499,
+surface acquire 0.051/0.091, encoding 0.380/0.898, queue submission
+0.148/0.274, presentation 0.070/0.133. Surface acquisition max was
+0.276 ms. Run-to-run draw costs varied, so these are observations rather
+than an instrumentation overhead comparison or GPU throughput conclusion.
+
+A structural terrain-throughput limit is independent of these frame costs:
+only two jobs including completed results may be outstanding, and new jobs
+are dispatched only when the main thread polls once per redraw. Consequently,
+throughput cannot exceed twice the redraw rate: 120 chunks/second at 60 FPS,
+or about 330 at 165 FPS, even if workers finish early. The initial desired
+set contains 1,171 chunks; the original tour accepted 358 in its first 180
+frames and did not settle until frame 625 while crossing adjacent columns.
+Distant locations commonly remained incomplete at the next relocation.
+A further 1,800-frame run with an isolated 60-FPS setting accepted 354
+chunks in the first stage and first settled at frame 631 (10.576 seconds),
+versus frame 625 (3.795 seconds) in the original uncapped/VSync run.
+The route is frame-based, so relocation spacing in seconds also changes;
+the nearly identical settlement frame counts support the scheduling limit.
+The 60-FPS run had interval median/p95/max 16.767/16.861/26.799 ms
+and peak synchronous stream/upload 22.409 ms.
+Decoupling a bounded worker backlog from a separately budgeted per-frame
+upload queue is the leading terrain-readiness candidate. Simply adding
+workers or accelerating generation cannot remove the frame-dependent limit.
+
+The separate perf recording lost no samples (seven out-of-order events were
+reported). Core-PMU self time highlights worker height (7.13% across both
+workers), hypot (6.99%), skylight sampling (6.64%), biome (6.04%), halo
+meshing (5.71%) and waterway queries (5.32%). These are shares of sampled
+CPU cycles across the run, not frame-time percentages. UI rectangle generation
+also appears at 2.16%. Procedural/lighting optimization remains relevant,
+but should follow scheduling and synchronous planning investigation.
+
+Validation: release build, short Clippy, formatting, diff checks and all 114
+quiet nextest tests pass. Analyzer exercised against old and extended CSVs,
+including range selection. This change adds diagnostics; streaming behavior
+is unchanged. Native-upscaler builds and GPU execution timing were not tested.
+
+
+### Buffered streaming and background planning fix (2026-11-09)
+
+Two CPU mesh workers now consume a shared bounded job backlog continuously,
+with at most 64 outstanding jobs including completed results. Completed CPU
+results use a 32-slot blocking channel, and accepted meshes awaiting GPU upload
+are separately capped at 32. The main thread uses independent two-millisecond
+soft budgets for accepting results, dispatching snapshots and uploading meshes;
+budgets stop between whole chunks, so a single expensive chunk can overrun.
+Backpressure bounds memory while permitting many completions between redraws.
+World mesh output persists until consumed, replacing older queued meshes for the
+same key. Dirty meshes are removed before upload, and edit revision validation
+still rejects obsolete worker snapshots. CPU-only stress explicitly consumes
+mesh output, matching the new persistent-output contract.
+
+A third persistent thread computes surface bounds and desired chunk sets from
+the seed and a reusable bounded column cache. Only one request/result is
+outstanding. The main thread rejects plans whose center/radius no longer match
+and requests the latest view. Obsolete queued mesh jobs are cancelled on view
+changes; already-running/completed jobs are checked on receipt. Horizontal
+eviction happens immediately, followed by exact desired-set eviction once the
+plan arrives. Resident remesh requests and edits arriving during planning are
+preserved. Priority sorting, eviction and snapshot copying still run on the main
+thread; this change moves the expensive terrain-column evaluation off it.
+Shutdown discards queued jobs and disconnects the completed receiver before
+joining workers, so full result channels cannot deadlock destruction. A planner
+can finish its sole outstanding plan during shutdown.
+
+Fresh sequential release tour recordings are in `target/performance-fix/`;
+comparisons use `target/performance-followup/` from the preceding investigation.
+Each tour uses seed 314159, 1,800 frames, and isolated saves/preferences:
+
+| Measurement | Before | After |
+| --- | ---: | ---: |
+| 60-FPS tour first settlement | 10.576 s (frame 631) | 0.752 s (frame 45) |
+| ~165-Hz tour first settlement | 4.002 s (frame 660) | 0.922 s (frame 147) |
+| 60-FPS peak stream/upload CPU | 22.409 ms | 3.982 ms |
+| ~165-Hz peak stream/upload CPU | 18.619 ms | 1.986 ms |
+| ~165-Hz interval p95 / max | 6.669 / 20.640 ms | 6.465 / 12.480 ms |
+
+All ten stages settled before the next relocation in both after runs, reaching
+1,284 resident chunks. Earlier tours commonly left distant stages incomplete
+and peaked at 1,200 resident chunks. Tours relocate every 180 frames; first
+settlement thus compares route readiness, not an identical stationary scene.
+Run-to-run CPU/driver load varies. The 60-FPS interval p95 changed from 16.861
+to 17.144 ms despite lower peak stream work; remaining pacing/scheduling tails
+are visible, and GPU execution time is still unmeasured. These results establish
+faster readiness and lower main-thread streaming peaks, not universal FPS gains.
+
+The release CPU stress completed 24 measured repetitions after warmup:
+settled radius-one streaming median/p95 73.787/77.045 ms, twelve fluid pulses
+26.468/28.305 ms. Its relocation timing includes worker polling and sleeps;
+it is separate from the native frame measurements.
+
+All 116 quiet nextest tests, short Clippy, formatting and diff checks pass.
+Regressions cover continuous worker progress without redraw polling, destruction
+with full result backpressure, obsolete plan rejection, and exact blocks/meshes
+for edits during planning, alongside the existing eviction, height bounds,
+column-cache, edit revision and resident-remesh checks.
+
+A separate 1,800-frame offscreen tour also completed successfully, including
+startup, relocation and final blocking settlement, with no queued/active work
+or pending uploads at exit (`target/performance-fix/headless.csv`).

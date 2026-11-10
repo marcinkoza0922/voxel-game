@@ -47,6 +47,8 @@ struct Mesh {
     opaque_count: u32,
 }
 pub struct Renderer {
+    pub profile_draw: bool,
+    pub draw_times: [f64; 5],
     #[cfg(feature = "native-upscalers")]
     native: crate::native_upscale::Native,
     last_draw: std::time::Instant,
@@ -602,6 +604,8 @@ impl Renderer {
             support.super_resolution_supported,
         );
         Ok(Self {
+            profile_draw: false,
+            draw_times: [0.; 5],
             #[cfg(feature = "native-upscalers")]
             native,
             last_draw: std::time::Instant::now(),
@@ -721,7 +725,9 @@ impl Renderer {
         for k in w.stream(pos, VIEW_RADIUS) {
             self.meshes.remove(&k);
         }
-        for (k, mut data) in std::mem::take(&mut w.meshes) {
+        let upload_start = std::time::Instant::now();
+        while !w.meshes.is_empty() && upload_start.elapsed() < std::time::Duration::from_millis(2) {
+            let (k, mut data) = w.meshes.remove(0);
             if !w.loaded(k) {
                 continue;
             }
@@ -747,6 +753,13 @@ impl Renderer {
             }
         }
     }
+    fn profile_phase(&mut self, start: &mut Option<std::time::Instant>, phase: usize) {
+        if let Some(start) = start {
+            let now = std::time::Instant::now();
+            self.draw_times[phase] = now.duration_since(*start).as_secs_f64() * 1000.;
+            *start = now;
+        }
+    }
     pub fn draw(
         &mut self,
         g: &Game,
@@ -755,6 +768,8 @@ impl Renderer {
         fps: f32,
         capture: Option<&std::path::Path>,
     ) -> Result<(), String> {
+        let mut phase_start = self.profile_draw.then(std::time::Instant::now);
+        self.draw_times = [0.; 5];
         let (celestial, daylight) = sky_cycle(g.time);
         // Moonlight takes over at night; both lights follow the visible orbit.
         let sun = if celestial.y >= 0. {
@@ -1081,6 +1096,7 @@ impl Renderer {
                 contents: bytemuck::cast_slice(&self.ui.vertices),
                 usage: wgpu::BufferUsages::VERTEX,
             });
+        self.profile_phase(&mut phase_start, 0);
         let frame = if let Some(surface) = &self.surface {
             match surface.get_current_texture() {
                 Ok(frame) => Some(frame),
@@ -1095,6 +1111,7 @@ impl Renderer {
         } else {
             None
         };
+        self.profile_phase(&mut phase_start, 1);
         let offscreen = frame.is_none().then(|| {
             self.device.create_texture(&wgpu::TextureDescriptor {
                 label: Some("Headless framebuffer"),
@@ -1312,7 +1329,10 @@ impl Renderer {
             );
             (buffer, stride)
         });
-        self.queue.submit(Some(encoder.finish()));
+        let commands = encoder.finish();
+        self.profile_phase(&mut phase_start, 2);
+        self.queue.submit(Some(commands));
+        self.profile_phase(&mut phase_start, 3);
         if let (Some(path), Some((buffer, stride))) = (capture, readback) {
             let (tx, rx) = std::sync::mpsc::channel();
             buffer.slice(..).map_async(wgpu::MapMode::Read, move |r| {
@@ -1349,6 +1369,7 @@ impl Renderer {
         if let Some(frame) = frame {
             frame.present();
         }
+        self.profile_phase(&mut phase_start, 4);
         Ok(())
     }
 }

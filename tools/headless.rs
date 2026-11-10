@@ -70,6 +70,7 @@ pub fn run(mut game: Game, options: &Options) -> Result<(), String> {
                 std::thread::sleep(Duration::from_millis(1));
             }
             let stream_ms = streaming.elapsed().as_secs_f64() * 1000.;
+            renderer.profile_draw = profile.is_some();
             let draw = Instant::now();
             renderer.draw(
                 &game,
@@ -94,6 +95,7 @@ pub fn run(mut game: Game, options: &Options) -> Result<(), String> {
                     game.world.stream_counts(),
                     true,
                     options.pack,
+                    renderer.draw_times,
                 )?;
             }
         }

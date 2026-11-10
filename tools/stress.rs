@@ -92,6 +92,8 @@ pub fn run(seed: u64, repetitions: u32, output: Option<&Path>) -> Result<(), Str
                 );
                 loop {
                     stream.stream(pos, 1);
+                    // This CPU workload consumes meshes without uploading them.
+                    stream.meshes.clear();
                     let [resident, queued, active] = stream.stream_counts();
                     peak = peak.max(resident);
                     if queued + active == 0 {
