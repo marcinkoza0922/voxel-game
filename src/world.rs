@@ -894,11 +894,13 @@ impl World {
                 p.y.div_euclid(2),
                 p.z.div_euclid(2),
             ) % 101;
-            if vein < 5 {
+            // Shared 2x2x2 veins: coal is more plentiful than either metal.
+            // Iron starts just four blocks below copper; their deeper ranges overlap.
+            if vein < 2 {
                 Block::Copper
-            } else if vein < 10 {
+            } else if vein < 5 {
                 Block::Coal
-            } else if vein < 13 && p.y < height - 12 {
+            } else if vein < 7 && p.y <= height - 8 {
                 Block::Iron
             } else {
                 Block::Stone
@@ -1455,6 +1457,41 @@ fn outcrop_top(h: u64, mut x: i32, mut z: i32) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn ore_abundance_and_overlapping_depth_ranges() {
+        let mut counts = [0usize; 3];
+        let mut shallow_copper = 0;
+        for seed in [1, 42, 314159] {
+            let world = World::new(seed);
+            for x in -16..16 {
+                for z in -16..16 {
+                    let surface = world.height(x, z);
+                    for depth in 4..40 {
+                        let block = world.get(IVec3::new(x, surface - depth, z));
+                        if depth < 8 {
+                            assert_ne!(block, Block::Iron);
+                            shallow_copper += usize::from(block == Block::Copper);
+                        } else {
+                            match block {
+                                Block::Copper => counts[0] += 1,
+                                Block::Coal => counts[1] += 1,
+                                Block::Iron => counts[2] += 1,
+                                _ => {}
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        assert!(shallow_copper > 0);
+        let [copper, coal, iron] = counts;
+        assert!(coal > copper && coal > iron, "{counts:?}");
+        assert!(iron * 4 > copper * 3 && copper * 4 > iron * 3, "{counts:?}");
+        let samples = 3 * 32 * 32 * 32;
+        assert!(copper < samples * 3 / 100, "{counts:?}");
+        assert!(coal < samples * 4 / 100, "{counts:?}");
+    }
+
     #[test]
     fn open_water_keeps_land_within_the_normal_view_distance() {
         for seed in [1, 41, 314159] {

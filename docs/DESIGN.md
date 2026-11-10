@@ -311,8 +311,12 @@ out-of-range drops and pickups blocked by a full inventory remain silent.
 ## Iron expeditions and tundra ruins
 
 The second tier extends the existing registries without changing earlier item
-discriminants or recipe indices. Iron veins occur in every biome, below twelve
-blocks of cover, and require a copper pickaxe. A table crafts a crude smelter
+discriminants or recipe indices. Ore uses deterministic 2x2x2 vein cells in every
+biome: copper occupies 2/101 eligible cells, coal 3/101, and iron 2/101.
+Copper and coal start four blocks below the local surface; iron starts eight
+blocks below it. All three continue to the world's bottom stone layer, so the
+metal ranges overlap with iron only slightly deeper. Caves and other terrain
+features can replace ore. Iron requires a copper pickaxe. A table crafts a crude smelter
 from six cobblestone and two copper ingots. It shares placed-furnace inventory,
 reach, transfer, fuel, XP, mining protection and persistence rules, but can also
 process iron. Basic furnaces cannot process iron and consume no fuel trying.
