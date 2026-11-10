@@ -743,7 +743,10 @@ Inventory icons and held geometry distinguish bucket material and contents.
 
 Players move more slowly in fluid; drag limits falling speed, Space swims upward,
 and landing in fluid avoids fall damage. Submersion follows the rendered fluid
-height. An underwater eye consumes a 15-second air reserve; exhaustion deals
+height. Swimming toward a clear one-block bank applies an exit jump once the
+eye is above the fluid, using the same obstacle and headroom checks as land
+auto-jump. This lets the feet clear the shore despite swim drag.
+An underwater eye consumes a 15-second air reserve; exhaustion deals
 8 damage/second, and air recovers at five seconds per second above water. Lava
 contact deals 25 damage/second. HUD overlays tint submerged views and show air.
 Creature swimming, drowning and fluid effects on loose items remain future work.
@@ -751,7 +754,10 @@ Creature swimming, drowning and fluid effects on loose items remain future work.
 Water uses a separate alpha-blended pass with depth testing and no depth writes,
 after opaque terrain. Chunk buffers partition opaque and fluid vertex ranges;
 fluid chunks draw from far to near. Faces shared by equal-height fluid cells are
-culled; flow levels lower exposed surfaces. The shader adds ripples; lava is
+culled using each cell's effective height: a fluid cell covered by the same
+fluid fills its whole voxel. This also applies to neighboring columns across
+chunk boundaries, preventing internal translucent strips beneath deep water.
+Flow levels lower exposed surfaces. The shader adds ripples; lava is
 opaque/emissive in this pass and supplies nearby warm lights through the existing
 16-light budget. Exposed lava is grouped into four-block cells to avoid stacking
 a light for every voxel; each group uses strength 0.22. Lava light also suppresses

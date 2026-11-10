@@ -1287,7 +1287,17 @@ pub fn mesh_halo(
                     } else {
                         1.
                     };
-                    if same_fluid && (normal.y != 0 || neighbor.fluid_height() >= height) {
+                    // Covered fluid cells fill the full voxel, including neighbors.
+                    // Using their exposed height leaves translucent internal strips.
+                    let neighbor_height = if same_fluid
+                        && normal.y == 0
+                        && get(p + normal + IVec3::Y).fluid().map(|f| f.0) == fluid.map(|f| f.0)
+                    {
+                        1.
+                    } else {
+                        neighbor.fluid_height()
+                    };
+                    if same_fluid && (normal.y != 0 || neighbor_height >= height) {
                         continue;
                     }
                     let mut vertices = [Vertex {
@@ -1316,7 +1326,7 @@ pub fn mesh_halo(
                         if fluid.is_some() {
                             let local_y = pos.y - (base + p).y as f32;
                             let bottom = if same_fluid && normal.y == 0 {
-                                neighbor.fluid_height()
+                                neighbor_height
                             } else {
                                 0.
                             };
@@ -2012,6 +2022,27 @@ mod sky_tests {
 #[cfg(test)]
 mod fluid_mesh_tests {
     use super::*;
+    #[test]
+    fn deep_water_has_no_internal_sides_across_chunk_boundaries() {
+        let mut w = World::new(41);
+        // Cross both horizontal and vertical chunk boundaries.
+        for x in 15..=16 {
+            for y in 207..=208 {
+                w.set(IVec3::new(x, y, 0), Block::Water);
+            }
+        }
+        for x in 15..=16 {
+            for y in 207..=208 {
+                let mesh = mesh_chunk(&w, crate::world::chunk(IVec3::new(x, y, 0)));
+                assert!(
+                    !mesh
+                        .iter()
+                        .any(|v| v.tile[2] == -5. && v.normal[0].abs() > 0.5 && v.pos[0] == 16.)
+                );
+            }
+        }
+    }
+
     #[test]
     fn fluid_faces_use_transparent_material_and_match_flow_height() {
         let mut w = World::new(41);

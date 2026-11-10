@@ -618,6 +618,11 @@ impl Game {
             self.velocity.y = (self.velocity.y * (1. - 4. * dt).max(0.)
                 + if input.jump { 12. * dt } else { -3. * dt })
             .clamp(-2., 3.);
+            // A clear bank needs a jump impulse: swim drag alone stalls at
+            // the surface before the player's feet can clear the ledge.
+            if auto_jump && self.world.fluid_at(self.player.eye()).is_none() {
+                self.velocity.y = 7.2;
+            }
         } else {
             self.velocity.y = (self.velocity.y - 22. * dt).max(-45.);
         }
@@ -1854,6 +1859,41 @@ mod fluid_tests {
             assert_eq!(g.world.get(p), Block::FlowingWater(3));
         }
     }
+    #[test]
+    fn swimming_climbs_a_clear_bank() {
+        let mut g = Game::new(41);
+        for x in -2..=2 {
+            for z in -3..=3 {
+                g.world.set(IVec3::new(x, 198, z), Block::Stone);
+                for y in 199..=202 {
+                    g.world.set(
+                        IVec3::new(x, y, z),
+                        if y == 199 {
+                            if z < 0 { Block::Stone } else { Block::Water }
+                        } else {
+                            Block::Air
+                        },
+                    );
+                }
+            }
+        }
+        g.player.pos = [0.5, 199.1, 0.5];
+        g.player.yaw = 0.;
+        for _ in 0..60 {
+            g.tick(
+                &Input {
+                    forward: 1.,
+                    jump: true,
+                    ..Default::default()
+                },
+                STEP,
+            );
+        }
+        assert!(g.player.pos[2] < -0.5, "{:?}", g.player.pos);
+        assert!(g.player.pos[1] >= 200., "{:?}", g.player.pos);
+        assert!(!collides(&g.world, Vec3::from_array(g.player.pos)));
+    }
+
     #[test]
     fn water_slows_falls_allows_swimming_and_consumes_air_lava_hurts() {
         let mut g = Game::new(41);
