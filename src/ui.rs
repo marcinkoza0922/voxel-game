@@ -379,7 +379,9 @@ impl Ui {
                         [x, 180. + n as f32 * 42., 440., 35.],
                         label,
                         Action::Setting(n as u8),
-                        (n != 0 || settings.upscaler == 0) && (n != 8 || settings.upscaler != 0),
+                        (n != 0 || settings.upscaler == 0)
+                            && (!matches!(n, 3 | 4) || settings.upscaler == 0)
+                            && (n != 8 || settings.upscaler != 0),
                     );
                 }
                 let output = (

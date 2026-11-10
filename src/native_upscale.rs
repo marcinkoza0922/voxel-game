@@ -54,7 +54,7 @@ impl Native {
                 "Native linear depth",
             ),
             mode: 0,
-            quality: crate::settings::UpscaleQuality::Custom,
+            quality: crate::settings::UpscaleQuality::Quality,
             size: (0, 0),
             display: (0, 0),
             dlss_status,
@@ -109,14 +109,6 @@ impl Native {
                     UpscaleQuality::Balanced => DlssPerfQualityMode::Balanced,
                     UpscaleQuality::Performance => DlssPerfQualityMode::Performance,
                     UpscaleQuality::Native => DlssPerfQualityMode::Dlaa,
-                    UpscaleQuality::Custom if size == display => DlssPerfQualityMode::Dlaa,
-                    UpscaleQuality::Custom if size.0 as f32 / display.0 as f32 >= 0.6 => {
-                        DlssPerfQualityMode::Quality
-                    }
-                    UpscaleQuality::Custom if size.0 as f32 / display.0 as f32 >= 0.55 => {
-                        DlssPerfQualityMode::Balanced
-                    }
-                    UpscaleQuality::Custom => DlssPerfQualityMode::Performance,
                 };
                 let context = DlssSuperResolution::new(
                     UVec2::new(display.0, display.1),
