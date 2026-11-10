@@ -12,6 +12,26 @@ glam = "0.30"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
+[features]
+native-upscalers = ["dep:dlss_wgpu", "dep:uuid", "dep:fsr", "dep:ash"]
+
+[dependencies.dlss_wgpu]
+path = "vendor/dlss_wgpu"
+optional = true
+
+[dependencies.uuid]
+version = "1"
+optional = true
+
+[dependencies.fsr]
+version = "0.1.11"
+features = ["vulkan"]
+optional = true
+
+[dependencies.ash]
+version = "0.38"
+optional = true
+
 [lints.clippy]
 correctness = "deny"
 suspicious = "warn"
@@ -22,3 +42,8 @@ opt-level = 1
 
 [profile.dev.package."*"]
 opt-level = 2
+
+# Preserve function names and call stacks for perf/flamegraph.
+[profile.release]
+debug = 1
+strip = false

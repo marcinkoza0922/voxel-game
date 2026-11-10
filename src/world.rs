@@ -44,6 +44,7 @@ pub enum Block {
     FlowingLava(u8),
     Obsidian,
     Ice,
+    Gravel,
 }
 impl Block {
     pub fn solid(self) -> bool {
@@ -108,6 +109,7 @@ impl Block {
             Self::Furnace => [0.29, 0.31, 0.34],
             Self::Table => [0.49, 0.31, 0.16],
             Self::Torch => [1., 0.65, 0.18],
+            Self::Gravel => [0.52, 0.49, 0.44],
             Self::Sand => [0.76, 0.69, 0.47],
             Self::Bed => [0.63, 0.24, 0.20],
             Self::Iron => [0.59, 0.54, 0.49],
@@ -144,6 +146,7 @@ impl Block {
             Self::Furnace => "Furnace",
             Self::Table => "Crafting table",
             Self::Torch => "Torch",
+            Self::Gravel => "Gravel",
             Self::Sand => "Sand",
             Self::Bed => "Bedroll",
             Self::Iron => "Iron ore",
@@ -267,9 +270,76 @@ pub struct Edit {
     pub block: Block,
 }
 
+/// Immutable procedural inputs shared by queries at different column heights.
+struct TerrainColumn {
+    height: i32,
+    tree: Option<(i32, i32, i32)>,
+    ruin: Option<IVec3>,
+    cave: Option<(i32, i32)>,
+}
+
+pub(crate) struct SkyColumn {
+    terrain: TerrainColumn,
+    pub roof: i32,
+}
+impl SkyColumn {
+    pub fn blocked(&self, world: &World, p: IVec3) -> bool {
+        let block = world
+            .edits
+            .get(&p.to_array())
+            .copied()
+            .or_else(|| world.chunks.get(&chunk(p)).map(|c| c[index(p)]))
+            .unwrap_or_else(|| {
+                world.natural_column(
+                    p,
+                    self.terrain.height,
+                    self.terrain.tree,
+                    self.terrain.ruin,
+                    self.terrain.cave,
+                )
+            });
+        // Plant support never changes whether a block is opaque.
+        block.solid() && block != Block::Leaves
+    }
+}
+
+/// Snapshot queries for one read phase. Discard before committing world changes.
+#[derive(Default)]
+pub(crate) struct BlockQueries {
+    blocks: HashMap<IVec3, Block>,
+    columns: HashMap<(i32, i32), TerrainColumn>,
+}
+impl BlockQueries {
+    pub fn get(&mut self, world: &World, p: IVec3) -> Block {
+        if let Some(&block) = self.blocks.get(&p) {
+            return block;
+        }
+        let block = world
+            .edits
+            .get(&p.to_array())
+            .copied()
+            .or_else(|| world.chunks.get(&chunk(p)).map(|c| c[index(p)]))
+            .unwrap_or_else(|| {
+                let column = self
+                    .columns
+                    .entry((p.x, p.z))
+                    .or_insert_with(|| world.terrain_column(p.x, p.z));
+                world.natural_column(p, column.height, column.tree, column.ruin, column.cave)
+            });
+        let block = if block.plant() && !self.get(world, p - IVec3::Y).dirt() {
+            Block::Air
+        } else {
+            block
+        };
+        self.blocks.insert(p, block);
+        block
+    }
+}
+
 pub struct World {
     pub seed: u64,
     pub edits: BTreeMap<[i32; 3], Block>,
+    pub(crate) physics_pending: std::collections::BTreeSet<[i32; 3]>,
     pub fluid_pending: std::collections::BTreeSet<[i32; 3]>,
     pub torch_mounts: BTreeMap<[i32; 3], [i32; 3]>,
     chunks: HashMap<IVec3, Box<[Block]>>,
@@ -279,8 +349,11 @@ pub struct World {
     center: IVec3,
     radius: i32,
     desired: HashSet<IVec3>,
-    surface_bounds: HashMap<(i32, i32), (i32, i32)>,
+    pub(crate) surface_bounds: HashMap<(i32, i32), (i32, i32)>,
     workers: Option<crate::streaming::Workers>,
+    planner: Option<crate::streaming::Planner>,
+    planning: bool,
+    plan_ready: bool,
     active: HashSet<IVec3>,
     pub meshes: Vec<(IVec3, Vec<crate::render::Vertex>)>,
 }
@@ -326,6 +399,7 @@ impl World {
             edits: BTreeMap::new(),
             torch_mounts: BTreeMap::new(),
             fluid_pending: Default::default(),
+            physics_pending: Default::default(),
             chunks: HashMap::new(),
             pending: VecDeque::new(),
             dirty: vec![],
@@ -335,6 +409,9 @@ impl World {
             desired: HashSet::new(),
             surface_bounds: HashMap::new(),
             workers: None,
+            planner: None,
+            planning: false,
+            plan_ready: false,
             active: HashSet::new(),
             meshes: vec![],
         }
@@ -383,11 +460,10 @@ impl World {
         self.ruin_in_cell(x.div_euclid(256), z.div_euclid(256))
     }
     fn tree(&self, x: i32, z: i32) -> Option<(i32, i32, i32)> {
-        if self.biome(x, z) == Biome::Tundra {
-            return None;
-        }
         let tx = x.div_euclid(7);
         let tz = z.div_euclid(7);
+        let mut best = None;
+        let mut distance = i32::MAX;
         for a in tx - 1..=tx + 1 {
             for b in tz - 1..=tz + 1 {
                 let h = hash(self.seed ^ 834, a, 0, b);
@@ -398,9 +474,23 @@ impl World {
                 } else {
                     19
                 };
-                if h.is_multiple_of(chance) && (x - cx).abs() <= 2 && (z - cz).abs() <= 2 {
+                if h.is_multiple_of(chance)
+                    && self.biome(cx, cz) != Biome::Tundra
+                    && (x - cx).abs() <= 3
+                    && (z - cz).abs() <= 3
+                {
                     let height = self.height(cx, cz);
-                    if self.waterway_column(cx, cz).is_none()
+                    let root = IVec3::new(cx, height + 1, cz);
+                    if self
+                        .natural_column(
+                            root,
+                            height,
+                            None,
+                            self.nearby_ruin(cx, cz),
+                            self.cave_column(cx, cz),
+                        )
+                        .replaceable()
+                        && self.waterway_column(cx, cz).is_none()
                         && self
                             .pool_block(IVec3::new(cx, height, cz), height)
                             .is_none()
@@ -408,12 +498,16 @@ impl World {
                             .cave_column(cx, cz)
                             .is_some_and(|(lo, hi)| (lo..=hi).contains(&height))
                     {
-                        return Some((cx, height, cz));
+                        let d = (x - cx).pow(2) + (z - cz).pow(2);
+                        if d < distance {
+                            distance = d;
+                            best = Some((cx, height, cz));
+                        }
                     }
                 }
             }
         }
-        None
+        best
     }
     /// A column's cave interval, shared by direct queries and chunk generation.
     /// Features fit inside 160-block cells, including their entrance ramps.
@@ -542,11 +636,28 @@ impl World {
         }
         if p.y > height {
             if let Some((tx, ty, tz)) = tree {
-                if p.x == tx && p.z == tz && p.y <= ty + 5 {
+                let h = hash(self.seed ^ 0x74726565, tx, 0, tz);
+                let tall = 5 + (h % 5) as i32;
+                let dx = p.x - tx;
+                let dz = p.z - tz;
+                let dy = p.y - ty;
+                let branch_y = tall - 2;
+                let axis_x = h & 8 == 0;
+                let branch = dy == branch_y
+                    && if axis_x {
+                        dz == 0 && dx.abs() <= 2
+                    } else {
+                        dx == 0 && dz.abs() <= 2
+                    };
+                if (dx == 0 && dz == 0 && dy <= tall) || branch {
                     return Block::Log;
                 }
-                if (ty + 3..=ty + 6).contains(&p.y)
-                    && (p.x - tx).abs() + (p.z - tz).abs() + (p.y - ty - 4).abs() < 5
+                let radius = 2 + ((h >> 5) % 2) as i32;
+                let crown = dx.abs() + dz.abs() + (dy - tall + 1).abs();
+                if dy >= tall - 3
+                    && dy <= tall + 1
+                    && crown <= radius + 1
+                    && (crown <= 2 || !hash(h, dx, dy, dz).is_multiple_of(7))
                 {
                     return Block::Leaves;
                 }
@@ -603,6 +714,39 @@ impl World {
             ),
         )
     }
+    fn terrain_column(&self, x: i32, z: i32) -> TerrainColumn {
+        TerrainColumn {
+            height: self.height(x, z),
+            tree: self.tree(x, z),
+            ruin: self.nearby_ruin(x, z),
+            cave: self.cave_column(x, z),
+        }
+    }
+    /// Prepare one column for both roof searches and ray occupancy queries.
+    pub(crate) fn sky_column(&self, x: i32, z: i32) -> SkyColumn {
+        let mut column = SkyColumn {
+            terrain: self.terrain_column(x, z),
+            roof: MIN_Y,
+        };
+        let top = self
+            .edits
+            .range([x, i32::MIN, i32::MIN]..=[x, i32::MAX, i32::MAX])
+            .filter(|(p, _)| p[2] == z)
+            .map(|(p, _)| p[1])
+            .max()
+            .unwrap_or(MIN_Y)
+            .max(column.terrain.height + 16)
+            .min(MAX_Y);
+        column.roof = (MIN_Y..=top)
+            .rev()
+            .find(|&y| column.blocked(self, IVec3::new(x, y, z)))
+            .unwrap_or(MIN_Y);
+        column
+    }
+    #[cfg(test)]
+    pub fn sky_roof(&self, x: i32, z: i32) -> i32 {
+        self.sky_column(x, z).roof
+    }
     fn supported_plant(&self, p: IVec3, b: Block) -> Block {
         if b.plant() && !self.get(p - IVec3::Y).dirt() {
             Block::Air
@@ -645,6 +789,7 @@ impl World {
             self.set(p + IVec3::Y, Block::Air);
         }
         self.wake_fluid(p);
+        self.wake_physics(p);
         self.edits.insert(p.to_array(), b);
         if b != Block::Torch {
             self.torch_mounts.remove(&p.to_array());
@@ -717,82 +862,129 @@ impl World {
         }
         count
     }
+    pub(crate) fn plan_surface(&mut self, c: IVec3, radius: i32) -> HashSet<IVec3> {
+        let mut desired = HashSet::new();
+        // Only retain columns in this view: bounded memory even after long travel.
+        self.surface_bounds
+            .retain(|&(x, z), _| (x - c.x).abs() <= radius && (z - c.z).abs() <= radius);
+        for x in c.x - radius..=c.x + radius {
+            for z in c.z - radius..=c.z + radius {
+                // Heights depend only on the seed. Reuse overlapping columns
+                // across replans, while sampling all 256 heights in new columns.
+                let (low, high) = if let Some(bounds) = self.surface_bounds.get(&(x, z)) {
+                    *bounds
+                } else {
+                    let (mut low, mut high) = (MAX_Y, MIN_Y);
+                    for dx in 0..SIZE {
+                        for dz in 0..SIZE {
+                            let h = self.height(x * SIZE + dx, z * SIZE + dz);
+                            low = low.min(h);
+                            high = high.max(h + 6);
+                            if let Some((_, level)) =
+                                self.waterway_column(x * SIZE + dx, z * SIZE + dz)
+                            {
+                                low = low.min(level - 8);
+                                high = high.max(level + 1);
+                            }
+                        }
+                    }
+                    self.surface_bounds.insert((x, z), (low, high));
+                    (low, high)
+                };
+                let lo = (low.div_euclid(SIZE) - 1).max(MIN_Y / SIZE);
+                let hi = high.div_euclid(SIZE).min(MAX_Y / SIZE);
+                for y in lo..=hi {
+                    desired.insert(IVec3::new(x, y, z));
+                }
+                // Underground gameplay needs nearby caves, not every cave
+                // beneath every distant mountain.
+                if (x - c.x).abs() <= 2 && (z - c.z).abs() <= 2 {
+                    for y in (c.y - 2).max(MIN_Y / SIZE)..=(c.y + 2).min(MAX_Y / SIZE) {
+                        desired.insert(IVec3::new(x, y, z));
+                    }
+                }
+            }
+        }
+        desired
+    }
     pub fn stream(&mut self, pos: Vec3, radius: i32) -> Vec<IVec3> {
-        self.meshes.clear();
         let c = chunk(pos.floor().as_ivec3());
         let mut removed = vec![];
         let radius = radius.max(0);
         if c != self.center || radius != self.radius {
             self.center = c;
             self.radius = radius;
-            let mut desired = HashSet::new();
-            // Only retain columns in this view: bounded memory even after long travel.
-            self.surface_bounds
-                .retain(|&(x, z), _| (x - c.x).abs() <= radius && (z - c.z).abs() <= radius);
-            for x in c.x - radius..=c.x + radius {
-                for z in c.z - radius..=c.z + radius {
-                    // Heights depend only on the seed. Reuse overlapping columns
-                    // across replans, while sampling all 256 heights in new columns.
-                    let (low, high) = if let Some(bounds) = self.surface_bounds.get(&(x, z)) {
-                        *bounds
-                    } else {
-                        let (mut low, mut high) = (MAX_Y, MIN_Y);
-                        for dx in 0..SIZE {
-                            for dz in 0..SIZE {
-                                let h = self.height(x * SIZE + dx, z * SIZE + dz);
-                                low = low.min(h);
-                                high = high.max(h + 6);
-                                if let Some((_, level)) =
-                                    self.waterway_column(x * SIZE + dx, z * SIZE + dz)
-                                {
-                                    low = low.min(level - 8);
-                                    high = high.max(level + 1);
-                                }
-                            }
-                        }
-                        self.surface_bounds.insert((x, z), (low, high));
-                        (low, high)
-                    };
-                    let lo = (low.div_euclid(SIZE) - 1).max(MIN_Y / SIZE);
-                    let hi = high.div_euclid(SIZE).min(MAX_Y / SIZE);
-                    for y in lo..=hi {
-                        desired.insert(IVec3::new(x, y, z));
-                    }
-                    // Underground gameplay needs nearby caves, not every cave
-                    // beneath every distant mountain.
-                    if (x - c.x).abs() <= 2 && (z - c.z).abs() <= 2 {
-                        for y in (c.y - 2).max(MIN_Y / SIZE)..=(c.y + 2).min(MAX_Y / SIZE) {
-                            desired.insert(IVec3::new(x, y, z));
-                        }
+            self.plan_ready = false;
+            self.desired.clear();
+            if let Some(workers) = &self.workers {
+                for key in workers.cancel_pending() {
+                    self.active.remove(&key);
+                    if self.chunks.contains_key(&key) && !self.pending.contains(&key) {
+                        self.pending.push_back(key);
                     }
                 }
             }
             self.chunks.retain(|key, _| {
-                let keep = desired.contains(key);
+                let keep = (key.x - c.x).abs() <= radius && (key.z - c.z).abs() <= radius;
                 if !keep {
                     removed.push(*key);
                 }
                 keep
             });
-            self.desired = desired;
-            let mut wanted: Vec<_> = self
-                .desired
-                .iter()
-                .copied()
-                .filter(|k| !self.chunks.contains_key(k))
-                .collect();
-            let mut queued: HashSet<_> = wanted.iter().copied().collect();
-            // Keep queued remeshes of resident edited chunks when replanning.
-            for key in &self.pending {
-                if self.desired.contains(key) && queued.insert(*key) {
-                    wanted.push(*key);
+            self.pending
+                .retain(|key| (key.x - c.x).abs() <= radius && (key.z - c.z).abs() <= radius);
+            self.meshes.retain(|(key, _)| self.chunks.contains_key(key));
+        }
+        let planner = self
+            .planner
+            .get_or_insert_with(crate::streaming::Planner::new);
+        if let Some(plan) = planner.receive() {
+            self.planning = false;
+            self.surface_bounds = plan.bounds;
+            if plan.center == c && plan.radius == radius {
+                self.plan_ready = true;
+                let desired = plan.desired;
+                self.chunks.retain(|key, _| {
+                    let keep = desired.contains(key);
+                    if !keep {
+                        removed.push(*key);
+                    }
+                    keep
+                });
+                self.desired = desired;
+                let mut wanted: Vec<_> = self
+                    .desired
+                    .iter()
+                    .copied()
+                    .filter(|k| !self.chunks.contains_key(k))
+                    .collect();
+                let mut queued: HashSet<_> = wanted.iter().copied().collect();
+                // Keep queued remeshes of resident edited chunks when replanning.
+                for key in &self.pending {
+                    if self.desired.contains(key) && queued.insert(*key) {
+                        wanted.push(*key);
+                    }
                 }
+                wanted.sort_by_key(|p| ((*p - c).length_squared(), p.x, p.y, p.z));
+                self.pending = wanted.into();
             }
-            wanted.sort_by_key(|p| ((*p - c).length_squared(), p.x, p.y, p.z));
-            self.pending = wanted.into();
+        }
+        if !self.plan_ready && !self.planning {
+            planner.request(
+                self.seed,
+                c,
+                radius,
+                std::mem::take(&mut self.surface_bounds),
+            );
+            self.planning = true;
         }
         let mut priorities_changed = false;
-        for key in self.dirty.drain(..) {
+        self.meshes.retain(|(key, _)| !self.dirty.contains(key));
+        for key in if self.plan_ready {
+            std::mem::take(&mut self.dirty)
+        } else {
+            Vec::new()
+        } {
             if self.desired.contains(&key) && !self.pending.contains(&key) {
                 self.pending.push_back(key);
                 priorities_changed = true;
@@ -801,9 +993,21 @@ impl World {
         let workers = self
             .workers
             .get_or_insert_with(crate::streaming::Workers::new);
-        while let Some(result) = workers.receive() {
+        let accept_start = std::time::Instant::now();
+        while self.meshes.len() < crate::streaming::UPLOAD_BACKLOG
+            && accept_start.elapsed() < std::time::Duration::from_millis(2)
+        {
+            let Some(result) = workers.receive() else {
+                break;
+            };
             self.active.remove(&result.key);
             if !self.desired.contains(&result.key) {
+                if !self.plan_ready
+                    && self.chunks.contains_key(&result.key)
+                    && !self.pending.contains(&result.key)
+                {
+                    self.pending.push_back(result.key);
+                }
                 continue;
             }
             if result.revision != self.revision {
@@ -815,17 +1019,22 @@ impl World {
             }
             self.pending.retain(|k| *k != result.key);
             for (i, b) in result.blocks.iter().enumerate() {
-                if b.fluid().is_some() {
+                if b.fluid().is_some() || matches!(b, Block::Sand | Block::Gravel | Block::Leaves) {
                     let p = result.key * SIZE
                         + IVec3::new(
                             i as i32 % SIZE,
                             i as i32 / (SIZE * SIZE),
                             i as i32 / SIZE % SIZE,
                         );
-                    self.fluid_pending.insert(p.to_array());
+                    if b.fluid().is_some() {
+                        self.fluid_pending.insert(p.to_array());
+                    } else {
+                        self.physics_pending.insert(p.to_array());
+                    }
                 }
             }
             self.chunks.insert(result.key, result.blocks);
+            self.meshes.retain(|(key, _)| *key != result.key);
             self.meshes.push((result.key, result.mesh));
         }
         if priorities_changed {
@@ -833,8 +1042,12 @@ impl World {
                 .make_contiguous()
                 .sort_by_key(|p| ((*p - c).length_squared(), p.x, p.y, p.z));
         }
-        // At most two jobs (including completed results) can occupy memory.
-        while self.active.len() < crate::streaming::WORKERS {
+        // A bounded backlog keeps workers running between redraws.
+        let dispatch_start = std::time::Instant::now();
+        while self.plan_ready
+            && self.active.len() < crate::streaming::MAX_OUTSTANDING
+            && dispatch_start.elapsed() < std::time::Duration::from_millis(2)
+        {
             let Some(i) = self.pending.iter().position(|k| !self.active.contains(k)) else {
                 break;
             };
@@ -876,7 +1089,11 @@ impl World {
         self.chunks.contains_key(&k)
     }
     pub fn stream_counts(&self) -> [usize; 3] {
-        [self.chunks.len(), self.pending.len(), self.active.len()]
+        [
+            self.chunks.len(),
+            self.pending.len() + self.meshes.len() + usize::from(!self.plan_ready),
+            self.active.len(),
+        ]
     }
     pub fn chunk_count(&self) -> usize {
         self.chunks.len()
@@ -1053,14 +1270,14 @@ mod tests {
             Vec3::new(-16., -100., -16.),
             Vec3::new(1024., 500., 1024.),
         ] {
-            cached.stream(pos, 2);
+            wait_for_plan(&mut cached, pos, 2);
             let mut fresh = World::new(314159);
-            fresh.stream(pos, 2);
+            wait_for_plan(&mut fresh, pos, 2);
             assert_eq!(cached.desired, fresh.desired);
             assert_eq!(cached.surface_bounds, fresh.surface_bounds);
             assert_eq!(cached.surface_bounds.len(), 25);
         }
-        cached.stream(Vec3::ZERO, 0);
+        wait_for_plan(&mut cached, Vec3::ZERO, 0);
         assert_eq!(cached.surface_bounds.len(), 1);
     }
     #[test]
@@ -1090,17 +1307,17 @@ mod tests {
             .max_by_key(|(x, z)| w.height(*x, *z))
             .unwrap();
         let pos = Vec3::new(x as f32, 40., z as f32);
-        w.stream(pos, 0);
+        wait_for_plan(&mut w, pos, 0);
         let surface = chunk(IVec3::new(x, w.height(x, z), z));
         assert!(surface.y > chunk(pos.as_ivec3()).y + 4);
         assert!(w.desired.contains(&surface));
-        w.stream(pos, 2);
+        wait_for_plan(&mut w, pos, 2);
         let edge = IVec3::new(surface.x + 2, surface.y, surface.z);
         assert!(
             w.pending.iter().any(|k| k.x == edge.x && k.z == edge.z)
                 || w.chunks.keys().any(|k| k.x == edge.x && k.z == edge.z)
         );
-        w.stream(Vec3::new(0., 40., 0.), 0);
+        wait_for_plan(&mut w, Vec3::new(0., 40., 0.), 0);
         assert!(w.pending.iter().all(|k| k.x == 0 && k.z == 0));
     }
     #[test]
@@ -1108,9 +1325,9 @@ mod tests {
         let mut w = World::new(42);
         let pos = Vec3::new(-1., 40., 16.);
         let key = chunk(pos.as_ivec3());
-        w.stream(pos, 1);
+        wait_for_plan(&mut w, pos, 1);
         assert!(!w.active.is_empty());
-        assert!(w.active.len() <= crate::streaming::WORKERS);
+        assert!(w.active.len() <= crate::streaming::MAX_OUTSTANDING);
         // These edits happen after immutable snapshots were submitted. They
         // invalidate old results, including AO in diagonal neighboring chunks.
         let edit = key * SIZE;
@@ -1147,6 +1364,7 @@ mod tests {
         let moved = pos + Vec3::X * SIZE as f32;
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         loop {
+            w.meshes.clear();
             w.stream(moved, 1);
             if let Some((_, mesh)) = w.meshes.iter().find(|(k, _)| *k == key) {
                 let expected = crate::render::mesh_chunk(&w, key);
@@ -1163,14 +1381,39 @@ mod tests {
     #[test]
     fn obsolete_background_jobs_cannot_reload_evicted_chunks() {
         let mut w = World::new(42);
-        w.stream(Vec3::new(0., 40., 0.), 0);
+        wait_for_plan(&mut w, Vec3::new(0., 40., 0.), 0);
         let old = w.active.clone();
         let pos = Vec3::new(1000., 40., 1000.);
         let key = chunk(pos.as_ivec3());
         wait_for_chunk(&mut w, pos, key);
         assert!(old.iter().all(|k| !w.loaded(*k)));
         assert!(w.chunks.keys().all(|k| w.desired.contains(k)));
-        assert!(w.active.len() <= crate::streaming::WORKERS);
+        assert!(w.active.len() <= crate::streaming::MAX_OUTSTANDING);
+    }
+    #[test]
+    fn obsolete_plans_are_rejected_and_edits_during_planning_survive() {
+        let mut w = World::new(42);
+        w.stream(Vec3::new(-1000., 40., -1000.), 2);
+        assert!(w.planning);
+        // Move before accepting the first plan. No old plan or result may be applied.
+        let pos = Vec3::new(1024., 40., 1024.);
+        let key = chunk(pos.as_ivec3());
+        let edit = key * SIZE;
+        w.set(edit, Block::Planks);
+        wait_for_chunk(&mut w, pos, key);
+        assert!(w.plan_ready);
+        assert!(
+            w.desired
+                .iter()
+                .all(|k| (k.x - key.x).abs() <= 1 && (k.z - key.z).abs() <= 1)
+        );
+        assert_eq!(w.chunks[&key][index(edit)], Block::Planks);
+        let expected = crate::render::mesh_chunk(&w, key);
+        let actual = &w.meshes.iter().find(|(k, _)| *k == key).unwrap().1;
+        assert_eq!(
+            bytemuck::cast_slice::<_, u8>(actual),
+            bytemuck::cast_slice::<_, u8>(&expected)
+        );
     }
     #[test]
     fn negative_chunks() {
@@ -1215,10 +1458,23 @@ mod tests {
         assert!(peak > 384, "peak was {peak}");
         assert!(peak < MAX_Y);
     }
+    fn wait_for_plan(w: &mut World, pos: Vec3, radius: i32) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            w.meshes.clear();
+            w.stream(pos, radius);
+            if w.plan_ready {
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline, "planning timed out");
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+    }
     fn wait_for_chunk(w: &mut World, pos: Vec3, key: IVec3) {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         while !w.loaded(key) {
             assert!(std::time::Instant::now() < deadline, "streaming timed out");
+            w.meshes.clear();
             w.stream(pos, 1);
             std::thread::sleep(std::time::Duration::from_millis(1));
         }
@@ -1516,5 +1772,256 @@ mod cave_tests {
                 Block::Grass
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod sky_column_tests {
+    use super::*;
+
+    #[test]
+    fn pulse_queries_match_direct_reads_across_world_layers() {
+        for seed in [42, 314159, 987654] {
+            let mut world = World::new(seed);
+            for (x, z) in [(-17, -16), (0, 0), (255, 256), (1024, -1024)] {
+                let y = world.height(x, z);
+                let p = IVec3::new(x, y + 1, z);
+                for resident in [false, true] {
+                    if resident {
+                        world
+                            .chunks
+                            .insert(chunk(p), vec![Block::Planks; 4096].into_boxed_slice());
+                    }
+                    for support in [Block::Dirt, Block::Stone, Block::Air] {
+                        world.set(p - IVec3::Y, support);
+                        for block in [
+                            Block::Air,
+                            Block::Water,
+                            Block::Lava,
+                            Block::FlowingWater(7),
+                            Block::Leaves,
+                            Block::RedFlower,
+                        ] {
+                            world.set(p, block);
+                            let mut queries = BlockQueries::default();
+                            for dy in (-64..=32).chain([MIN_Y - y - 2, MAX_Y - y + 2]) {
+                                for dx in -1..=1 {
+                                    for dz in -1..=1 {
+                                        let q = IVec3::new(x + dx, y + dy, z + dz);
+                                        let expected = world.get(q);
+                                        // Both fresh queries and cache hits must match.
+                                        for _ in 0..2 {
+                                            assert_eq!(
+                                                queries.get(&world, q),
+                                                expected,
+                                                "seed={seed} q={q} resident={resident}"
+                                            );
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn cached_occupancy_matches_world_queries_with_edits_and_resident_chunks() {
+        for seed in [42, 314159, 987654] {
+            let mut world = World::new(seed);
+            for (x, z) in [(-17, -16), (0, 0), (255, 256)] {
+                let y = world.height(x, z);
+                for resident in [false, true] {
+                    if resident {
+                        // Deliberately different from procedural terrain to verify precedence.
+                        world.chunks.insert(
+                            chunk(IVec3::new(x, y, z)),
+                            vec![Block::Planks; 4096].into_boxed_slice(),
+                        );
+                    }
+                    for block in [
+                        Block::Stone,
+                        Block::Air,
+                        Block::Leaves,
+                        Block::Water,
+                        Block::RedFlower,
+                    ] {
+                        world.set(IVec3::new(x, y + 1, z), block);
+                        let column = world.sky_column(x, z);
+                        for dy in -64..=32 {
+                            let p = IVec3::new(x, y + dy, z);
+                            let expected = world.get(p);
+                            assert_eq!(
+                                column.blocked(&world, p),
+                                expected.solid() && expected != Block::Leaves,
+                                "seed={seed} p={p} resident={resident} edit={block:?}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+impl World {
+    pub(crate) fn wake_physics(&mut self, p: IVec3) {
+        self.physics_pending.insert(p.to_array());
+        for d in [
+            IVec3::X,
+            IVec3::NEG_X,
+            IVec3::Y,
+            IVec3::NEG_Y,
+            IVec3::Z,
+            IVec3::NEG_Z,
+        ] {
+            self.physics_pending.insert((p + d).to_array());
+        }
+    }
+
+    /// Bounded active frontier; one falling voxel step per 200ms pulse.
+    pub fn tick_block_physics(&mut self, center: IVec3, pulse: u32) {
+        let nearby: Vec<_> = self
+            .physics_pending
+            .iter()
+            .copied()
+            .filter(|p| (IVec3::from_array(*p) - center).abs().max_element() <= 64)
+            .collect();
+        let count = nearby.len();
+        let ready: Vec<_> = nearby
+            .into_iter()
+            .cycle()
+            .skip(if count == 0 {
+                0
+            } else {
+                pulse as usize * 256 % count
+            })
+            .take(count.min(256))
+            .collect();
+        let mut queries = BlockQueries::default();
+        let mut supported = HashSet::new();
+        let mut changes = Vec::new();
+        for key in ready {
+            self.physics_pending.remove(&key);
+            let p = IVec3::from_array(key);
+            let b = queries.get(self, p);
+            if matches!(b, Block::Sand | Block::Gravel) && p.y > MIN_Y + 1 {
+                let below = queries.get(self, p - IVec3::Y);
+                if below.replaceable() {
+                    changes.push((p, Block::Air));
+                    changes.push((p - IVec3::Y, b));
+                }
+            } else if b == Block::Leaves && supported.contains(&p) {
+                self.physics_pending.insert(key);
+            } else if b == Block::Leaves {
+                let mut seen = HashSet::from([p]);
+                let mut todo = VecDeque::from([p]);
+                let mut attached = false;
+                while let Some(q) = todo.pop_front() {
+                    for d in [
+                        IVec3::X,
+                        IVec3::NEG_X,
+                        IVec3::Y,
+                        IVec3::NEG_Y,
+                        IVec3::Z,
+                        IVec3::NEG_Z,
+                    ] {
+                        let n = q + d;
+                        match queries.get(self, n) {
+                            Block::Log => {
+                                attached = true;
+                                break;
+                            }
+                            Block::Leaves if seen.insert(n) => todo.push_back(n),
+                            _ => {}
+                        }
+                    }
+                    if attached || seen.len() >= 4096 {
+                        break;
+                    }
+                }
+                // Large unresolved components remain alive and retry later.
+                if attached || !todo.is_empty() {
+                    supported.extend(seen);
+                    self.physics_pending.insert(key);
+                } else if hash(self.seed ^ pulse as u64, p.x, p.y, p.z).is_multiple_of(16) {
+                    changes.push((p, Block::Air));
+                } else {
+                    self.physics_pending.insert(key);
+                }
+            }
+        }
+        drop(queries);
+        for (p, b) in changes {
+            self.set(p, b);
+        }
+    }
+}
+
+#[cfg(test)]
+mod vegetation_physics_tests {
+    use super::*;
+
+    #[test]
+    fn sediment_falls_and_keeps_its_material() {
+        for block in [Block::Sand, Block::Gravel] {
+            let mut w = World::new(41);
+            let p = IVec3::new(0, 200, 0);
+            w.set(p - IVec3::Y * 3, Block::Stone);
+            w.set(p - IVec3::Y, Block::Water);
+            w.set(p, block);
+            for tick in 0..30 {
+                w.tick_block_physics(p, tick);
+            }
+            assert_eq!(w.get(p), Block::Air);
+            assert_eq!(w.get(p - IVec3::Y * 2), block);
+        }
+    }
+
+    #[test]
+    fn leaves_follow_support_chains_and_decay_after_wood_is_removed() {
+        let mut w = World::new(41);
+        let p = IVec3::new(15, 200, -16);
+        w.set(p, Block::Log);
+        for x in 1..=8 {
+            w.set(p + IVec3::X * x, Block::Leaves);
+        }
+        for tick in 0..100 {
+            w.tick_block_physics(p, tick);
+        }
+        for x in 1..=8 {
+            assert_eq!(w.get(p + IVec3::X * x), Block::Leaves);
+        }
+        w.set(p, Block::Air);
+        w.tick_block_physics(p, 100);
+        assert!((1..=8).any(|x| w.get(p + IVec3::X * x) == Block::Leaves));
+        for tick in 101..600 {
+            w.tick_block_physics(p, tick);
+        }
+        for x in 1..=8 {
+            assert_eq!(w.get(p + IVec3::X * x), Block::Air);
+        }
+    }
+
+    #[test]
+    fn trees_have_varied_heights_and_roots_across_biomes() {
+        let w = World::new(41);
+        let mut roots = HashSet::new();
+        let mut heights = HashSet::new();
+        for x in (-400..400).step_by(3) {
+            for z in (-400..400).step_by(3) {
+                if let Some((tx, ty, tz)) = w.tree(x, z) {
+                    if roots.insert((tx, tz)) {
+                        assert_ne!(w.biome(tx, tz), Biome::Tundra);
+                        assert_eq!(w.get(IVec3::new(tx, ty + 1, tz)), Block::Log);
+                        heights.insert(5 + hash(w.seed ^ 0x74726565, tx, 0, tz) % 5);
+                    }
+                }
+            }
+        }
+        assert!(roots.len() > 100);
+        assert_eq!(heights.len(), 5);
     }
 }

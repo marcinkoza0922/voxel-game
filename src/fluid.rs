@@ -86,21 +86,25 @@ impl World {
                 candidates.insert((p + d).to_array());
             }
         }
+        let mut queries = crate::world::BlockQueries::default();
         let mut changes = Vec::new();
         for key in candidates {
             let p = IVec3::from_array(key);
             if !(MIN_Y + 1..=MAX_Y).contains(&p.y) {
                 continue;
             }
-            let old = self.get(p);
+            let old = queries.get(self, p);
             if !old.replaceable() {
                 continue;
             }
-            let neighbors = SIDES.map(|d| self.get(p + d));
+            let neighbors = SIDES.map(|d| queries.get(self, p + d));
             if old.fluid().is_some_and(|(lava, _)| lava)
-                && NEIGHBORS
-                    .iter()
-                    .any(|d| self.get(p + *d).fluid().is_some_and(|(lava, _)| !lava))
+                && NEIGHBORS.iter().any(|d| {
+                    queries
+                        .get(self, p + *d)
+                        .fluid()
+                        .is_some_and(|(lava, _)| !lava)
+                })
             {
                 changes.push((
                     p,
@@ -121,21 +125,21 @@ impl World {
                     if old.fluid().is_some()
                         || NEIGHBORS
                             .iter()
-                            .any(|d| self.get(p + *d).fluid().is_some_and(|(l, _)| l))
+                            .any(|d| queries.get(self, p + *d).fluid().is_some_and(|(l, _)| l))
                     {
                         self.fluid_pending.insert(key);
                     }
                     continue;
                 }
                 let source = if lava { Block::Lava } else { Block::Water };
-                let below = self.get(p - IVec3::Y);
+                let below = queries.get(self, p - IVec3::Y);
                 let renewable = !lava
                     && neighbors.iter().filter(|b| **b == Block::Water).count() >= 2
                     && (below.solid() || below == Block::Water);
                 let level = if old == source || renewable {
                     Some(0)
-                } else if self
-                    .get(p + IVec3::Y)
+                } else if queries
+                    .get(self, p + IVec3::Y)
                     .fluid()
                     .is_some_and(|(l, _)| l == lava)
                 {
@@ -145,8 +149,8 @@ impl World {
                         .iter()
                         .filter_map(|d| {
                             let n = p + *d;
-                            let (kind, level) = self.get(n).fluid()?;
-                            let floor = self.get(n - IVec3::Y);
+                            let (kind, level) = queries.get(self, n).fluid()?;
+                            let floor = queries.get(self, n - IVec3::Y);
                             if kind != lava || !(floor.solid() || floor.fluid() == Some((lava, 0)))
                             {
                                 return None;
@@ -178,6 +182,7 @@ impl World {
                 changes.push((p, next));
             }
         }
+        drop(queries); // The cached snapshot ends before committing changes.
         for (p, b) in changes {
             self.set(p, b);
         }
@@ -260,7 +265,7 @@ impl World {
         })
     }
 
-    /// Small stone-lined pools in gentle terrain, outside the protected spawn.
+    /// Irregular sediment-lined ponds (stone-lined lava) outside the protected spawn.
     pub(crate) fn pool_block(&self, p: IVec3, height: i32) -> Option<Block> {
         if p.x.abs() < 32 && p.z.abs() < 32 {
             return None;
@@ -273,9 +278,12 @@ impl World {
         }
         let x = cx * 64 + 16 + ((h >> 8) % 32) as i32;
         let z = cz * 64 + 16 + ((h >> 24) % 32) as i32;
-        let dx = (p.x - x).abs();
-        let dz = (p.z - z).abs();
-        if dx > 5 || dz > 5 {
+        let dx = p.x - x;
+        let dz = p.z - z;
+        let radius = 4.2 + ((h >> 48) % 3) as f32 * 0.35;
+        let edge = (dx as f32 * 0.9).hypot(dz as f32 * 1.1) - radius
+            + 0.45 * (dx as f32 * 1.3 + dz as f32 * 0.8).sin();
+        if edge > 1. {
             return None;
         }
         let y = self.height(x, z);
@@ -290,8 +298,23 @@ impl World {
         if !(y - 3..=height.max(y) + 1).contains(&p.y) {
             return None;
         }
-        if dx == 5 || dz == 5 || p.y == y - 3 {
-            return (p.y <= y).then_some(Block::Stone);
+        let floor = y - 2 - i32::from(edge < -1.8);
+        if p.y <= floor || edge >= 0. {
+            return (p.y <= y - i32::from(edge < 0.)).then_some(if lava {
+                Block::Stone
+            } else {
+                match hash(
+                    self.seed ^ 0x62616e6b,
+                    p.x.div_euclid(2),
+                    0,
+                    p.z.div_euclid(2),
+                ) % 5
+                {
+                    0 => Block::Gravel,
+                    1 => Block::Dirt,
+                    _ => Block::Sand,
+                }
+            });
         }
         Some(if p.y < y {
             if lava {
@@ -441,7 +464,10 @@ mod tests {
         assert_eq!(w.biome(p.x, p.z), Biome::Tundra);
         assert!(w.get(p).solid());
         assert_eq!(w.get(p - IVec3::Y), Block::Water);
-        assert_eq!(w.get(p - IVec3::Y * 2), Block::Stone);
+        assert!(matches!(
+            w.get(p - IVec3::Y * 2),
+            Block::Stone | Block::Sand | Block::Gravel | Block::Dirt
+        ));
         assert!(warm.is_some());
         let mut broken = World::new(w.seed);
         broken.set(p, Block::Air);
@@ -505,6 +531,46 @@ mod tests {
     }
 
     #[test]
+    fn pond_banks_are_irregular_and_mix_sediments() {
+        let w = World::new(41);
+        let mut sand = false;
+        let mut gravel = false;
+        let mut dirt = false;
+        let mut irregular = false;
+        for cx in 1..12 {
+            for cz in 1..12 {
+                let h = hash(w.seed ^ 0x706f6f6c, cx, 0, cz);
+                let x = cx * 64 + 16 + ((h >> 8) % 32) as i32;
+                let z = cz * 64 + 16 + ((h >> 24) % 32) as i32;
+                let y = w.height(x, z);
+                if w.pool_block(IVec3::new(x, y - 1, z), y) != Some(Block::Water) {
+                    continue;
+                }
+                let mut widths = std::collections::HashSet::new();
+                for dz in -6..=6 {
+                    let mut width = 0;
+                    for dx in -6..=6 {
+                        let p = IVec3::new(x + dx, y - 1, z + dz);
+                        width +=
+                            i32::from(w.pool_block(p, w.height(p.x, p.z)) == Some(Block::Water));
+                        match w.pool_block(p - IVec3::Y * 2, w.height(p.x, p.z)) {
+                            Some(Block::Sand) => sand = true,
+                            Some(Block::Gravel) => gravel = true,
+                            Some(Block::Dirt) => dirt = true,
+                            _ => {}
+                        }
+                    }
+                    if width > 0 {
+                        widths.insert(width);
+                    }
+                }
+                irregular |= widths.len() > 1;
+            }
+        }
+        assert!(sand && gravel && dirt && irregular);
+    }
+
+    #[test]
     fn natural_pools_are_repeatable_and_match_chunk_halos() {
         let w = World::new(41);
         let mut water = None;
@@ -533,8 +599,11 @@ mod tests {
                 halo[(local.x + 18 * (local.z + 18 * local.y)) as usize],
                 w.get(p)
             );
-            assert_eq!(w.get(p - IVec3::Y * 2), Block::Stone);
-            assert_eq!(w.get(p + IVec3::X * 5), Block::Stone);
+            assert!(matches!(
+                w.get(p - IVec3::Y * 2),
+                Block::Stone | Block::Sand | Block::Gravel | Block::Dirt
+            ));
+            assert!(w.get(p + IVec3::X * 5).solid());
         }
     }
 }

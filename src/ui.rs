@@ -20,8 +20,29 @@ pub enum Action {
     Save,
     Quit,
     NewWorld,
+    LoadMenu,
+    Load(usize),
+    Page(i32),
+    Settings,
+    Back,
+    Title,
+    Setting(u8),
 }
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Screen {
+    Game,
+    Title,
+    Load,
+    Settings,
+}
+
 pub struct Ui {
+    pub screen: Screen,
+    pub focus: usize,
+    pub page: usize,
+    pub saves: Vec<std::path::PathBuf>,
+    pub settings: crate::settings::Settings,
+    pub notice: String,
     pub vertices: Vec<UiVertex>,
     pub hits: Vec<([f32; 4], Action)>,
     pub scale: f32,
@@ -34,6 +55,12 @@ pub struct Ui {
 impl Ui {
     pub fn new() -> Self {
         Self {
+            screen: Screen::Game,
+            focus: 0,
+            page: 0,
+            saves: vec![],
+            settings: crate::settings::Settings::default(),
+            notice: String::new(),
             vertices: vec![],
             hits: vec![],
             scale: 1.,
@@ -82,25 +109,38 @@ impl Ui {
         }
     }
     pub fn button(&mut self, r: [f32; 4], label: &str, action: Action, enabled: bool) {
+        let hovered = self.pointer.0 / self.scale >= r[0]
+            && self.pointer.0 / self.scale < r[0] + r[2]
+            && self.pointer.1 / self.scale >= r[1]
+            && self.pointer.1 / self.scale < r[1] + r[3];
+        let selected = self.screen != Screen::Game && self.focus == self.hits.len();
         self.rect(
             r[0],
             r[1],
             r[2],
             r[3],
-            if enabled {
+            if enabled && (hovered || selected) {
+                [0.28, 0.40, 0.33, 0.98]
+            } else if enabled {
                 [0.17, 0.25, 0.24, 0.98]
             } else {
                 [0.12, 0.14, 0.16, 0.98]
             },
         );
         self.text(
-            r[0] + 8.,
+            if self.screen == Screen::Game {
+                r[0] + 8.
+            } else {
+                r[0] + (r[2] - label.chars().count() as f32 * 6. * 1.4) / 2.
+            },
             r[1] + 9.,
             label,
             1.4,
             if enabled { INK } else { MUTED },
         );
-        self.hits.push((r, action));
+        if enabled {
+            self.hits.push((r, action));
+        }
     }
     pub fn click(&self, x: f32, y: f32) -> Option<Action> {
         let x = x / self.scale;
@@ -115,6 +155,10 @@ impl Ui {
         self.begin(width, height);
         let w = self.width;
         let h = self.height;
+        if self.screen != Screen::Game {
+            self.menu();
+            return;
+        }
         if pack {
             self.pack(g);
             return;
@@ -132,13 +176,13 @@ impl Ui {
                 Action::Quit,
                 true,
             );
+            self.button([x, y + 208., 320., 42.], "Settings", Action::Settings, true);
             self.button(
-                [x, y + 208., 320., 42.],
-                "New world (saves current)",
-                Action::NewWorld,
+                [x, y + 260., 320., 42.],
+                "Save and return to title",
+                Action::Title,
                 true,
             );
-            self.text(x, y + 272., "Esc returns to the world", 1.4, MUTED);
             if g.message_time > 0. {
                 self.text(24., h - 40., &g.message, 1.3, INK);
             }
@@ -278,6 +322,135 @@ impl Ui {
             self.text(w / 2. - 317., 128., &g.message, 1.25, INK);
         }
     }
+    fn menu(&mut self) {
+        let w = self.width;
+        let h = self.height;
+        self.rect(0., 0., w, h, [0.025, 0.045, 0.065, 0.90]);
+        // Broad stepped ridges echo the surrounding voxel landscape.
+        for layer in 0..2 {
+            for i in 0..56 {
+                let t = i as f32 / 56.;
+                let ridge = (t * 8. + layer as f32 * 2.).sin().abs() * 58. + (t * 19.).cos() * 12.;
+                let height = 30. + ridge + layer as f32 * 25.;
+                self.rect(
+                    i as f32 * w / 56.,
+                    h - height,
+                    w / 56. + 1.,
+                    height,
+                    if layer == 0 {
+                        [0.045, 0.085, 0.10, 1.]
+                    } else {
+                        [0.025, 0.055, 0.065, 1.]
+                    },
+                );
+            }
+        }
+        let x = w / 2. - 220.;
+        self.text(x + 130., 74., "VOXEL", 6., INK);
+        self.text(
+            x + 107.5,
+            126.,
+            "A D V E N T U R E",
+            2.5,
+            [0.65, 0.79, 0.63, 1.],
+        );
+        match self.screen {
+            Screen::Title => {
+                self.text(
+                    x + (440. - 24. * 6. * 1.4) / 2.,
+                    193.,
+                    "A WORLD BEYOND THE HORIZON",
+                    1.4,
+                    MUTED,
+                );
+                for (n, label, action) in [
+                    (0, "New game", Action::NewWorld),
+                    (1, "Load game", Action::LoadMenu),
+                    (2, "Settings", Action::Settings),
+                    (3, "Quit", Action::Quit),
+                ] {
+                    self.button([x, 244. + n as f32 * 57., 440., 44.], label, action, true);
+                }
+            }
+            Screen::Settings => {
+                let settings = self.settings.clone();
+                for (n, label) in settings.labels().iter().enumerate() {
+                    self.button(
+                        [x, 180. + n as f32 * 42., 440., 35.],
+                        label,
+                        Action::Setting(n as u8),
+                        (n != 0 || settings.upscaler == 0)
+                            && (!matches!(n, 3 | 4) || settings.upscaler == 0)
+                            && (n != 8 || settings.upscaler != 0),
+                    );
+                }
+                let output = (
+                    (self.width * self.scale).round() as u32,
+                    (self.height * self.scale).round() as u32,
+                );
+                let size = settings.render_size(output.0, output.1);
+                self.text(
+                    x,
+                    565.,
+                    &format!(
+                        "World: {} x {}   Output: {} x {}",
+                        size.0, size.1, output.0, output.1
+                    ),
+                    1.2,
+                    MUTED,
+                );
+                self.button([x, 590., 440., 39.], "Back", Action::Back, true);
+            }
+            Screen::Load => {
+                self.text(x, 188., "SELECT A SAVED WORLD", 1.8, INK);
+                let start = self.page * 6;
+                let count = self.saves.len().saturating_sub(start).min(6);
+                if count == 0 {
+                    self.text(x, 246., "No saved worlds found", 1.7, MUTED);
+                }
+                for i in 0..count {
+                    let label = self.saves[start + i]
+                        .file_stem()
+                        .unwrap_or_default()
+                        .to_string_lossy()
+                        .chars()
+                        .take(46)
+                        .collect::<String>();
+                    self.button(
+                        [x, 232. + i as f32 * 48., 440., 39.],
+                        &label,
+                        Action::Load(start + i),
+                        true,
+                    );
+                }
+                self.button(
+                    [x, 540., 140., 39.],
+                    "Previous",
+                    Action::Page(-1),
+                    self.page > 0,
+                );
+                self.button(
+                    [x + 150., 540., 140., 39.],
+                    "Next",
+                    Action::Page(1),
+                    start + count < self.saves.len(),
+                );
+                self.button([x + 300., 540., 140., 39.], "Back", Action::Back, true);
+            }
+            Screen::Game => (),
+        }
+        let notice = self.notice.clone();
+        for (i, line) in notice.as_bytes().chunks(95).take(3).enumerate() {
+            self.text(
+                24.,
+                h - 66. + i as f32 * 16.,
+                &String::from_utf8_lossy(line),
+                1.2,
+                INK,
+            );
+        }
+    }
+
     pub fn icon(&mut self, x: f32, y: f32, item: Item, scale: f32) {
         use Item::*;
         let block = matches!(
@@ -851,5 +1024,41 @@ mod tests {
         assert!(ui.hits.iter().any(|(_, a)| matches!(a, Action::Slot(45))));
         assert!(ui.hits.iter().any(|(_, a)| matches!(a, Action::Slot(46))));
         assert!(ui.hits.iter().any(|(_, a)| matches!(a, Action::Output)));
+    }
+}
+
+#[cfg(test)]
+mod menu_tests {
+    use super::*;
+    #[test]
+    fn title_has_only_menu_actions_and_disabled_buttons_cannot_be_clicked() {
+        let mut ui = Ui::new();
+        ui.screen = Screen::Title;
+        ui.build(&Game::new(7), false, false, 900, 600, 60.);
+        assert_eq!(ui.hits.len(), 4);
+        assert!(matches!(ui.hits[0].1, Action::NewWorld));
+        assert!(matches!(ui.hits[1].1, Action::LoadMenu));
+        assert!(matches!(ui.hits[2].1, Action::Settings));
+        ui.begin(900, 600);
+        ui.button([10., 10., 100., 40.], "Disabled", Action::Quit, false);
+        assert!(ui.click(20. * ui.scale, 20. * ui.scale).is_none());
+    }
+    #[test]
+    fn every_save_is_reachable_and_settings_fit_minimum_window() {
+        let mut ui = Ui::new();
+        ui.screen = Screen::Load;
+        ui.saves = (0..13).map(|i| format!("world-{i}.json").into()).collect();
+        ui.page = 2;
+        ui.build(&Game::new(7), false, false, 900, 600, 60.);
+        assert!(ui.hits.iter().any(|(_, a)| matches!(a, Action::Load(12))));
+        assert!(!ui.hits.iter().any(|(_, a)| matches!(a, Action::Page(1))));
+        ui.screen = Screen::Settings;
+        ui.build(&Game::new(7), false, false, 900, 600, 60.);
+        assert_eq!(ui.hits.len(), 9);
+        for (r, _) in &ui.hits {
+            assert!(
+                r[0] >= 0. && r[1] >= 0. && r[0] + r[2] <= ui.width && r[1] + r[3] <= ui.height
+            );
+        }
     }
 }

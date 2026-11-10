@@ -11,6 +11,11 @@ use std::time::{Duration, Instant};
 pub fn run(mut game: Game, options: &Options) -> Result<(), String> {
     let mut renderer = pollster::block_on(Renderer::headless(1280, 800))?;
     let result = (|| {
+        let settings = crate::settings::Settings::read(&options.settings_path)?;
+        renderer.apply_settings(&settings)?;
+        if options.title {
+            renderer.ui.screen = crate::ui::Screen::Title;
+        }
         let mut profile = options
             .profile
             .as_deref()
@@ -21,7 +26,9 @@ pub fn run(mut game: Game, options: &Options) -> Result<(), String> {
             let start = Instant::now();
             let interval = start.duration_since(last).as_secs_f64() * 1000.;
             last = start;
-            if options.pack {
+            if options.title {
+                // Title previews do not advance or write a world.
+            } else if options.pack {
                 game.tick_furnace();
             } else {
                 game.tick(&Input::default(), STEP);
@@ -63,6 +70,7 @@ pub fn run(mut game: Game, options: &Options) -> Result<(), String> {
                 std::thread::sleep(Duration::from_millis(1));
             }
             let stream_ms = streaming.elapsed().as_secs_f64() * 1000.;
+            renderer.profile_draw = profile.is_some();
             let draw = Instant::now();
             renderer.draw(
                 &game,
@@ -87,13 +95,16 @@ pub fn run(mut game: Game, options: &Options) -> Result<(), String> {
                     game.world.stream_counts(),
                     true,
                     options.pack,
+                    renderer.draw_times,
                 )?;
             }
         }
         if let Some(profile) = &mut profile {
             profile.finish()?;
         }
-        save::write(&game, &options.save)?;
+        if !options.title {
+            save::write(&game, &options.save)?;
+        }
         println!(
             "Headless render completed: {} frames",
             options.frames.unwrap_or(240)
