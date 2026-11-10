@@ -32,7 +32,7 @@ The slice uses `winit 0.30`, `wgpu 27`, `glam` for primitive vector/matrix math,
 
 The initial ECS is a small, single-archetype component store: generational entity IDs index reusable slots containing position, health, level and AI cooldown. Creature behavior and physics run in explicit simulation systems. This is deliberately smaller than a general archetype/query framework. More component stores and scheduling can be added when multiple entity classes require them. Creatures are transient and respawn after loading; player state, discoveries, recipe counts, tool wear, torches, time and block edits persist.
 
-Terrain chunks are 16x16x16. Stream radius is ten chunks horizontally (160 blocks along each axis). Each horizontal chunk column samples all 256 terrain heights and streams from one chunk below its lowest surface through its highest surface plus tree canopy, without clamping mountains to player elevation. A five-by-five horizontal area additionally streams two chunks above/below the player for cave exploration. Streaming replans on player chunk or radius changes and evicts chunks outside the desired set. Jobs are ordered by distance with deterministic ties; obsolete mesh jobs are discarded and remaining mesh jobs reprioritized near the player. Two persistent CPU workers generate chunk blocks and meshes together from a shared one-block halo. At most 64 jobs, including completed results, are outstanding per world. Workers run continuously from that backlog between redraws; completed results and pending GPU uploads each have a 32-mesh capacity. Result acceptance, snapshot dispatch and GPU uploads each have a two-millisecond soft budget per call, stopping between whole chunks. Workers receive immutable seed/local-edit snapshots and never access authoritative state or GPU resources. The main thread polls without waiting, accepts only still-desired results matching the current edit revision, and retries invalidated jobs. Revision checks are conservatively world-wide: unrelated edits can also trigger retries. Evicted results are discarded. Pending resident remeshes survive stream replanning; boundary edits invalidate diagonal neighbors for AO. Worker channels close and threads join on world destruction, bounded by outstanding jobs. A dedicated planner computes terrain column bounds and desired chunk sets, with one outstanding request/result; obsolete plans are rejected and the latest view is requested next. Priority sorting, edit snapshot copying, residency updates and GPU uploads remain synchronous. Sampling is deterministic whether or not a chunk is resident. Surface heights are roughly 24–800, with mountain growth suppressed near spawn. The full legal range is -512..1535. Mountain surfaces within the view radius can render at any generated elevation. Horizontal fog fades between 112 and 160 blocks; the camera far plane is 1,024 blocks to include tall nearby peaks. Conservative chunk AABB tests independently cull camera and sun-shadow draws. CPU meshing uses a one-block halo with shared column height/tree data (324 column evaluations instead of up to 5,832 for an unloaded halo), shared-face culling and diagonal-aware corner AO. LOD and greedy meshing remain future performance work; this iteration retains exact voxel geometry and existing terrain generation/save compatibility. Rendering uses a 2048-square sun depth map with 3x3 comparison filtering, a day/night intensity cycle, fog, and the nearest sixteen warm torch lights. Held torches occupy one light slot. Placed torches expire after 600 simulation seconds, and placement is capped at 256 active torches.
+Terrain chunks are 16x16x16. Stream radius is ten chunks horizontally (160 blocks along each axis). Each horizontal chunk column samples all 256 terrain heights and streams from one chunk below its lowest surface through its highest surface plus tree canopy, without clamping mountains to player elevation. A five-by-five horizontal area additionally streams two chunks above/below the player for cave exploration. Streaming replans on player chunk or radius changes and evicts chunks outside the desired set. Jobs are ordered by distance with deterministic ties; obsolete mesh jobs are discarded and remaining mesh jobs reprioritized near the player. Two persistent CPU workers generate chunk blocks and meshes together from a shared one-block halo. At most 64 jobs, including completed results, are outstanding per world. Workers run continuously from that backlog between redraws; completed results and pending GPU uploads each have a 32-mesh capacity. Result acceptance and snapshot dispatch share a deadline, stopping between whole chunks. CPU-only polls allow two milliseconds; rendering reserves the first millisecond for CPU streaming and uploads until a shared two-millisecond deadline. Frontier maintenance remains coherent in the same call and can overrun the soft deadline. Workers receive immutable seed/local-edit snapshots and never access authoritative state or GPU resources. The main thread polls without waiting, accepts only still-desired results matching the current edit revision, and retries invalidated jobs. Revision checks are conservatively world-wide: unrelated edits can also trigger retries. Evicted results are discarded. Pending resident remeshes survive stream replanning; boundary edits invalidate diagonal neighbors for AO. Worker channels close and threads join on world destruction, bounded by outstanding jobs. A dedicated planner computes terrain column bounds and desired chunk sets, with one outstanding request/result; obsolete plans are rejected and the latest view is requested next. Priority sorting, edit snapshot copying, residency updates and GPU uploads remain synchronous. Sampling is deterministic whether or not a chunk is resident. Surface relief is regional: flat plains have at most three blocks of underlying relief, hills rise to roughly 66, mountains to roughly 326, and very rare mega mountains can approach 1,376. Mountain growth is suppressed near spawn. The full legal range is -512..1535. Mountain surfaces within the view radius can render at any generated elevation. Horizontal fog fades between 112 and 160 blocks; the camera far plane is 1,024 blocks to include tall nearby peaks. Conservative chunk AABB tests independently cull camera and sun-shadow draws. CPU meshing uses a one-block halo with shared column height/tree data (324 column evaluations instead of up to 5,832 for an unloaded halo), shared-face culling and diagonal-aware corner AO. LOD and greedy meshing remain future performance work; this iteration retains exact voxel geometry and existing voxel geometry/save format compatibility. Rendering uses a 2048-square sun depth map with 3x3 comparison filtering, a day/night intensity cycle, fog, and the nearest sixteen warm torch lights. Held torches occupy one light slot. Placed torches expire after 600 simulation seconds, and placement is capped at 256 active torches.
 
 The owned GUI is an immediate-mode triangle builder with rectangle buttons, pointer hit regions, a built-in 5x7 font and resolution-aware scaling. The pack has a 27-slot backpack, nine real hotbar slots, shaped crafting, a recipe pattern guide, a furnace view and attribute allocation. Escape menus and lost focus pause simulation. Opening the pack pauses movement and survival while furnace processing continues. Crafting recipes are instant transactions; furnaces process automatically over five seconds per item. Tables and furnaces must be within three blocks. A wood bedroll recipe substitutes for the later wool economy. Leaves supply berries as a renewable slice food source. Husks provide combat and meat; animals and audio are deferred. All visuals are code-native voxel geometry and glyphs, so no asset authoring tools or generated raster assets were used.
 
@@ -59,22 +59,9 @@ Validation for this change: formatting, Clippy with warnings denied, all 30 quie
 
 VSync update validation: formatting, short-format Clippy with warnings denied, quiet nextest, and gameplay/persistence smoke passed. The initial sandboxed native run could not connect to the Wayland socket (EPERM). Repeating the 120-frame Vulkan run outside the sandbox connected to the compositor, rendered, saved to a temporary world, and exited successfully. Refresh-rate timing was not measured. The historical 60 FPS capture above used the removed software timer.
 
-## Measured playtest and streaming follow-up
+## Playtest and streaming follow-up
 
-Optional `--profile PATH` diagnostics live in `tools/performance.rs`, included as
-a Rust module. A buffered CSV records unclamped start-to-start frame intervals,
-simulation/autosave, streaming plus GPU uploads, draw/presentation wall times,
-and resident/queued/active chunk counts, plus focus/menu flags. The first frame
-has no interval. Memory use stays bounded; explicit flush errors propagate on
-exit. Draw times include surface waits and final capture readback, not GPU
-execution timestamps. A slow phase in row N typically affects interval N+1.
-`tools/analyze-profile.py` reports nearest-rank median/p95/max and chunk peaks;
-`--skip` and `--limit` select a frame range. Profiling is opt-in.
-
-`--tour` performs deterministic camera relocations every 180 frames, including
-adjacent chunk crossings and distant terrain, repeating after 1,800 frames.
-It requires a frame bound and an explicit unused save path. This is a streaming
-stress route, not a walked gameplay expedition. `tools/expedition.rs` implements
+`tools/expedition.rs` implements
 `--expedition`: fresh inventory, controlled resource arena, DDA mining, recipe
 transactions, station placement, copper gear, combat/loot, eating, sleep blocked
 by enemies and restored after victory, persistent torches, natural forest
@@ -90,7 +77,8 @@ surface heights. Replanning uses hash-set membership for queued remesh merging,
 and queue sorting runs only when priorities change rather than every redraw.
 Regression coverage compares desired chunks and cached bounds to fresh worlds
 across negative coordinates, elevation changes, distant moves and radius changes.
-See PLAYTEST.md for timings, actual checks and limitations.
+See [PLAYTEST.md](PLAYTEST.md) for gameplay checks and limitations, and
+[PROFILING.md](PROFILING.md) for profiling workflows and measurements.
 
 ## Slot inventory and shaped crafting
 
@@ -311,8 +299,12 @@ out-of-range drops and pickups blocked by a full inventory remain silent.
 ## Iron expeditions and tundra ruins
 
 The second tier extends the existing registries without changing earlier item
-discriminants or recipe indices. Iron veins occur in every biome, below twelve
-blocks of cover, and require a copper pickaxe. A table crafts a crude smelter
+discriminants or recipe indices. Ore uses deterministic 2x2x2 vein cells in every
+biome: copper occupies 2/101 eligible cells, coal 3/101, and iron 2/101.
+Copper and coal start four blocks below the local surface; iron starts eight
+blocks below it. All three continue to the world's bottom stone layer, so the
+metal ranges overlap with iron only slightly deeper. Caves and other terrain
+features can replace ore. Iron requires a copper pickaxe. A table crafts a crude smelter
 from six cobblestone and two copper ingots. It shares placed-furnace inventory,
 reach, transfer, fuel, XP, mining protection and persistence rules, but can also
 process iron. Basic furnaces cannot process iron and consume no fuel trying.
@@ -664,14 +656,20 @@ torches, automatic climbing, and diagonal edge protection.
 
 Grassland keeps open sightlines, with existing tall-grass patches supplemented by
 meadow-clustered flowers and sparse berry shrubs between meadows. Existing flower
-colors, harvesting and planting rules remain in use. Low stone outcrops use one
-seeded candidate per 48-block cell (one third qualify), with centers inset ten
-blocks to keep neighboring formations apart. Five families of elliptical lobes
-produce rounded boulders, broad slabs, ridges, split rocks and uneven clusters,
-with seeded size, rotation and reflection variations and heights of one to three
-blocks. A gentle grassland surface check keeps them grounded. They use ordinary mineable stone;
-direct queries and chunk halo generation share the same rules. As with earlier
-terrain additions, untouched generated terrain changes while saved edits win.
+colors, harvesting and planting rules remain in use. Stone outcrops occur in grassland and snowy biomes, with one seeded candidate per
+48-block cell and one ninth qualifying. Centers are inset sixteen blocks. Five
+families of elliptical lobes vary in rotation, reflection and proportions; most
+use unit scale, a quarter use double scale and one sixteenth use triple scale
+independently for height, width and depth (up to nine blocks tall and roughly
+thirty blocks wide). This permits broad low slabs, narrow tall rocks and elongated
+ridges without tying their footprint to their height. They merge into slopes within
+six blocks of their center elevation. Snowy columns have snow caps over mineable
+stone. Surface streaming reserves sixteen blocks above terrain for these features.
+Mountain and mega-mountain biomes additionally have seeded candidates in 96-block
+cells (one fifth qualify) for elliptical ridge passages or shorter overhang
+recesses, retaining at least three blocks of roof and exposing stone around the
+opening. Existing water, ruin and cave rules take precedence. Direct queries and
+chunk halos share feature evaluation; saved edits continue to win.
 
 Small groups of up to three sheep appear on clear grassland surfaces near the
 player, checked every 18 seconds after the initial four-second delay. At most six
@@ -720,9 +718,13 @@ harvest. This is an approximation of Minecraft-style behavior: no conserved
 volume, pressure, slope-search routing, fluid currents, waterlogging, fire
 spread or exact edition-specific water/lava reaction rules.
 
-The ordered frontier provides deterministic bounded work. Cells beyond 64 blocks
-on any axis sleep until approached. Changed blocks wake themselves and six
-neighbors; accepting streamed chunks seeds their fluid cells. Loading a save
+The ordered frontier provides deterministic bounded work, with a rotating key
+cursor so continuing activity at one end cannot starve spillways at the other.
+Cells beyond 64 blocks on any axis sleep until approached. Changed blocks wake
+themselves and six neighbors; first acceptance of streamed chunks seeds exposed
+sources, existing flow and fluid contacts from the worker's halo. Quiet interiors
+and open air above a water surface do not need updates; resident remeshes do not
+reseed fluids. Loading a save
 rebuilds the frontier around saved edits. Settled fluids require no ongoing full
 world scan. Streamed meshes retain ordinary edit revision checks. A growing flow
 can invalidate in-flight mesh work; a pulse is not guaranteed to process every
@@ -742,16 +744,21 @@ item and does not automatically regrow; breaking it exposes the water below.
 Seeded 384-block cells can also contain two irregular inland lakes (roughly 40–60
 blocks across) connected by a winding, roughly ten-block-wide river. Candidate
 sites reject steep endpoint/river elevations and stay outside the starting area.
-Each system shares a level water surface, has shallows and deeper lake centers,
-and uses sand banks and a sealed bed down to eight blocks below the surface.
+Each system has an upper lake, a descending river and a lower receiving lake.
+Rim heights and the lowest channel bank determine their elevations. Wet paths
+are continuous across terraces and waterfall drops, with source water in the
+channel and supplied falling water at vertical transitions. Shore aprons blend
+into native terrain without raising retaining walls; other lake shores stay
+closed. Beds have three sediment blocks over a stable stone foundation.
 These larger bodies remain liquid in every biome, including tundra. Waterways
 override small pools and caves; ruins retain priority. Trees whose roots would
 intersect waterways or pools are suppressed. Streaming bounds include lake beds
 and elevated water surfaces. Direct queries and chunk halos use identical seeded
 sampling; player edits still override generated water and ice. Existing unedited
 terrain gains these features on load. Rivers currently connect local lake pairs;
-there is no global drainage network, current simulation, seasonal freeze/thaw,
-ocean generation or underground lava-lake generation.
+there is no global drainage network, current simulation, seasonal freeze/thaw
+or underground lava-lake generation. Continental oceans and sea-level river
+valleys are described below.
 
 Tests cover frozen and warm ponds, breaking ice to expose liquid, liquid tundra
 rivers/lakes, basin beds, and agreement between chunk halos and direct queries.
@@ -906,60 +913,11 @@ with an isolated preferences file to exercise graphics settings without changing
 normal preferences. Native debugging required an unrestricted driver run; a
 sandboxed native attempt crashed, while unrestricted FSR and DLSS completed.
 
-## CPU stress and sampling tools
+## Performance tools and measurements
 
-`cargo run --release -- --stress --frames 12 --profile target/cpu.csv`
-runs deterministic CPU workloads without creating a window, reading settings or
-accessing saves. `--seed` selects the terrain seed; `--frames` is the positive
-repetition count in this mode (default 12). One complete warmup is excluded.
-Samples rotate through four fixed surface locations, so distributions include
-terrain variation. CSV rows contain workload, repetition index, wall milliseconds
-and output units (halo cells, vertices, final fluid edits, or peak resident chunks).
-The console prints median/p95/max; timings are observations, not CI speed gates.
-
-`tools/stress.rs` measures halo generation, surface meshing, surface sky access,
-a synthetic checkerboard mesh, cave sky access, twelve fluid pulses from 512
-sources, and settled radius-one streaming through adjacent chunks and a distant
-teleport and return. Setup is outside each timer. Streaming includes planning,
-worker generation/lighting, polling and one-millisecond sleeps; it has a
-60-second deadline per repetition. Cave fixtures can be empty for some seeds;
-consult vertex units before comparing lighting timings. This is CPU coverage;
-it does not measure GPU execution, uploads or full render-radius throughput.
-
-`tools/profile-cpu.sh [output-directory] [repetitions]` builds release, records
-compiler/OS/git metadata, saves CSV and summaries, then attempts a separate
-`perf record --call-graph dwarf` run and writes a flat self-time report. Release
-builds retain line tables for symbolized stacks. Perf permission failures are
-reported in `perf-error.txt` while baseline timings remain available. For flame
-graphs, use `cargo flamegraph --release -- --stress --frames 12` where sampling
-permissions allow it. Sampling overhead is excluded from the baseline CSV.
-
-For end-to-end render profiling, existing `--headless --tour --frames 1800
---save /tmp/unique-world.json --profile target/render.csv --settings
-/tmp/isolated-settings.json` exercises the full scripted route with isolated
-files (the save must not exist). `tools/analyze-profile.py target/render.csv`
-summarizes it. Headless tour relocation frames deliberately wait for terrain
-settlement; analyze these separately from steady frames. Draw timings measure
-CPU submission/presentation waits, not GPU timestamp durations.
-
-Validation (2026-11-09): formatting, short Clippy and all 110 quiet nextest
-tests pass. Release stress completed 24 measured repetitions after warmup.
-Final baseline median/p95 milliseconds: halo 0.636/0.828, surface mesh
-0.326/0.498, surface sky 5.287/19.083, checkerboard 1.437/1.878,
-cave sky 5.388/37.843, twelve fluid pulses 149.931/151.824, and four
-settled streaming relocations 164.044/168.869. These are local wall-time
-observations; earlier runs varied substantially with machine load. Output is
-in `target/performance/{cpu.csv,summary.txt,environment.txt}`. Perf recording
-was attempted with user-space cycles both sandboxed and unrestricted, but
-host performance-counter access was denied; no sampled call graph was obtained.
-
-The offscreen 1,800-frame tour completed outside the sandbox (the sandboxed
-attempt stalled and was interrupted). `target/performance-render.csv` contains
-all frames: CPU draw/submission median 0.363 ms, p95 1.326 ms; peak residency
-1,284 chunks; longest stream settlement 2,215.413 ms. This run overlapped an
-initial CPU stress pass, so treat it as stress coverage rather than an isolated
-render benchmark. Interval timings describe the preceding frame, so a settlement
-at frame 1620 appears in interval 1621. GPU timestamps were not collected.
+See [PROFILING.md](PROFILING.md) for CPU/GPU/resource profiling workflows,
+benchmark results, sampling investigations and historical comparisons.
+The implementation decisions below describe the resulting caches and streaming architecture.
 
 ### Skylight CPU optimization
 
@@ -977,20 +935,6 @@ queries and exposure against the original direct sampling and full ray traversal
 across three seeds, negative coordinates, cave depths, roof openings, leaves and
 removed high edits. All 111 quiet nextest tests, formatting and short Clippy pass.
 
-A fresh release comparison with 24 measured repetitions each (seed 314159) is
-in `target/performance/lighting-{before,after}.{csv,txt}`. Median/p95 ms changed:
-surface lighting 5.654/21.000 -> 1.214/8.991; cave lighting 6.288/39.734 ->
-2.368/15.680; settled streaming 170.369/175.045 -> 113.970/117.777. This is
-roughly 79% less median surface-lighting time, 62% less cave-lighting time and
-33% less streaming time on this machine. Unchanged workloads show some load
-variation, so these are local observations, not fixed performance guarantees.
-No new GPU measurement was needed: vertex exposure is checked for exact equality.
-
-Further candidates, not implemented: share procedural column metadata across
-occupancy ray queries, precompute ray offsets, and use a bounded dense occupancy
-cache in chunk workers. Persistent cross-mesh lighting caches would also need
-careful edit invalidation; current per-operation caches avoid that complexity.
-
 ### Shared occupancy column metadata
 
 Skylight now stores `World::SkyColumn` values per horizontal coordinate for each
@@ -1007,50 +951,6 @@ compares direct world queries at negative, boundary and distant coordinates
 across three seeds, generated terrain, deliberately different resident chunks,
 and stone/air/leaf/water/plant edits. All 112 quiet nextest tests, short Clippy,
 formatting and diff checks pass.
-
-The fresh 24-repetition release comparison is recorded in
-`target/performance/occupancy-{before,after}.{csv,txt}`. Cave-lighting median/p95
-fell from 1.669/9.161 to 0.667/4.745 ms (60%/48% reduction). Surface lighting
-changed from 0.889/5.269 to 0.916/6.025 ms, with no demonstrated improvement;
-settled streaming changed from 94.985/101.296 to 102.851/118.247 ms. Other
-unchanged workloads also varied substantially between runs, so this result
-supports faster cave occupancy sampling, not an overall streaming speedup.
-Column metadata sharing is now implemented; precomputed ray offsets and bounded
-dense occupancy storage remain possible future work.
-A 48-repetition confirmation (`occupancy-after-confirm.{csv,txt}`) measured
-cave-lighting median 0.669 ms and p95 5.918 ms, surface median 0.853 ms,
-and streaming median 98.972 ms, reinforcing the cave improvement while
-showing continuing tail and machine-load variability.
-
-### Profiling rerun (2026-11-09)
-
-`target/performance-rerun/` records a fresh release CPU run (24 repetitions,
-seed 314159) and a subsequent isolated 1,800-frame offscreen tour. CPU workload
-median/p95 ms: halo 0.430/0.823, surface mesh 0.236/0.452, surface sky
-0.954/6.265, checkerboard 0.859/2.254, cave sky 0.854/10.463, twelve fluid
-pulses 107.043/169.862, four settled relocations 98.194/124.865.
-The stress reporter uses the upper middle sample for even-sized medians.
-
-Tour steady frames (excluding relocation/final settlement) measured draw CPU
-wall time median 0.510 ms, p95 1.611 ms and max 83.974 ms. Simulation max
-was 0.917 ms. Initial settlement took 1,434.973 ms; distant relocations/return
-1,056.949–1,329.602 ms; adjacent moves 58.418–91.903 ms. Peak residency
-was 1,284 chunks. Settlement is deliberately blocking in the headless runner;
-these durations are terrain readiness latency, not native-window frame stalls.
-GPU execution timestamps remain unmeasured.
-
-Hardware sampling succeeded outside the sandbox with `perf record -e cycles:u
---user-callchains --call-graph dwarf`. The explicit user-callchain option is
-needed with this host's `perf_event_paranoid=2`; user-only counting worked
-without it, but recording failed. The helper now includes this flag. The sampled
-run is separate from baseline timing. Its core-PMU flat self-time report shows
-main-thread hypot 16.75%, height 16.26%, biome 9.61%, floorf 4.50%, tree
-3.16%; worker samples also highlight meshing, height/biome/waterway generation
-and skylight. These percentages describe this mixed synthetic workload and
-include fixture setup, not the game's frame budget. Repeated procedural terrain
-queries are the strongest CPU optimization candidate; fluid pulses and terrain
-readiness are the largest measured workload costs. Raw samples and report are
-`target/performance-rerun/perf.{data}` and `perf-report.txt`.
 
 ### Per-pulse fluid query cache
 
@@ -1070,87 +970,14 @@ heights, world bounds, deliberately different resident chunks, fluid/air/leaf/
 plant edits and supported/unsupported plants. All 113 quiet nextest tests,
 short Clippy, formatting and diff checks pass.
 
-Fresh release measurements (48 repetitions, seed 314159, one excluded warmup)
-are in `target/performance-rerun/fluid-{before,after}.{csv,txt}`. Twelve-pulse
-median/p95 fell from 91.712/126.552 to 23.315/24.722 ms (75%/80% reduction).
-Every workload's output units match between runs. Other workloads were slower
-in the after run, consistent with machine-load variation; settled streaming
-changed from 93.534/109.694 to 111.570/114.769 ms. This demonstrates faster
-fluid stress updates, not a streaming or general frame-rate improvement.
-
-
-### Windowed profiling follow-up (2026-11-09)
-
-`--profile` now appends five CPU wall-time columns: `draw_prepare_ms`
-(dynamic geometry, lighting and UI), `surface_acquire_ms`, `draw_encode_ms`
-(including encoder finish), `queue_submit_ms`, and `present_capture_ms`
-(including optional capture readback). Phase clocks run only with profiling
-enabled. These remain CPU timings, not GPU execution timestamps. The analyzer
-accepts older CSVs, reports intervals exceeding common frame budgets, and
-attributes the five worst intervals to the preceding frame's phases. The
-remaining interval time includes event-loop/pacing waits and uninstrumented
-work, not necessarily a stall. `--tour` additionally reports settlement and
-ending queue counts per 180-frame stage; only use it for tour recordings.
-
-Fresh release native Wayland tours (seed 314159, isolated saves/preferences)
-and a separate 3,600-frame perf sampling run are in
-`target/performance-followup/`. The unsampled original 1,800-frame tour had
-interval median/p95/max 6.061/6.902/12.499 ms, with no intervals above
-16.667 ms. The instrumented repeat measured 6.081/6.669/20.640 ms,
-with three intervals above 16.667 ms. Its three worst intervals followed
-distant relocations: synchronous stream/upload consumed 18.619, 16.746 and
-15.635 ms. Streaming replans still evaluate all 256 heights and waterway
-inputs for every newly visible horizontal chunk column on the main thread,
-then evict, rebuild desired sets and sort jobs. Moving that planning work off
-the main thread or budgeting it is a strong hitch-reduction candidate.
-
-Detailed median/p95 CPU draw phases (ms): preparation 0.294/0.499,
-surface acquire 0.051/0.091, encoding 0.380/0.898, queue submission
-0.148/0.274, presentation 0.070/0.133. Surface acquisition max was
-0.276 ms. Run-to-run draw costs varied, so these are observations rather
-than an instrumentation overhead comparison or GPU throughput conclusion.
-
-A structural terrain-throughput limit is independent of these frame costs:
-only two jobs including completed results may be outstanding, and new jobs
-are dispatched only when the main thread polls once per redraw. Consequently,
-throughput cannot exceed twice the redraw rate: 120 chunks/second at 60 FPS,
-or about 330 at 165 FPS, even if workers finish early. The initial desired
-set contains 1,171 chunks; the original tour accepted 358 in its first 180
-frames and did not settle until frame 625 while crossing adjacent columns.
-Distant locations commonly remained incomplete at the next relocation.
-A further 1,800-frame run with an isolated 60-FPS setting accepted 354
-chunks in the first stage and first settled at frame 631 (10.576 seconds),
-versus frame 625 (3.795 seconds) in the original uncapped/VSync run.
-The route is frame-based, so relocation spacing in seconds also changes;
-the nearly identical settlement frame counts support the scheduling limit.
-The 60-FPS run had interval median/p95/max 16.767/16.861/26.799 ms
-and peak synchronous stream/upload 22.409 ms.
-Decoupling a bounded worker backlog from a separately budgeted per-frame
-upload queue is the leading terrain-readiness candidate. Simply adding
-workers or accelerating generation cannot remove the frame-dependent limit.
-
-The separate perf recording lost no samples (seven out-of-order events were
-reported). Core-PMU self time highlights worker height (7.13% across both
-workers), hypot (6.99%), skylight sampling (6.64%), biome (6.04%), halo
-meshing (5.71%) and waterway queries (5.32%). These are shares of sampled
-CPU cycles across the run, not frame-time percentages. UI rectangle generation
-also appears at 2.16%. Procedural/lighting optimization remains relevant,
-but should follow scheduling and synchronous planning investigation.
-
-Validation: release build, short Clippy, formatting, diff checks and all 114
-quiet nextest tests pass. Analyzer exercised against old and extended CSVs,
-including range selection. This change adds diagnostics; streaming behavior
-is unchanged. Native-upscaler builds and GPU execution timing were not tested.
-
-
 ### Buffered streaming and background planning fix (2026-11-09)
 
 Two CPU mesh workers now consume a shared bounded job backlog continuously,
 with at most 64 outstanding jobs including completed results. Completed CPU
 results use a 32-slot blocking channel, and accepted meshes awaiting GPU upload
-are separately capped at 32. The main thread uses independent two-millisecond
-soft budgets for accepting results, dispatching snapshots and uploading meshes;
-budgets stop between whole chunks, so a single expensive chunk can overrun.
+are separately capped at 32. The initial implementation used independent two-millisecond soft budgets. The
+2026-11-10 movement follow-up below replaces those with shared deadlines; a
+single expensive chunk and coherent frontier maintenance can still overrun.
 Backpressure bounds memory while permitting many completions between redraws.
 World mesh output persists until consumed, replacing older queued meshes for the
 same key. Dirty meshes are removed before upload, and edit revision validation
@@ -1170,41 +997,11 @@ Shutdown discards queued jobs and disconnects the completed receiver before
 joining workers, so full result channels cannot deadlock destruction. A planner
 can finish its sole outstanding plan during shutdown.
 
-Fresh sequential release tour recordings are in `target/performance-fix/`;
-comparisons use `target/performance-followup/` from the preceding investigation.
-Each tour uses seed 314159, 1,800 frames, and isolated saves/preferences:
-
-| Measurement | Before | After |
-| --- | ---: | ---: |
-| 60-FPS tour first settlement | 10.576 s (frame 631) | 0.752 s (frame 45) |
-| ~165-Hz tour first settlement | 4.002 s (frame 660) | 0.922 s (frame 147) |
-| 60-FPS peak stream/upload CPU | 22.409 ms | 3.982 ms |
-| ~165-Hz peak stream/upload CPU | 18.619 ms | 1.986 ms |
-| ~165-Hz interval p95 / max | 6.669 / 20.640 ms | 6.465 / 12.480 ms |
-
-All ten stages settled before the next relocation in both after runs, reaching
-1,284 resident chunks. Earlier tours commonly left distant stages incomplete
-and peaked at 1,200 resident chunks. Tours relocate every 180 frames; first
-settlement thus compares route readiness, not an identical stationary scene.
-Run-to-run CPU/driver load varies. The 60-FPS interval p95 changed from 16.861
-to 17.144 ms despite lower peak stream work; remaining pacing/scheduling tails
-are visible, and GPU execution time is still unmeasured. These results establish
-faster readiness and lower main-thread streaming peaks, not universal FPS gains.
-
-The release CPU stress completed 24 measured repetitions after warmup:
-settled radius-one streaming median/p95 73.787/77.045 ms, twelve fluid pulses
-26.468/28.305 ms. Its relocation timing includes worker polling and sleeps;
-it is separate from the native frame measurements.
-
 All 116 quiet nextest tests, short Clippy, formatting and diff checks pass.
 Regressions cover continuous worker progress without redraw polling, destruction
 with full result backpressure, obsolete plan rejection, and exact blocks/meshes
 for edits during planning, alongside the existing eviction, height bounds,
 column-cache, edit revision and resident-remesh checks.
-
-A separate 1,800-frame offscreen tour also completed successfully, including
-startup, relocation and final blocking settlement, with no queued/active work
-or pending uploads at exit (`target/performance-fix/headless.csv`).
 
 ### Tree variation, pond banks and block physics
 
@@ -1240,3 +1037,540 @@ through long leaf chains, gradual decay after wood removal, irregular mixed
 pond sediment, and existing cold-pond/halo behavior. All 120 quiet nextest tests,
 short Clippy, formatting and diff checks pass. No visual window review was
 performed for these terrain changes.
+
+
+### Continental water and river valleys
+
+Terrain now blends the existing hills/mountains into broad seeded ocean basins
+using a 1,200-block continental noise scale. A warped 260-block noise contour
+cuts winding river valleys to four blocks below the shared sea level (highest
+source voxel Y=24). Rivers are procedural valleys, without drainage simulation;
+connections and routes follow noise rather than a watershed graph. The first
+256 blocks around the origin retain their original heights, with a smooth
+transition to full continental/river shaping at radius 640. Deep ocean beds
+vary with a separate noise field; nearby exposed shores use sand and gravel.
+
+Empty surface columns below sea level receive water sources up to Y=24.
+The upper four bed blocks are sealed sediment before cave carving, preventing
+surface water from spawning into open cave entrances. Oceans and these rivers
+remain liquid in cold biomes. Existing inland lake/river pairs and small ponds
+remain, with low-elevation candidates rejected to avoid replacing the shared
+water surface. Trees and ruins reject submerged roots/sites. Surface streaming
+bounds include sea level even when the seabed lies several chunks beneath it.
+Direct queries, worker generation and halos share these rules; saved edits
+continue to override generation. Existing saves reconstruct unedited terrain
+with the new generator, so shorelines may change around saved builds.
+Underground aquifers and elevated lake water tables remain future work.
+
+Validation: all 123 quiet nextest tests, short Clippy and formatting/diff checks
+pass. New checks cover continental river carving, deep/shallow source-water
+columns, sealed sediment beds, sea-surface streaming, halo/query consistency,
+edit precedence and dry spawn heights across seeds. No windowed visual review
+was performed for this change.
+
+
+### Waterfalls and natural lake shores
+
+Generated water now wakes at exposed side/downward edges and opposing-fluid
+contacts using the worker's existing 18-cube halo, including unresident neighbor
+chunks. Flowing cells also wake for supply/drainage checks. Remesh acceptance
+preserves the existing frontier instead of adding every settled source again.
+The 512-entry pulse budget advances a deterministic rotating key cursor; a busy
+lower-key region cannot indefinitely delay another nearby outlet. Existing
+fall-first rules create falling columns over ledges and horizontal runoff when
+they reach support. These cascades use ordinary persistent flow edits, and drain
+when their supplying source is removed. The existing 64-block activation range
+still limits distant simulation.
+
+Inland lake levels previously depended on the center height and could leave
+raised sand retaining walls or large water sheets above lower surrounding ground.
+The generator now samples both lake rims and both sides of the connecting river
+at roughly block spacing. Their lowest sampled elevation caps the common water
+level (at most one block above that sample); unsuitable low/steep sites are
+rejected. A per-World deterministic cache holds at most 128 cell levels, including
+rejections, to avoid repeating rim sampling for every block or column. Evicting
+cache entries changes no geometry. Aprons carve slopes rather than raise walls;
+pond rims also never add sediment above the original ground. Continental river
+valley shoulders widen with surrounding relief to avoid narrow walls through
+high terrain. Aquifers and watershed simulation remain deferred.
+
+`tools/water_review.rs` adds `cargo run -- --water-review --seed 41`. It finds an
+untouched lake outlet, activates it through normal chunk streaming, advances 90
+fluid pulses, checks falling water, positions a camera and renders one offscreen
+Vulkan frame. It always writes its own `target/water-review/world.json` and
+`waterfall.ppm`, with isolated settings in the same directory; normal saves are
+not loaded or overwritten. The review uses fixed output paths and a single
+stationary frame. The preview can be reopened
+using `cargo run -- --save target/water-review/world.json --frames 900`.
+
+Validation: all 129 quiet nextest tests, short Clippy, formatting and diff checks
+pass. Regressions cover frontier fairness, unloaded-neighbor ledge flow and
+subsequent drainage, quiet ocean interiors, upper-face fluid contacts, untouched
+lake activation through streaming, resident remeshes without reseeding, banks
+that never rise above native terrain, near-shore water elevation, and bounded
+level-cache eviction/determinism. An ore check now samples below the local ground
+height because widened valleys can lie well below an adjacent ruin. The seed-41
+review rendered successfully and was visually inspected: its lake sits within
+sloping shores and spills into a stepped cascade, without a suspended water
+sheet. Its source is (-2764, 30, -2130), with overflow toward positive X.
+
+The full mechanics playtest and controlled progression expedition also pass,
+including crafting, combat, exploration, natural ruin encounters and save reload.
+
+
+### Contained lake-to-lake drainage
+
+`hydrology` replaces unplanned inland spillways with deterministic local drainage
+systems inside the existing 384-block cells. Each accepted pair has an upper lake
+and a lower receiving lake. Exact rasterized rim samples cap lake elevations two
+blocks below surrounding land. The existing winding corridor is rasterized into
+a four-connected voxel path; its water elevation never increases downstream.
+The lower lake is lowered to accept the channel's lowest bank-supported level,
+with sea level as a floor so it can merge with continental water. Very low or
+steep upper sites, wet footprints intersecting ruins, and any actual shore
+column that would permit an unplanned spill are rejected.
+
+Every channel column contains generated source water, independent of the fluid
+solver's seven-block spreading range or the player's activation distance. At
+steps, supplied flowing/falling columns join the higher surface to the lower
+channel, which continues into the receiving lake. Source renewal is suppressed
+within those planned vertical falls so the solver cannot dam a cascade with
+new stationary source cells. Falling/flowing water that lands on source water
+joins the pool without spreading an elevated layer across its surface; only
+sources can supply horizontal flow while supported by a fluid source, while
+all levels can spread on solid support. Explicitly placed sources and ordinary bucket flow
+retain their existing rules. This is a local drainage topology, without global
+watershed routing, erosion, currents or water-volume conservation.
+
+Lake/channel shores carve broad aprons into existing land, never build above it,
+and preserve the higher bank where neighboring reaches at different elevations
+have overlapping aprons. Otherwise a lower reach's apron could cut through a
+higher reach's containment and recreate field runoff. Submerged dry aprons defer
+to continental sea water. Three sediment layers over a stone foundation seal the
+beds above caves and keep generated sand/gravel from collapsing into them.
+Small isolated water/lava pools require a complete containing rim and remain
+closed ponds. Dynamic spill/flow still responds normally when the player edits
+banks or places water elsewhere.
+
+The bounded immutable-plan cache holds up to 64 waterway cells and 128 pond-site
+checks, with FIFO eviction. Main-thread queries, CPU worker snapshots and the
+background surface planner share it through an Arc/Mutex; plans build outside
+the lock and deterministic duplicate results are harmless. Eviction changes no
+blocks. Surface streaming bounds include beds and the full height of falling
+columns. All sampling and saved-edit precedence remain shared across direct
+queries, halos, lighting and workers. Existing saved block/fluid edits retain
+priority; untouched generated water and shores change on load.
+
+`tools/water_review.rs` now locates a planned cascade and reports the upstream
+and receiving lake centers. In addition to the isolated world and waterfall
+render, it writes `target/water-review/watercourse.ppm`, a top-down diagnostic of
+actual wet columns over the whole cell. The seed-41 review connects upper lake
+(-2934, 31, -2138) to lower lake (-2794, 26, -2138) along a 221-column route.
+Its waterfall source is (-2821, 31, -2126). Both the plan view and the Vulkan
+render were inspected: the river reaches its receiving lake and the fall lands
+inside the lower wet channel, with no stream ending on a field.
+
+Validation: all 133 quiet nextest tests, short Clippy, formatting and diff checks
+pass. New regressions sample multiple systems across seeds 1, 41 and 314159:
+non-increasing, four-connected wet routes reach both lake centers; every source
+edge meets solid containment or another wet column; beds stay sealed; and fluid
+simulation over the whole route produces no runoff onto dry fields or dried
+river stretches. Existing waterfall streaming, halo, cache eviction, bucket
+flow and drainage tests remain in place. Pond tests select actual ponds and
+check their containing rim rather than relying on a fixed five-block radius.
+A separate regression checks that a waterfall landing in a pool does not spread
+a raised sheet over the pool's surface. The complete mechanics playtest and
+controlled progression expedition also pass with the new drainage generation.
+
+## Debug god mode
+
+F6 toggles a session-only god mode during active gameplay. The HUD displays the
+mode and flight controls. WASD flies relative to the camera (including pitch),
+Space rises, Shift descends, and the existing double-W sprint increases flight
+speed from 12 to 30 blocks/second. Flight ignores collision, gravity and fluids;
+idle flight hovers. Damage, drowning, hunger/rest drain and out-of-world death
+are disabled. Toggling clears velocity and mining progress.
+
+Left-click uses normal targeting and drops but completes block mining in one
+simulation step, bypassing tool tiers, guardian locks and tool wear. World bounds
+and the requirement to empty processors before mining remain in effect. Block
+edits persist normally; god mode itself is never saved and defaults off on load.
+
+
+### Water distribution and standalone lakes
+
+The 384-block hydrology cells now choose between the established contained
+lake-to-lake cascade and a standalone lake. Cascade candidates occupy one sixth
+of cells instead of one half; another third can host isolated lakes. Standalone
+lakes have weighted size variation: five eighths of candidates use radii of
+24–48 blocks, two eighths use 49–72, and one eighth use 80–104. Seeded aspect
+ratios and irregular shores further vary their shapes. These are candidate
+frequencies; terrain containment determines which actually survive. Standalone
+lakes centered on dry land can use sea-level water tables; cascades still need
+an elevated upper lake. Exact rim checks, carved-shore containment and ruin exclusion
+still reject unsafe sites. Shore sampling and stamping bounds scale with lake
+size, and centers keep the entire plan inside its owning cell. The existing
+cascade geometry remains stable because overlapping reaches need consistent
+source elevations. Standalone plans use identical lake endpoints and a single
+route point; diagnostics that seek waterfalls continue to select actual drops.
+
+Continental ocean blending starts at noise values below 0.54 (previously 0.48),
+creating broader large bodies of water. The initial 0.58 ocean threshold was
+reduced after play feedback so oceans occupy less of the landscape. Larger
+standalone lakes do not change ocean coverage. The protected dry spawn remains intact;
+continental shaping now blends from radius 192 to 448 instead of 256 to 640,
+so ordinary exploration reaches full river and ocean generation earlier. River
+cores widen from a noise-contour tolerance of 0.01 to 0.018, giving rasterized
+channels more margin against dry sand pinches, while retaining the terrain-aware
+valley shoulders and deep ravines. Broad continental shorelines also provide
+more water beside low terrain rather than only excavated inland basins.
+
+Small pools now vary from 2.8 to 8.3 blocks in nominal radius. Seeded aspect,
+orientation and shore perturbation vary their outlines. Generation and cached
+containment use the same shore function and a rim search large enough for every
+variant. Cold lids, sediment, lava containment and the shallow stepped beds stay
+in place. Water tables and player edits retain their existing behavior; unedited
+terrain regenerates with these changes on load.
+
+Regression coverage checks surviving standalone lakes at both small and large
+sizes, wet interiors, cell ownership and preservation of continental water under
+shore aprons. Cold river/lake tests query actual planned surfaces rather than
+assuming the previous fixed template coordinates. Existing route continuity,
+fluid simulation, pond, ocean, spawn and halo checks remain required.
+
+
+### Nearby ocean shores and cave separation
+
+Ocean frequency alone did not constrain the horizon. Continental ocean carving
+now also has a bounded, seeded footprint in each 320-block cell: nominal radii
+96–128, with up to eight blocks of noise perturbation and a 24-block shore blend.
+Dry shoulders between these footprints keep nearby land within the normal
+160-block horizontal streaming range. The river network can still cross those
+shoulders. Inland lakes retain their separate weighted 24–104 radius variation.
+A regression samples actual source-water positions across three seeds and checks
+for solid shore within 144 blocks along sixteen directions. This is a terrain
+proximity check, not a guarantee about camera direction or visual occlusion.
+
+Cave geometry is split into raw intervals (used during hydrology planning) and
+water-aware intervals (used by terrain queries and halos). Completed lake/river
+plans cap cave ceilings twelve blocks below their waterline throughout their
+wet footprint and shore apron. Continental wet columns and small pools also cap
+nearby caves at sampled offsets up to twelve blocks away. This preserves deep
+caves while preventing most exposed mouths immediately beside water, rather
+than relying on a thin sediment plug to separate the two. The raw/safe split
+avoids recursion between cave and lake containment planning.
+
+One in 32 seeded cave formations can intersect continental water. Where a cave
+reaches within three blocks of a submerged bed, generated falling water opens
+the bed and connects the sea-level source to the cavern floor. Ordinary fluid
+simulation can spread the landing water into the cavern. Planned inland lakes
+and cascades retain their rock buffer even in these rare formations. Tests cover
+ordinary cave separation, an actual rare supplied underground fall surviving
+fluid pulses and matching its chunk halo, varied surviving cave sizes, and the
+existing water/shore continuity checks.
+
+## Regional terrain variants
+
+Grassland and snow climates each expose flat, hills, mountains and mega mountains
+through biome names and discovery. The existing Tundra discovery name is retained
+for snow plains. A seeded 650-block noise field selects tiers at 0.40, 0.72 and
+0.94; smooth ramps within tiers avoid elevation steps. Mega mountain regions
+occupy less than one percent of a broad deterministic sample. Forests retain
+ordinary rolling relief, with mountain amplitude fading across forest boundaries.
+Spawn relief fades in over radii 100–600. Existing oceans and river valleys carve
+the resulting terrain; they can lower otherwise flat regions near water. Legal
+world limits remain -512..1535, with generated surfaces reserving canopy space.
+All snow variants freeze ponds and retain snow cover; all grassland variants
+retain grassland vegetation and animal eligibility. Existing saved edits persist,
+but unedited procedural terrain changes with the new generation rules.
+
+Validation covers both climates at every tier, ordinary height bounds, flat local
+slopes, deterministic rarity, and increasing maximum elevations. The pond halo
+regression searches the full supported pond extent for its containing rim.
+Tree roots also reject cave carving at the first trunk voxel, preventing missing
+trunks on the newly common gentle terrain.
+
+### Underground streaming frontiers
+
+GPU-ready chunks, including chunks with empty meshes, track their six neighbors.
+Where a neighbor has not uploaded a mesh, the renderer caps underground boundary
+areas with black geometry. Vertical caps stop at the lower opaque roof of the
+columns on either side; horizontal caps cover only columns with an opaque roof
+at or above that plane. Roof queries use authoritative procedural terrain and
+edits, independent of residency. Directly exposed sky stays open. Caps use scene
+depth, have zero surface color and sky access, receive no torch brightness or
+atmospheric fog, and never enter the shadow pass. This hides absent cave geometry
+from cameras both outside and inside caves, including the finite underground
+streaming range and delayed GPU uploads.
+
+Frontier masks and buffers are cached until neighbor readiness changes. Roofs
+are shared across cap builds in a coordinate cache bounded to the view radius
+plus one chunk for boundary samples. Each successful voxel edit queues its exact
+horizontal block column in `World::roof_dirty`; the renderer drains that set
+before streaming. Only referenced columns are queried again. Unchanged roofs
+preserve every cap; changed roofs invalidate only caps in that horizontal chunk
+column and its neighbors, at all elevations. This handles roofs across chunk
+boundaries without rebuilding distant buffers after mining. Eviction removes
+readiness/frontier buffers and prunes roof queries outside the view. Switching
+worlds clears all three caches. The skybox and
+surface fog use their original lighting again: camera-wide sky dimming did not
+cover outside views into caves and incorrectly dimmed visible outdoor sky. Caps
+are temporary opaque closures, so cave geometry and lights beyond an unready
+boundary remain hidden until streaming supplies their meshes. Chunk selection,
+terrain generation and saves are unchanged.
+
+Regression tests cover readiness for empty chunks, neighbor arrival/eviction,
+exposed sky, roof edits, and the outdoor camera/ray from `saves/world-36.json`
+(seed and coordinates embedded in the test, with no dependency on local saves).
+Offscreen captures of a copy of that save reproduce the blue opening before the
+change and show it sealed afterward with the outdoor sky preserved. The original
+save is never passed to a runner that writes it.
+
+Validation: formatting, Clippy with warnings denied, all 148 quiet nextest tests,
+gameplay/persistence smoke and automated playtest/expedition passed. Offscreen
+Vulkan captures of the latest save passed; the settled scene contained 1,446
+resident chunks.
+
+### Mining frontier validation
+
+Mining fix validation: formatting, Clippy with warnings denied, all 149 quiet
+nextest tests, gameplay/persistence smoke and automated playtest/expedition
+passed. Offscreen captures of the current save and the original entrance fixture
+completed; the entrance still has no blue opening. User saves were read only.
+
+### Stationary TAA edge shimmer
+
+The built-in TAA resolve now samples the jittered scene at the offset corresponding
+to each fixed output pixel and stores history with an unjittered camera matrix.
+Previously both output and history inherited the current Halton offset, making
+high-contrast voxel edges shimmer even with a frozen camera and simulation.
+Stationary views retain 95 percent accepted history with a 0.03 neighborhood
+clipping margin to preserve subpixel coverage. The renderer passes the original
+unjittered camera directly to TAA, so exact view comparisons do not depend on
+floating point cancellation of jitter. With an identical view and valid history,
+output pixels reuse their exact history UV and bypass reprojection depth rejection:
+jitter samples on different sides of a silhouette must not repeatedly invalidate
+that pixel. Neighborhood color clipping still rejects stale colors. Any camera
+translation, rotation, projection change or invalid history restores depth-tested
+reprojection and the tighter, difference-dependent clipping/weight. Native
+upscaler motion/reprojection is unchanged.
+
+`tools/still_review.rs`, invoked with `cargo run -- --still-review --save PATH
+--capture DIRECTORY`, loads the save read only, settles streaming offscreen,
+applies saved graphics settings, and freezes camera and simulation. It renders
+64 frames by default and captures the last sixteen as PPM files; `--frames N`
+changes the duration (minimum sixteen). It bypasses window/audio
+initialization and never writes the world. Without `--capture`, the directory is
+`target/still-review`.
+
+Against `saves/world-36.json`, at 1280×800 with its TAA settings, mean absolute
+adjacent-frame RGB change in the terrain rectangle x=0..760, y=360..700 fell
+from 1.4196 to 0.5435 (about 62 percent). This measures temporal stability in a
+frozen scene, not elimination of every aliasing artifact or moving-view quality.
+A projection regression covers fixed history across different jitter offsets.
+Formatting, Clippy, all 150 quiet nextest tests, gameplay/persistence smoke and
+playtest/expedition passed. Frozen GPU captures validated the shader at runtime;
+user save files were not modified.
+
+Follow-up validation of identity stationary reprojection used a temporary fixture
+with the original snowy camera/time from world-36 and TAA explicitly enabled in
+a temporary settings file (the current user settings had TAA disabled). Across
+frames 240–255, the same terrain rectangle measured 0.03734 mean absolute RGB
+change and maximum channel change 12, versus 0.54346 and 94 after the first fix.
+This is about 93 percent less remaining mean variation; it is not a claim of
+pixel-identical frames. The latest saved camera was also captured with TAA
+explicitly enabled. Exact-view regression coverage checks history invalidation,
+small translations, rotations and projection changes. Clippy, all 150 nextest
+tests and a 64-frame headless moving-camera tour passed. User saves/settings
+were read only.
+
+### Native upscaler texture detail
+
+World tile sampling applies `log2(render_width / output_width) - 1` LOD
+bias while a native temporal upscaler is active, including Native AA. This
+matches the DLSS adapter's suggested mip bias (about -1.585 in Quality),
+keeping fine texture information in the input for temporal reconstruction.
+Without it, lower-resolution rendering selected coarser mips before DLSS could
+recover detail. The bias travels in the otherwise unused camera `sky.z` field;
+ordinary rendering uses zero bias. This affects both opaque and cutout tiles.
+
+### AA and DLSS visual comparison (2026-11-10)
+
+Frozen captures of `saves/world.json` used the same camera, simulation state,
+settled terrain and 1280×800 output for all eight modes. Each run rendered 240
+frames and retained frames 224–239; comparison images use frame 239. The native
+upscaler mip-bias change above was active. Saves and user settings were read
+only; each mode used a separate temporary settings file.
+
+| Mode | World input | Observed appearance |
+| --- | --- | --- |
+| All AA off | 1280×800 | Crispest texture contrast; jagged foliage holes and silhouettes |
+| TAA | 1280×800 | Smoother edges, softer texture detail |
+| 67% scale, AA off | 858×536 | Fine detail lost, visible pixelation |
+| 67% scale, TAA | 858×536 | Further texture softening |
+| DLSS Quality | 853×533 | Visibly smeared foliage, softer than native TAA |
+| DLSS Balanced | 753×471 | Similar smearing with less fine detail |
+| DLSS Performance | 640×400 | Greatest fine-detail loss |
+| DLAA (Native AA) | 1280×800 | Clearly sharper than DLSS Quality, softer than AA off |
+
+The reported excessive blur in DLSS Quality remains reproducible. Adding the
+recommended mip bias alone did **not** resolve it. These observations identify
+an unresolved image-quality issue, not its cause. Investigate SDK jitter
+conventions, motion-vector reprojection and temporal reconstruction next.
+Static captures do not establish moving-view quality, ghosting or shimmer.
+
+Local artifacts are in `target/aa-comparison/` (generated, not versioned):
+`overview.png` contains half-size full views; `detail.png` contains matching
+unscaled 320×240 crops starting at pixel (400,390). Each mode directory contains
+`settings.json`, sixteen PPM frames and a full-resolution `final.png`.
+`README.md` records the setup and reproduction command. These artifacts depend
+on the current local save and are not a permanent visual regression fixture.
+
+Build with `tools/run-native.sh` to prepare the native SDKs, then reproduce a
+mode with the existing frozen-capture helper:
+
+```sh
+DLSS_SDK="$PWD/target/native-sdk/DLSS" \
+LD_LIBRARY_PATH="$PWD/target/native-sdk/runtime" \
+target/debug/voxel-game --still-review --save saves/world.json \
+  --frames 240 --settings target/aa-comparison/dlss-quality/settings.json \
+  --capture target/aa-comparison/dlss-quality
+```
+
+The DLSS runs used an RTX 3060 Ti with NVIDIA driver 595.112.07, with
+`VK_DRIVER_FILES=/usr/share/vulkan/icd.d/nvidia_icd.x86_64.json` set explicitly.
+GPU captures required execution outside the sandbox. Direct execution also
+requires `DLSS_SDK` at runtime for SDK library discovery, as provided by the
+native launcher; setting only `LD_LIBRARY_PATH` produced an NGX unsupported
+error on this setup. All eight capture runs completed after configuring this.
+
+### Native motion-vector blur correction
+
+Follow-up isolation replaced the frozen view's motion vectors with exact zero,
+which visibly restored foliage detail in DLSS Quality. Although the old path
+cancelled projection jitter algebraically, reconstructing a stationary point
+through depth, inverse projection and the previous jittered projection produced
+nonzero numerical motion. DLSS should receive exactly zero camera motion for
+an unchanged view.
+
+Native resolve now receives and retains the unjittered camera matrix. It uses
+the jittered inverse only to reconstruct the current depth sample and removes
+the current UV jitter when comparing it with the previous unjittered projection.
+An identical camera/eye with valid history bypasses reconstruction and writes
+exact zero motion. Any translation, rotation, projection change or invalid
+history uses normal reprojection. SDK jitter signs, SDK presets, exposure and
+the existing history reset conditions remain unchanged. This motion generation
+is shared by DLSS and FSR 2. It still describes camera motion only; moving
+creatures do not yet have per-object motion vectors.
+
+Repeated 240-frame frozen captures at the original camera show clearer leaf
+texture and less smearing in Quality and Balanced; DLAA also gains texture
+clarity, while Performance still loses fine detail. Local before/after crops are in
+`target/aa-comparison/motion-fix-comparison.png`, with original captures in
+`dlss-{quality,balanced,performance}` and corrected captures in
+`fixed-{quality,balanced,performance}`, plus `dlaa` and `fixed-dlaa`.
+This supersedes the unresolved static
+blur finding above, but does not claim native/no-AA sharpness or eliminate
+every temporal artifact. The historical baseline artifacts were retained.
+
+A projection regression checks that translated-camera motion maps to the
+previous unjittered pixel independently of current jitter. Existing identity
+tests cover valid history and camera/eye changes. All 151 quiet nextest tests,
+native-feature short-format Clippy, and native DLSS frozen captures passed.
+A 64-frame native DLSS Quality moving-camera tour rendered and exited using a
+temporary world. That is a functional check; moving-view ghosting and shimmer
+have not received equivalent comparative visual validation. FSR 2 visual
+quality has not been re-evaluated for this correction.
+
+### Waterway column lookup reuse
+
+The expensive `waterway_plan` samples were principally repeated cached-plan
+lookups, not evidence that every query rebuilt a waterway. `natural_column`
+previously called `waterway_block` at each voxel height: that acquired the
+shared hydrology cache mutex, searched the cell map, cloned the plan Arc and
+looked up the horizontal column. Concurrent terrain workers repeated this for
+up to 5,832 positions in each 18-cube halo. Main-thread sampling and the surface
+planner also use the cache. Cache misses still build outside the mutex; this
+change does not serialize construction or change its duplicate-build policy.
+
+`TerrainColumn` now retains an optional copied hydrology `Column`, including
+negative results. Halo generation resolves it once per horizontal column
+(324 positions) and reuses it across all 18 heights. Lighting roof/occupancy
+queries and the fluid read-phase column cache also reuse it. Direct block
+queries resolve the same data afresh. Ruin priority, edits, resident chunks,
+plant support, hydrology geometry and cache eviction behavior are preserved.
+No global cache capacity increase, new long-lived cache or lock primitive change
+was needed. Additional tree/support queries can still acquire the shared cache;
+324 is the halo's base water-column lookup count, not a total query count.
+
+Validation: all 152 quiet nextest tests pass, including new halo/direct-query
+equality around both lake centers and a descending reach. Existing resident/edit,
+fluid, skylight and cache-eviction tests also pass. Formatting, diff whitespace
+checks and standard short-format Clippy pass. An additional all-targets Clippy
+run reports existing warnings in unrelated tests; no new warnings were found.
+
+### Reusing terrain-column fields
+
+`TerrainColumn` includes the final biome alongside height, tree, ruin, cave and
+water inputs. Its constructor computes climate and relief once and passes those
+exact values to both height and biome classification. `natural_column` receives
+the shared column, so rock, snow and vegetation decisions reuse its biome across
+voxel heights. Halo, skylight and fluid read-phase queries use the same inputs;
+direct queries construct a fresh column. Existing edit/resident precedence and
+plant-support checks remain authoritative. Column lifetime stays local to the
+halo or existing lighting/fluid operation; no persistent cache or synchronization
+is added, and distance/noise formulas and arithmetic are unchanged.
+
+Tree selection rejects candidates outside the existing three-block canopy reach
+before computing biome fields. Each remaining candidate shares climate/relief
+between biome, root height and root-support queries. Candidate order and nearest
+root selection are preserved. Golden halo fingerprints captured from the original
+implementation cover three seeds, negative boundaries, surface/subterranean and
+distant terrain. Existing direct/halo, lighting, fluid, resident/edit and hydrology
+equivalence tests remain in place. See [PROFILING.md](PROFILING.md) for before/after
+measurements and validation.
+
+### Movement performance diagnostics (2026-11-10)
+
+`tools/movement_review.rs` provides opt-in ignored nextest diagnostics for idle,
+walking, repeated jumping and walking/jumping comparisons. The CPU review settles
+radius-one terrain before timing 120 fixed simulation steps per mode, with sixteen
+measured repetitions and one excluded warmup. The render review settles the full
+view before profiling 360 offscreen frames per mode at 1280x800 with default TAA,
+including sixty initial idle frames. It records existing CPU phase/GPU timestamp
+CSVs and exercises normal streaming during movement. Both use separate seeded
+worlds without reading or writing player saves/settings. They are observations,
+not timing assertions; they are excluded from normal test runs. See
+[PROFILING.md](PROFILING.md) for commands, measurements and scope limitations.
+
+
+### Reducing movement streaming spikes (2026-11-10)
+
+Terrain workers now prepare physics wakeup positions while extracting chunk
+blocks and stably group opaque vertices before transparent vertices. The main
+thread accepts these lists and uploads already ordered geometry. Lighting and
+frontier roof calculations share each job's `SkyAccess` column samples. Each
+completed job supplies a full 18x18 roof halo, sufficient for every face of its
+chunk's streaming cap. Roof snapshots are accepted only after the same desired
+chunk and edit-revision checks as geometry; rejected jobs cannot populate the
+renderer cache. `World::stream_roofs` is cleared at each poll and drained by the
+renderer immediately. Renderer roof retention follows the existing bounded view
+cache, and authoritative edited columns still refresh/invalidate caps normally.
+This avoids cold terrain-column queries when newly uploaded chunks need caps.
+
+CPU acceptance and snapshot dispatch share a deadline rather than accumulating
+separate budgets. Rendering allows them the first millisecond, then uploads until
+two milliseconds from the start of the world update. CPU-only callers use a
+shared two-millisecond budget. These remain soft limits checked between chunks;
+planning acceptance, eviction, an individual chunk and frontier coherence can
+still overrun. Uploads retain time to make progress under result backpressure.
+Frontier masks are traversed only after readiness, eviction or roof changes.
+Frontier membership still follows GPU readiness, including empty chunks, and
+updates synchronously so the change cannot temporarily expose unstreamed caves.
+
+The movement diagnostic also writes `.stream.csv` phase breakdowns for roof
+invalidation, CPU world work/eviction, mesh uploads, and frontier maintenance.
+These extra renderer counters compile only in tests. Tests check mixed opaque/
+fluid mesh equality, physics wakeups from worker results, and exact roof/cap and
+vertex-light equivalence across edits and negative coordinates. Measurements and
+remaining limitations are in [PROFILING.md](PROFILING.md).

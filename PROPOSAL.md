@@ -38,8 +38,8 @@ Ingenuity (boosts crafting efficiency and quality)
 
 ### Biomes
 Should be a mix of normal, exotic, fantastic, and scary
-- Grasslands (plains, hills, mountains)
-- Tundra (plains, hills, mountains)
+- Grasslands (flat plains, hills, mountains, very rare mega mountains)
+- Tundra (flat plains, hills, mountains, very rare mega mountains)
 - Forests (with occasional groves)
 - Mushroom forests
 - Enchanted forests (should be very, very rare). Purple trees and magic springs and what not.
@@ -202,7 +202,12 @@ Water spreads up to seven blocks horizontally, falls downward, drains when its
 supply is removed, and regenerates sources when supported between at least two
 horizontal water sources. Lava spreads more slowly and less far, cannot renew,
 and solidifies on contact with water. Include natural pools, swimming, drowning
-and lava damage. Generate ponds, rivers, and lakes. Ponds in colder biomes have
+and lava damage. Generate ponds, rivers, lakes, and oceans. Water spills over
+exposed ledges into waterfalls; natural shores blend into the surrounding
+terrain without artificial retaining walls. Natural lake outlets follow a
+continuous, contained river channel into a receiving body of water, with
+waterfalls at elevation drops. They should not dissipate across dry fields.
+Ponds in colder biomes have
 an ice cover with water beneath; larger lakes and rivers remain liquid.
 
 Buckets can be crafted from wood or any available metal. All carry one water

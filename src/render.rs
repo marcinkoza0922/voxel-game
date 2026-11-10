@@ -5,7 +5,10 @@ use crate::{
 };
 use bytemuck::{Pod, Zeroable};
 use glam::{IVec3, Mat4, Vec3};
-use std::{collections::HashMap, sync::Arc};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+};
 use wgpu::util::DeviceExt;
 use winit::window::Window;
 
@@ -46,9 +49,18 @@ struct Mesh {
     count: u32,
     opaque_count: u32,
 }
+struct Frontier {
+    mask: u8,
+    mesh: Option<Mesh>,
+}
+
 pub struct Renderer {
     pub profile_draw: bool,
+    gpu_profile: Option<crate::gpu_profile::GpuProfile>,
+    pub profile_frame: u32,
     pub draw_times: [f64; 5],
+    #[cfg(test)]
+    pub stream_times: [f64; 4],
     #[cfg(feature = "native-upscalers")]
     native: crate::native_upscale::Native,
     last_draw: std::time::Instant,
@@ -71,6 +83,9 @@ pub struct Renderer {
     depth: wgpu::TextureView,
     shadow: wgpu::TextureView,
     meshes: HashMap<IVec3, Mesh>,
+    ready_chunks: HashSet<IVec3>,
+    frontiers: HashMap<IVec3, Frontier>,
+    frontier_roofs: HashMap<(i32, i32), i32>,
     temporal: crate::temporal::Temporal,
     settings: crate::settings::Settings,
     present_modes: Vec<wgpu::PresentMode>,
@@ -151,6 +166,9 @@ impl Renderer {
             .map_err(|e| e.to_string())?;
         let descriptor = wgpu::DeviceDescriptor {
             label: Some("Voxel device"),
+            required_features: adapter.features()
+                & (wgpu::Features::TIMESTAMP_QUERY
+                    | wgpu::Features::TIMESTAMP_QUERY_INSIDE_ENCODERS),
             ..Default::default()
         };
         #[cfg(feature = "native-upscalers")]
@@ -605,7 +623,11 @@ impl Renderer {
         );
         Ok(Self {
             profile_draw: false,
+            gpu_profile: None,
+            profile_frame: 0,
             draw_times: [0.; 5],
+            #[cfg(test)]
+            stream_times: [0.; 4],
             #[cfg(feature = "native-upscalers")]
             native,
             last_draw: std::time::Instant::now(),
@@ -633,8 +655,23 @@ impl Renderer {
             depth,
             shadow,
             meshes: HashMap::new(),
+            ready_chunks: HashSet::new(),
+            frontiers: HashMap::new(),
+            frontier_roofs: HashMap::new(),
             ui: Ui::new(),
         })
+    }
+    pub fn enable_gpu_profile(
+        &mut self,
+        sender: std::sync::mpsc::Sender<crate::gpu_profile::Sample>,
+    ) {
+        self.gpu_profile = crate::gpu_profile::GpuProfile::new(&self.device, &self.queue, sender);
+    }
+    pub fn drain_gpu_profile(&self) -> Result<(), String> {
+        self.device
+            .poll(wgpu::PollType::wait_indefinitely())
+            .map_err(|e| e.to_string())?;
+        Ok(())
     }
     pub fn finish(self) {
         let _ = self.device.poll(wgpu::PollType::wait_indefinitely());
@@ -643,6 +680,9 @@ impl Renderer {
     pub fn reset_world(&mut self) {
         self.temporal.valid = false;
         self.meshes.clear();
+        self.ready_chunks.clear();
+        self.frontiers.clear();
+        self.frontier_roofs.clear();
         self.ui = crate::ui::Ui::new();
     }
     pub fn resize(&mut self, w: u32, h: u32) {
@@ -722,16 +762,44 @@ impl Renderer {
         }
     }
     pub fn update_world(&mut self, w: &mut World, pos: Vec3) {
-        for k in w.stream(pos, VIEW_RADIUS) {
-            self.meshes.remove(&k);
+        let start = std::time::Instant::now();
+        // Mining below an unchanged roof cannot change a frontier. Refresh only
+        // edited block columns already referenced by the bounded roof cache.
+        let changed = refresh_frontier_roofs(w, &mut self.frontier_roofs);
+        let mut refresh_frontiers = !changed.is_empty();
+        invalidate_frontiers(&mut self.frontiers, &changed);
+        #[cfg(test)]
+        let roofs_done = std::time::Instant::now();
+        // Reserve the second millisecond for GPU uploads, so accepting a busy
+        // result queue cannot indefinitely starve visible chunk progress.
+        let removed = w.stream_until(
+            pos,
+            VIEW_RADIUS,
+            start + std::time::Duration::from_millis(1),
+        );
+        self.frontier_roofs.extend(w.stream_roofs.drain());
+        if !removed.is_empty() {
+            refresh_frontiers = true;
+            let center = crate::world::chunk(pos.floor().as_ivec3());
+            self.frontier_roofs.retain(|&(x, z), _| {
+                (x.div_euclid(SIZE) - center.x).abs() <= VIEW_RADIUS + 1
+                    && (z.div_euclid(SIZE) - center.z).abs() <= VIEW_RADIUS + 1
+            });
         }
-        let upload_start = std::time::Instant::now();
-        while !w.meshes.is_empty() && upload_start.elapsed() < std::time::Duration::from_millis(2) {
-            let (k, mut data) = w.meshes.remove(0);
+        for k in removed {
+            self.meshes.remove(&k);
+            self.ready_chunks.remove(&k);
+            self.frontiers.remove(&k);
+        }
+        #[cfg(test)]
+        let world_done = std::time::Instant::now();
+        let deadline = start + std::time::Duration::from_millis(2);
+        while !w.meshes.is_empty() && std::time::Instant::now() < deadline {
+            let (k, data) = w.meshes.remove(0);
             if !w.loaded(k) {
                 continue;
             }
-            data.sort_by_key(|v| v.tile[2] < -4.5);
+            refresh_frontiers |= self.ready_chunks.insert(k);
             let opaque_count = data.partition_point(|v| v.tile[2] >= -4.5) as u32;
             if data.is_empty() {
                 self.meshes.remove(&k);
@@ -752,6 +820,45 @@ impl Renderer {
                 );
             }
         }
+        #[cfg(test)]
+        let uploads_done = std::time::Instant::now();
+        // Empty meshes are ready too: an all-air cave chunk must not be sealed
+        // merely because it has no triangles. Rebuild only changed frontiers.
+        if refresh_frontiers {
+            for &key in &self.ready_chunks {
+                let mask = frontier_mask(&self.ready_chunks, key);
+                if mask == 0 {
+                    self.frontiers.remove(&key);
+                    continue;
+                }
+                if self.frontiers.get(&key).is_some_and(|f| f.mask == mask) {
+                    continue;
+                }
+                let data = mesh_frontier_cached(w, key, mask, &mut self.frontier_roofs);
+                let mesh = (!data.is_empty()).then(|| Mesh {
+                    buffer: self
+                        .device
+                        .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                            label: Some("Underground streaming frontier"),
+                            contents: bytemuck::cast_slice(&data),
+                            usage: wgpu::BufferUsages::VERTEX,
+                        }),
+                    count: data.len() as u32,
+                    opaque_count: data.len() as u32,
+                });
+                self.frontiers.insert(key, Frontier { mask, mesh });
+            }
+        }
+        #[cfg(test)]
+        {
+            self.stream_times = [
+                roofs_done.duration_since(start),
+                world_done.duration_since(roofs_done),
+                uploads_done.duration_since(world_done),
+                uploads_done.elapsed(),
+            ]
+            .map(|d| d.as_secs_f64() * 1000.);
+        }
     }
     fn profile_phase(&mut self, start: &mut Option<std::time::Instant>, phase: usize) {
         if let Some(start) = start {
@@ -770,6 +877,12 @@ impl Renderer {
     ) -> Result<(), String> {
         let mut phase_start = self.profile_draw.then(std::time::Instant::now);
         self.draw_times = [0.; 5];
+        let gpu_slot = self
+            .gpu_profile
+            .as_ref()
+            .map(|p| p.begin(&self.device, self.profile_frame))
+            .transpose()?
+            .flatten();
         let (celestial, daylight) = sky_cycle(g.time);
         // Moonlight takes over at night; both lights follow the visible orbit.
         let sun = if celestial.y >= 0. {
@@ -778,22 +891,26 @@ impl Renderer {
             -celestial
         };
         let strength = daylight + (1. - daylight) * 0.025 * sun.y.max(0.).sqrt();
-        let sky = [daylight, g.time.fract(), 0., 1.];
         let eye = g.player.eye();
+        let mut sky = [daylight, g.time.fract(), 0., 1.];
         #[cfg(feature = "native-upscalers")]
         let native_active = self.native.active();
         #[cfg(not(feature = "native-upscalers"))]
         let native_active = false;
+        // Preserve texture detail for temporal reconstruction at the output resolution.
+        // sky.z is unused by atmosphere and carries the world texture LOD bias.
+        if native_active {
+            sky[2] = (self.temporal.size.0 as f32 / self.width as f32).log2() - 1.;
+        }
         let jitter = self.temporal.jitter(self.settings.taa || native_active);
         let jitter_matrix = Mat4::from_translation(Vec3::new(jitter.x, jitter.y, 0.));
-        let camera_view = jitter_matrix
-            * Mat4::perspective_rh(
-                75_f32.to_radians(),
-                self.width as f32 / self.height as f32,
-                0.05,
-                1024.,
-            )
-            * Mat4::look_at_rh(eye, eye + g.player.direction(), Vec3::Y);
+        let stable_camera = Mat4::perspective_rh(
+            75_f32.to_radians(),
+            self.width as f32 / self.height as f32,
+            0.05,
+            1024.,
+        ) * Mat4::look_at_rh(eye, eye + g.player.direction(), Vec3::Y);
+        let camera_view = jitter_matrix * stable_camera;
         let center = eye.floor();
         let light_view = Mat4::orthographic_rh(-80., 80., -80., 80., 0.1, 250.)
             * Mat4::look_at_rh(center + sun * 120., center, Vec3::Y);
@@ -1139,6 +1256,9 @@ impl Renderer {
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("Frame"),
             });
+        if let (Some(p), Some(slot)) = (&self.gpu_profile, gpu_slot) {
+            p.stamp(&mut encoder, slot, 0);
+        }
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("Shadow pass"),
@@ -1166,6 +1286,9 @@ impl Renderer {
                 pass.set_vertex_buffer(0, b.slice(..));
                 pass.draw(0..dynamic.len() as u32, 0..1);
             }
+        }
+        if let (Some(p), Some(slot)) = (&self.gpu_profile, gpu_slot) {
+            p.stamp(&mut encoder, slot, 1);
         }
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -1204,6 +1327,17 @@ impl Renderer {
                 pass.set_vertex_buffer(0, b.slice(..));
                 pass.draw(0..dynamic.len() as u32, 0..1);
             }
+            // Caps participate in scene depth, but never cast shadows. Their
+            // black material stays dark under daylight, torches and distance fog.
+            for (key, frontier) in &self.frontiers {
+                if !chunk_visible(camera_view, *key) {
+                    continue;
+                }
+                if let Some(mesh) = &frontier.mesh {
+                    pass.set_vertex_buffer(0, mesh.buffer.slice(..));
+                    pass.draw(0..mesh.count, 0..1);
+                }
+            }
             pass.set_pipeline(&self.fluid_pipeline);
             let mut fluid_chunks: Vec<_> = self
                 .meshes
@@ -1221,6 +1355,9 @@ impl Renderer {
                 pass.draw(m.opaque_count..m.count, 0..1);
             }
         }
+        if let (Some(p), Some(slot)) = (&self.gpu_profile, gpu_slot) {
+            p.stamp(&mut encoder, slot, 2);
+        }
         let now = std::time::Instant::now();
         #[cfg(feature = "native-upscalers")]
         if native_active {
@@ -1229,7 +1366,7 @@ impl Renderer {
                 &self.queue,
                 &mut encoder,
                 &view,
-                camera_view,
+                stable_camera,
                 eye,
                 &mut self.native,
                 now.duration_since(self.last_draw)
@@ -1242,7 +1379,7 @@ impl Renderer {
                 &self.queue,
                 &mut encoder,
                 &view,
-                camera_view,
+                stable_camera,
                 eye,
                 self.settings.taa,
             );
@@ -1253,10 +1390,13 @@ impl Renderer {
             &self.queue,
             &mut encoder,
             &view,
-            camera_view,
+            stable_camera,
             eye,
             self.settings.taa,
         );
+        if let (Some(p), Some(slot)) = (&self.gpu_profile, gpu_slot) {
+            p.stamp(&mut encoder, slot, 3);
+        }
         self.last_draw = now;
         if let Some(buffer) = &held_buffer {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -1285,6 +1425,9 @@ impl Renderer {
             pass.set_vertex_buffer(0, buffer.slice(..));
             pass.draw(0..held_mesh.len() as u32, 0..1);
         }
+        if let (Some(p), Some(slot)) = (&self.gpu_profile, gpu_slot) {
+            p.stamp(&mut encoder, slot, 4);
+        }
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("GUI pass"),
@@ -1302,6 +1445,10 @@ impl Renderer {
             pass.set_pipeline(&self.ui_pipeline);
             pass.set_vertex_buffer(0, ui_buffer.slice(..));
             pass.draw(0..self.ui.vertices.len() as u32, 0..1);
+        }
+        if let (Some(p), Some(slot)) = (&self.gpu_profile, gpu_slot) {
+            p.stamp(&mut encoder, slot, 5);
+            p.resolve(&mut encoder, slot);
         }
         let readback = capture.map(|_| {
             let stride = (self.width * 4).div_ceil(256) * 256;
@@ -1332,6 +1479,9 @@ impl Renderer {
         let commands = encoder.finish();
         self.profile_phase(&mut phase_start, 2);
         self.queue.submit(Some(commands));
+        if let (Some(p), Some(slot)) = (&self.gpu_profile, gpu_slot) {
+            p.submitted(slot, self.profile_frame);
+        }
         self.profile_phase(&mut phase_start, 3);
         if let (Some(path), Some((buffer, stride))) = (capture, readback) {
             let (tx, rx) = std::sync::mpsc::channel();
@@ -1382,6 +1532,126 @@ const FACES: [(IVec3, IVec3, IVec3); 6] = [
     (IVec3::Z, IVec3::NEG_X, IVec3::Y),
     (IVec3::NEG_Z, IVec3::X, IVec3::Y),
 ];
+fn refresh_frontier_roofs(world: &mut World, roofs: &mut HashMap<(i32, i32), i32>) -> Vec<IVec3> {
+    let dirty: Vec<_> = world.roof_dirty.drain().collect();
+    let mut changed = Vec::new();
+    for (x, z) in dirty {
+        if let Some(old) = roofs.get_mut(&(x, z)) {
+            let roof = world.sky_column(x, z).roof;
+            if *old != roof {
+                *old = roof;
+                changed.push(crate::world::chunk(IVec3::new(x, 0, z)));
+            }
+        }
+    }
+    changed
+}
+
+fn invalidate_frontiers(frontiers: &mut HashMap<IVec3, Frontier>, dirty: &[IVec3]) {
+    if dirty.is_empty() {
+        return;
+    }
+    let columns: HashSet<_> = dirty.iter().map(|k| (k.x, k.z)).collect();
+    frontiers.retain(|key, _| {
+        !(-1..=1).any(|dx| (-1..=1).any(|dz| columns.contains(&(key.x + dx, key.z + dz))))
+    });
+}
+
+// Membership follows GPU uploads, including empty meshes, rather than CPU
+// residency. Otherwise a completed-but-not-uploaded neighbor can expose the sky.
+fn frontier_mask(ready: &HashSet<IVec3>, key: IVec3) -> u8 {
+    FACES
+        .iter()
+        .enumerate()
+        .fold(0, |mask, (i, (normal, _, _))| {
+            mask | (u8::from(!ready.contains(&(key + normal))) << i)
+        })
+}
+
+#[cfg(test)]
+fn mesh_frontier(world: &World, key: IVec3, mask: u8) -> Vec<Vertex> {
+    mesh_frontier_cached(world, key, mask, &mut HashMap::new())
+}
+
+fn mesh_frontier_cached(
+    world: &World,
+    key: IVec3,
+    mask: u8,
+    roofs: &mut HashMap<(i32, i32), i32>,
+) -> Vec<Vertex> {
+    let base = key * SIZE;
+    let mut roof = |x, z| {
+        *roofs
+            .entry((x, z))
+            .or_insert_with(|| world.sky_column(x, z).roof)
+    };
+    let mut out = Vec::new();
+    let mut quad = |points: [Vec3; 4]| {
+        for i in [0, 1, 2, 0, 2, 3] {
+            out.push(Vertex {
+                pos: points[i].to_array(),
+                normal: [0., 1., 0.],
+                color: [0.; 3],
+                tile: [0., 0., -1.],
+                sky_access: 0.,
+            });
+        }
+    };
+    for (i, (normal, _, _)) in FACES.iter().enumerate() {
+        if mask & (1 << i) == 0 {
+            continue;
+        }
+        let plane = base + normal.max(IVec3::ZERO) * SIZE;
+        if normal.y == 0 {
+            // Each vertical strip extends only below the roofs on both sides;
+            // outdoor sky and directly exposed shafts remain open.
+            for t in 0..SIZE {
+                let inside = base
+                    + normal.max(IVec3::ZERO) * (SIZE - 1)
+                    + if normal.x != 0 {
+                        IVec3::Z * t
+                    } else {
+                        IVec3::X * t
+                    };
+                let outside = inside + *normal;
+                let top = (roof(inside.x, inside.z).min(roof(outside.x, outside.z)) + 1)
+                    .min(base.y + SIZE);
+                if top <= base.y {
+                    continue;
+                }
+                let start = if normal.x != 0 {
+                    Vec3::new(plane.x as f32, base.y as f32, (base.z + t) as f32)
+                } else {
+                    Vec3::new((base.x + t) as f32, base.y as f32, plane.z as f32)
+                };
+                let across = if normal.x != 0 { Vec3::Z } else { Vec3::X };
+                let up = Vec3::Y * (top - base.y) as f32;
+                quad([start, start + across, start + across + up, start + up]);
+            }
+        } else {
+            // Merge adjacent underground cells into strips on horizontal faces.
+            for z in base.z..base.z + SIZE {
+                let mut x = base.x;
+                while x < base.x + SIZE {
+                    if roof(x, z) < plane.y {
+                        x += 1;
+                        continue;
+                    }
+                    let start = x;
+                    x += 1;
+                    while x < base.x + SIZE && roof(x, z) >= plane.y {
+                        x += 1;
+                    }
+                    let a = Vec3::new(start as f32, plane.y as f32, z as f32);
+                    let b = Vec3::new(x as f32, plane.y as f32, z as f32);
+                    quad([a, b, b + Vec3::Z, a + Vec3::Z]);
+                }
+            }
+        }
+    }
+    out
+}
+
 const CORNERS: [(i32, i32); 4] = [(-1, -1), (1, -1), (1, 1), (-1, 1)];
 // Conservative clip-space AABB test, using wgpu's 0..w depth range.
 fn chunk_visible(view: Mat4, key: IVec3) -> bool {
@@ -1401,6 +1671,11 @@ fn chunk_visible(view: Mat4, key: IVec3) -> bool {
         })
     })
 }
+/// Group opaque triangles before transparent ones while retaining pass order.
+pub(crate) fn prepare_chunk_mesh(mesh: &mut [Vertex]) {
+    mesh.sort_by_key(|v| v.tile[2] < -4.5);
+}
+
 #[cfg(test)]
 pub fn mesh_chunk(w: &World, k: IVec3) -> Vec<Vertex> {
     let mut mesh = mesh_halo(w.seed, k, &w.halo(k), &w.torch_mounts);
@@ -1417,6 +1692,12 @@ struct SkyAccess<'a> {
     exposure: HashMap<IVec3, f32>,
 }
 impl SkyAccess<'_> {
+    fn light_mesh(&mut self, mesh: &mut [Vertex]) {
+        for vertex in mesh {
+            let sample = Vec3::from_array(vertex.pos) + Vec3::from_array(vertex.normal) * 0.02;
+            vertex.sky_access = self.sample(sample.floor().as_ivec3());
+        }
+    }
     fn open_sky(&mut self, cell: IVec3) -> bool {
         let column = self
             .columns
@@ -1480,14 +1761,18 @@ impl SkyAccess<'_> {
         value
     }
 }
-pub fn spawn_sky_light(world: &World, time: f32, pos: Vec3) -> f32 {
+fn camera_sky_access(world: &World, pos: Vec3) -> f32 {
     let mut sky = SkyAccess {
         world,
         columns: HashMap::new(),
         opaque: HashMap::new(),
         exposure: HashMap::new(),
     };
-    sky.sample(pos.floor().as_ivec3()) * sky_cycle(time).1
+    sky.sample(pos.floor().as_ivec3())
+}
+
+pub fn spawn_sky_light(world: &World, time: f32, pos: Vec3) -> f32 {
+    camera_sky_access(world, pos) * sky_cycle(time).1
 }
 
 pub fn apply_sky_access(w: &World, mesh: &mut [Vertex]) {
@@ -1497,10 +1782,31 @@ pub fn apply_sky_access(w: &World, mesh: &mut [Vertex]) {
         opaque: HashMap::new(),
         exposure: HashMap::new(),
     };
-    for vertex in mesh {
-        let sample = Vec3::from_array(vertex.pos) + Vec3::from_array(vertex.normal) * 0.02;
-        vertex.sky_access = sky.sample(sample.floor().as_ivec3());
+    sky.light_mesh(mesh);
+}
+
+/// Workers reuse lighting columns and supply the full chunk/neighbor roof halo,
+/// so newly uploaded frontiers do not synchronously sample terrain columns.
+pub(crate) fn light_chunk(w: &World, key: IVec3, mesh: &mut [Vertex]) -> HashMap<(i32, i32), i32> {
+    let mut sky = SkyAccess {
+        world: w,
+        columns: HashMap::new(),
+        opaque: HashMap::new(),
+        exposure: HashMap::new(),
+    };
+    sky.light_mesh(mesh);
+    let base = key * SIZE;
+    let mut roofs = HashMap::with_capacity(18 * 18);
+    for x in base.x - 1..=base.x + SIZE {
+        for z in base.z - 1..=base.z + SIZE {
+            let column = sky
+                .columns
+                .entry((x, z))
+                .or_insert_with(|| w.sky_column(x, z));
+            roofs.insert((x, z), column.roof);
+        }
     }
+    roofs
 }
 pub fn mesh_halo(
     seed: u64,
@@ -2206,6 +2512,177 @@ fn held_model(out: &mut Vec<Vertex>, g: &Game) {
 #[cfg(test)]
 mod sky_tests {
     use super::*;
+
+    #[test]
+    fn worker_roofs_cover_frontiers_and_preserve_lighting_after_edits() {
+        let mut world = World::new(42);
+        let key = IVec3::new(-1, 2, 0);
+        let edit = IVec3::new(-1, 70, 4);
+        for block in [Block::Air, Block::Stone, Block::Air] {
+            world.set(edit, block);
+            let mut mesh = mesh_halo(world.seed, key, &world.halo(key), &world.torch_mounts);
+            let mut expected = mesh.clone();
+            apply_sky_access(&world, &mut expected);
+            let mut roofs = light_chunk(&world, key, &mut mesh);
+            assert_eq!(
+                bytemuck::cast_slice::<_, u8>(&mesh),
+                bytemuck::cast_slice::<_, u8>(&expected)
+            );
+            assert_eq!(roofs.len(), 18 * 18);
+            assert_eq!(roofs[&(edit.x, edit.z)], world.sky_roof(edit.x, edit.z));
+            for frontier in [key, key - IVec3::Y * 4] {
+                let cached = mesh_frontier_cached(&world, frontier, 63, &mut roofs);
+                let fresh = mesh_frontier(&world, frontier, 63);
+                assert_eq!(
+                    bytemuck::cast_slice::<_, u8>(&cached),
+                    bytemuck::cast_slice::<_, u8>(&fresh)
+                );
+                assert_eq!(roofs.len(), 18 * 18, "no synchronous roof queries needed");
+            }
+        }
+    }
+
+    #[test]
+    fn frontier_cache_reuses_unchanged_roofs_and_preserves_distant_caps() {
+        let mut world = World::new(42);
+        let mut roofs = HashMap::new();
+        let key = IVec3::new(-1, 0, 0);
+        mesh_frontier_cached(&world, key, 0b111111, &mut roofs);
+        let (x, z) = (-1, 4); // Across the negative-coordinate chunk boundary.
+        let roof = roofs[&(x, z)];
+        let keys = [key, key - IVec3::Y * 10, key + IVec3::X, key + IVec3::X * 8];
+        let mut frontiers: HashMap<_, _> = keys
+            .into_iter()
+            .map(|k| {
+                (
+                    k,
+                    Frontier {
+                        mask: 63,
+                        mesh: None,
+                    },
+                )
+            })
+            .collect();
+        world.set(IVec3::new(x, roof - 4, z), Block::Air);
+        let changed = refresh_frontier_roofs(&mut world, &mut roofs);
+        assert!(
+            changed.is_empty(),
+            "mining below the roof must reuse every cap"
+        );
+        invalidate_frontiers(&mut frontiers, &changed);
+        assert_eq!(frontiers.len(), keys.len());
+        assert!(world.roof_dirty.is_empty());
+
+        world.set(IVec3::new(x, roof + 4, z), Block::Stone);
+        let changed = refresh_frontier_roofs(&mut world, &mut roofs);
+        assert_eq!(changed, vec![IVec3::new(-1, 0, 0)]);
+        assert_eq!(roofs[&(x, z)], roof + 4);
+        invalidate_frontiers(&mut frontiers, &changed);
+        assert_eq!(frontiers.len(), 1);
+        assert!(
+            frontiers.contains_key(&keys[3]),
+            "distant cap buffers survive roof edits"
+        );
+        let cached = mesh_frontier_cached(&world, key, 63, &mut roofs);
+        let fresh = mesh_frontier(&world, key, 63);
+        assert_eq!(
+            bytemuck::cast_slice::<_, u8>(&cached),
+            bytemuck::cast_slice::<_, u8>(&fresh)
+        );
+
+        world.set(IVec3::new(x, roof + 4, z), Block::Air);
+        refresh_frontier_roofs(&mut world, &mut roofs);
+        assert_eq!(roofs[&(x, z)], roof);
+        let cached = mesh_frontier_cached(&world, key, 63, &mut roofs);
+        let fresh = mesh_frontier(&world, key, 63);
+        assert_eq!(
+            bytemuck::cast_slice::<_, u8>(&cached),
+            bytemuck::cast_slice::<_, u8>(&fresh)
+        );
+    }
+
+    #[test]
+    fn frontier_tracks_uploaded_neighbors_including_empty_chunks() {
+        let key = IVec3::new(-2, -1, 14);
+        let mut ready = HashSet::from([key]);
+        assert_eq!(frontier_mask(&ready, key), 0b111111);
+        for (i, (normal, _, _)) in FACES.iter().enumerate() {
+            // Membership does not require a nonempty GPU vertex buffer.
+            ready.insert(key + normal);
+            assert_eq!(frontier_mask(&ready, key) & (1 << i), 0);
+        }
+        assert_eq!(frontier_mask(&ready, key), 0);
+        ready.remove(&(key - IVec3::Y));
+        assert_eq!(frontier_mask(&ready, key), 1 << 3);
+    }
+
+    #[test]
+    fn frontier_keeps_exposed_sky_open_and_tracks_roof_edits() {
+        let mut world = World::new(42);
+        let key = IVec3::new(0, 10, 0);
+        assert!(mesh_frontier(&world, key, 0b111111).is_empty());
+        // A new opaque roof above a shaft requires a cap at its lower frontier.
+        world.set(IVec3::new(3, 180, 4), Block::Stone);
+        let cap = mesh_frontier(&world, key, 1 << 3);
+        assert_eq!(cap.len(), 6);
+        assert!(cap.iter().all(|v| v.pos[1] == 160.
+            && v.color == [0.; 3]
+            && v.sky_access == 0.
+            && v.tile[2] == -1.));
+        world.set(IVec3::new(3, 180, 4), Block::Air);
+        assert!(mesh_frontier(&world, key, 1 << 3).is_empty());
+        assert!(mesh_frontier(&world, IVec3::new(0, -10, 0), 0).is_empty());
+    }
+
+    #[test]
+    fn outside_view_into_saved_cave_is_sealed_at_streaming_frontier() {
+        // world-36 entrance: the camera is outdoors, looking down into a cave
+        // that extends beyond the local underground streaming band. The pixel
+        // at (600, 490) previously showed the sky after streaming had settled.
+        let mut world = World::new(8002119080243105863);
+        let pos = Vec3::new(-22.87702, 33.782837, 234.14214);
+        let eye = pos + Vec3::Y * 1.62;
+        assert_eq!(camera_sky_access(&world, eye), 1.);
+        let (yaw, pitch) = (4.7249875_f32, -0.5049995_f32);
+        let direction = Vec3::new(
+            yaw.sin() * pitch.cos(),
+            pitch.sin(),
+            -yaw.cos() * pitch.cos(),
+        );
+        let view = Mat4::perspective_rh(75_f32.to_radians(), 1.6, 0.05, 1024.)
+            * Mat4::look_at_rh(eye, eye + direction, Vec3::Y);
+        let far =
+            view.inverse() * glam::Vec4::new(600. / 1280. * 2. - 1., 1. - 490. / 800. * 2., 1., 1.);
+        let ray = (far.truncate() / far.w - eye).normalize();
+        let ready = world.plan_surface(crate::world::chunk(pos.floor().as_ivec3()), VIEW_RADIUS);
+        let mut previous = crate::world::chunk(eye.floor().as_ivec3());
+        for step in 1..1600 {
+            let p = eye + ray * (step as f32 * 0.1);
+            let key = crate::world::chunk(p.floor().as_ivec3());
+            if !ready.contains(&key) {
+                assert_eq!(world.get(p.floor().as_ivec3()), Block::Air);
+                let cap = mesh_frontier(&world, previous, frontier_mask(&ready, previous));
+                assert!(
+                    cap.chunks_exact(6).any(|quad| {
+                        let low = quad
+                            .iter()
+                            .map(|v| Vec3::from_array(v.pos))
+                            .fold(Vec3::splat(f32::INFINITY), Vec3::min);
+                        let high = quad
+                            .iter()
+                            .map(|v| Vec3::from_array(v.pos))
+                            .fold(Vec3::splat(f32::NEG_INFINITY), Vec3::max);
+                        p.cmpge(low - Vec3::splat(0.11)).all()
+                            && p.cmple(high + Vec3::splat(0.11)).all()
+                    }),
+                    "the cave ray must hit a black cap before reaching unmeshed space"
+                );
+                return;
+            }
+            previous = key;
+        }
+        panic!("the saved cave ray must exercise an underground streaming boundary");
+    }
 
     #[test]
     fn orbit_and_daylight_repeat_and_track_horizon() {

@@ -6,6 +6,8 @@ pub const MIN_Y: i32 = -512;
 pub const MAX_Y: i32 = 1535;
 pub const SIZE: i32 = 16;
 pub const VIEW_RADIUS: i32 = 10;
+/// Highest source-water voxel in oceans and terrain-carved rivers.
+pub const SEA_LEVEL: i32 = 24;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Block {
@@ -253,13 +255,40 @@ pub enum Biome {
     Grassland,
     Forest,
     Tundra,
+    GrasslandHills,
+    GrasslandMountains,
+    GrasslandMegaMountains,
+    SnowHills,
+    SnowMountains,
+    SnowMegaMountains,
 }
 impl Biome {
+    pub fn is_snow(self) -> bool {
+        matches!(
+            self,
+            Self::Tundra | Self::SnowHills | Self::SnowMountains | Self::SnowMegaMountains
+        )
+    }
+    pub fn is_grassland(self) -> bool {
+        matches!(
+            self,
+            Self::Grassland
+                | Self::GrasslandHills
+                | Self::GrasslandMountains
+                | Self::GrasslandMegaMountains
+        )
+    }
     pub fn name(self) -> &'static str {
         match self {
             Self::Grassland => "Grasslands",
             Self::Forest => "Oak forest",
             Self::Tundra => "Tundra",
+            Self::GrasslandHills => "Grassland hills",
+            Self::GrasslandMountains => "Grassland mountains",
+            Self::GrasslandMegaMountains => "Grassland mega mountains",
+            Self::SnowHills => "Snow hills",
+            Self::SnowMountains => "Snow mountains",
+            Self::SnowMegaMountains => "Snow mega mountains",
         }
     }
 }
@@ -273,9 +302,11 @@ pub struct Edit {
 /// Immutable procedural inputs shared by queries at different column heights.
 struct TerrainColumn {
     height: i32,
+    biome: Biome,
     tree: Option<(i32, i32, i32)>,
     ruin: Option<IVec3>,
     cave: Option<(i32, i32)>,
+    water: Option<crate::hydrology::Column>,
 }
 
 pub(crate) struct SkyColumn {
@@ -289,15 +320,7 @@ impl SkyColumn {
             .get(&p.to_array())
             .copied()
             .or_else(|| world.chunks.get(&chunk(p)).map(|c| c[index(p)]))
-            .unwrap_or_else(|| {
-                world.natural_column(
-                    p,
-                    self.terrain.height,
-                    self.terrain.tree,
-                    self.terrain.ruin,
-                    self.terrain.cave,
-                )
-            });
+            .unwrap_or_else(|| world.natural_column(p, &self.terrain));
         // Plant support never changes whether a block is opaque.
         block.solid() && block != Block::Leaves
     }
@@ -324,7 +347,7 @@ impl BlockQueries {
                     .columns
                     .entry((p.x, p.z))
                     .or_insert_with(|| world.terrain_column(p.x, p.z));
-                world.natural_column(p, column.height, column.tree, column.ruin, column.cave)
+                world.natural_column(p, column)
             });
         let block = if block.plant() && !self.get(world, p - IVec3::Y).dirt() {
             Block::Air
@@ -341,11 +364,16 @@ pub struct World {
     pub edits: BTreeMap<[i32; 3], Block>,
     pub(crate) physics_pending: std::collections::BTreeSet<[i32; 3]>,
     pub fluid_pending: std::collections::BTreeSet<[i32; 3]>,
+    pub(crate) fluid_cursor: Option<[i32; 3]>,
+    pub(crate) waterways: crate::hydrology::SharedCache,
     pub torch_mounts: BTreeMap<[i32; 3], [i32; 3]>,
     chunks: HashMap<IVec3, Box<[Block]>>,
     pending: VecDeque<IVec3>,
     pub dirty: Vec<IVec3>,
     pub revision: u64,
+    pub(crate) roof_dirty: HashSet<(i32, i32)>,
+    // Roof snapshots from this poll only; the renderer consumes them immediately.
+    pub(crate) stream_roofs: HashMap<(i32, i32), i32>,
     center: IVec3,
     radius: i32,
     desired: HashSet<IVec3>,
@@ -399,11 +427,15 @@ impl World {
             edits: BTreeMap::new(),
             torch_mounts: BTreeMap::new(),
             fluid_pending: Default::default(),
+            fluid_cursor: None,
+            waterways: Default::default(),
             physics_pending: Default::default(),
             chunks: HashMap::new(),
             pending: VecDeque::new(),
             dirty: vec![],
             revision: 0,
+            roof_dirty: HashSet::new(),
+            stream_roofs: HashMap::new(),
             center: IVec3::splat(i32::MAX),
             radius: -1,
             desired: HashSet::new(),
@@ -416,7 +448,7 @@ impl World {
             meshes: vec![],
         }
     }
-    pub fn biome(&self, x: i32, z: i32) -> Biome {
+    fn climate(&self, x: i32, z: i32) -> Biome {
         if (x as f64).hypot(z as f64) > 240.
             && noise(self.seed ^ 7621, x as f32 / 320., z as f32 / 320.) > 0.52
         {
@@ -428,25 +460,91 @@ impl World {
             Biome::Grassland
         }
     }
+    // One continuous regional field controls both biome names and terrain relief.
+    fn relief(&self, x: i32, z: i32) -> f32 {
+        let distance = (x as f32).hypot(z as f32);
+        noise(self.seed ^ 914, x as f32 / 650., z as f32 / 650.)
+            * smooth(((distance - 100.) / 500.).clamp(0., 1.))
+    }
+    pub fn biome(&self, x: i32, z: i32) -> Biome {
+        let climate = self.climate(x, z);
+        let relief = self.relief(x, z);
+        Self::biome_from_fields(climate, relief)
+    }
+    fn biome_from_fields(climate: Biome, relief: f32) -> Biome {
+        match (climate, relief) {
+            (Biome::Grassland, r) if r >= 0.94 => Biome::GrasslandMegaMountains,
+            (Biome::Grassland, r) if r >= 0.72 => Biome::GrasslandMountains,
+            (Biome::Grassland, r) if r >= 0.40 => Biome::GrasslandHills,
+            (Biome::Tundra, r) if r >= 0.94 => Biome::SnowMegaMountains,
+            (Biome::Tundra, r) if r >= 0.72 => Biome::SnowMountains,
+            (Biome::Tundra, r) if r >= 0.40 => Biome::SnowHills,
+            _ => climate,
+        }
+    }
     pub fn height(&self, x: i32, z: i32) -> i32 {
+        let relief = self.relief(x, z);
+        self.height_from_fields(x, z, relief, self.climate(x, z))
+    }
+    fn height_from_fields(&self, x: i32, z: i32, relief: f32, climate: Biome) -> i32 {
+        let snow = climate == Biome::Tundra;
         let x = x as f32;
         let z = z as f32;
-        let hills =
-            noise(self.seed, x / 90., z / 90.) * 22. + noise(self.seed ^ 15, x / 25., z / 25.) * 5.;
-        let ridge = (noise(self.seed ^ 914, x / 650., z / 650.) - 0.52).max(0.) * 2.1;
-        // A gentle spawn region grows into mountains hundreds of blocks high.
-        let distance = (x * x + z * z).sqrt();
-        (24. + hills + ridge.powf(1.7) * 750. * ((distance - 100.).max(0.) / 500.).min(1.)) as i32
+        let blend = |lo: f32, hi: f32| smooth(((relief - lo) / (hi - lo)).clamp(0., 1.));
+        // Forests retain ordinary rolling relief; cold and grassland regions can
+        // grow into mountains. Fade this allowance across forest boundaries.
+        let forest = noise(self.seed ^ 456, x / 110., z / 110.);
+        let mountain_allowance = if snow {
+            1.
+        } else {
+            1. - smooth(((forest - 0.43) / 0.10).clamp(0., 1.))
+        };
+        let amplitude = 3.
+            + blend(0.40, 0.60) * 33.
+            + mountain_allowance * (blend(0.72, 0.90) * 260. + blend(0.94, 1.) * 1050.);
+        let detail = noise(self.seed, x / 90., z / 90.) * 0.8
+            + noise(self.seed ^ 15, x / 25., z / 25.) * 0.2;
+        let distance = x.hypot(z);
+        let inland = 30. + amplitude * (0.35 + detail * 0.65);
+        let exposure = smooth(((distance - 192.) / 256.).clamp(0., 1.));
+        let continent = noise(self.seed ^ 0x736561, x / 1200., z / 1200.);
+        // Bound individual ocean basins instead of only changing their frequency.
+        // Dry shoulders between basins keep a shoreline within ordinary view range.
+        let cell_x = (x / 320.).floor() as i32;
+        let cell_z = (z / 320.).floor() as i32;
+        let sea_hash = hash(self.seed ^ 0x73686f7265, cell_x, 0, cell_z);
+        let sea_x = cell_x as f32 * 320. + 144. + (sea_hash % 33) as f32;
+        let sea_z = cell_z as f32 * 320. + 144. + ((sea_hash >> 8) % 33) as f32;
+        let radius = 96. + ((sea_hash >> 16) % 33) as f32;
+        let shoreline = (noise(self.seed ^ 0x636f617374, x / 55., z / 55.) - 0.5) * 16.;
+        let shore =
+            smooth(((radius + shoreline - (x - sea_x).hypot(z - sea_z)) / 24.).clamp(0., 1.));
+        let ocean = smooth(((0.54 - continent) / 0.20).clamp(0., 1.)) * exposure * shore;
+        let basin = SEA_LEVEL as f32 - 8. - (0.54 - continent).max(0.) * 100.
+            + noise(self.seed ^ 0x626564, x / 70., z / 70.) * 4.;
+        let terrain = inland * (1. - ocean) + basin * ocean;
+        // A warped noise contour gives continuous valleys across chunk boundaries.
+        let warp = noise(self.seed ^ 0x77617270, x / 420., z / 420.) * 80.;
+        let channel =
+            (noise(self.seed ^ 0x72697672, (x + warp) / 260., (z - warp) / 260.) - 0.5).abs();
+        // Higher terrain needs wider valley shoulders to avoid narrow wall-like banks.
+        let shoulder = (0.035 + (terrain - SEA_LEVEL as f32).max(0.) * 0.0005).min(0.16);
+        let river = smooth(((0.018 + shoulder - channel) / shoulder).clamp(0., 1.)) * exposure;
+        ((terrain - (terrain - (SEA_LEVEL - 4) as f32).max(0.) * river) as i32)
+            .clamp(MIN_Y + 1, MAX_Y - 16)
     }
     /// One stable candidate per 256-block cell; only gentle tundra sites survive.
     pub fn ruin_in_cell(&self, x: i32, z: i32) -> Option<IVec3> {
         let h = hash(self.seed ^ 91283, x, 0, z);
         let cx = x * 256 + 48 + (h % 160) as i32;
         let cz = z * 256 + 48 + ((h >> 16) % 160) as i32;
-        if self.biome(cx, cz) != Biome::Tundra {
+        if !self.biome(cx, cz).is_snow() {
             return None;
         }
         let y = self.height(cx, cz);
+        if y <= SEA_LEVEL + 2 {
+            return None;
+        }
         if [-6, 6].into_iter().any(|dx| {
             [-6, 6]
                 .into_iter()
@@ -469,34 +567,38 @@ impl World {
                 let h = hash(self.seed ^ 834, a, 0, b);
                 let cx = a * 7 + 2 + (h % 3) as i32;
                 let cz = b * 7 + 2 + ((h >> 4) % 3) as i32;
-                let chance = if self.biome(cx, cz) == Biome::Forest {
-                    4
-                } else {
-                    19
-                };
-                if h.is_multiple_of(chance)
-                    && self.biome(cx, cz) != Biome::Tundra
-                    && (x - cx).abs() <= 3
-                    && (z - cz).abs() <= 3
-                {
-                    let height = self.height(cx, cz);
+                // Candidates outside canopy reach cannot contribute to this column.
+                if (x - cx).abs() > 3 || (z - cz).abs() > 3 {
+                    continue;
+                }
+                let climate = self.climate(cx, cz);
+                let relief = self.relief(cx, cz);
+                let biome = Self::biome_from_fields(climate, relief);
+                let chance = if biome == Biome::Forest { 4 } else { 19 };
+                if h.is_multiple_of(chance) && !biome.is_snow() {
+                    let height = self.height_from_fields(cx, cz, relief, climate);
                     let root = IVec3::new(cx, height + 1, cz);
-                    if self
-                        .natural_column(
-                            root,
-                            height,
-                            None,
-                            self.nearby_ruin(cx, cz),
-                            self.cave_column(cx, cz),
-                        )
-                        .replaceable()
+                    if height > SEA_LEVEL + 1
+                        && self
+                            .natural_column(
+                                root,
+                                &TerrainColumn {
+                                    height,
+                                    biome,
+                                    tree: None,
+                                    ruin: self.nearby_ruin(cx, cz),
+                                    cave: self.cave_column(cx, cz),
+                                    water: self.waterway_terrain_column(cx, cz),
+                                },
+                            )
+                            .replaceable()
                         && self.waterway_column(cx, cz).is_none()
                         && self
                             .pool_block(IVec3::new(cx, height, cz), height)
                             .is_none()
-                        && !self
-                            .cave_column(cx, cz)
-                            .is_some_and(|(lo, hi)| (lo..=hi).contains(&height))
+                        && !self.cave_column(cx, cz).is_some_and(|(lo, hi)| {
+                            (lo..=hi).contains(&height) || (lo..=hi).contains(&(height + 1))
+                        })
                     {
                         let d = (x - cx).pow(2) + (z - cz).pow(2);
                         if d < distance {
@@ -511,7 +613,40 @@ impl World {
     }
     /// A column's cave interval, shared by direct queries and chunk generation.
     /// Features fit inside 160-block cells, including their entrance ramps.
-    fn cave_column(&self, x: i32, z: i32) -> Option<(i32, i32)> {
+    pub(crate) fn cave_column(&self, x: i32, z: i32) -> Option<(i32, i32)> {
+        let (lo, mut hi) = self.raw_cave_column(x, z)?;
+        // Hydrology planning only uses raw geometry, so this cannot recurse.
+        if let Some((_, level)) = self.waterway_column(x, z) {
+            hi = hi.min(level - 12);
+        }
+        if !self.cave_sink(x, z) {
+            for (dx, dz) in [(0, 0), (-12, 0), (12, 0), (0, -12), (0, 12)] {
+                let height = self.height(x + dx, z + dz);
+                if height < SEA_LEVEL {
+                    hi = hi.min(SEA_LEVEL - 12);
+                } else if self
+                    .pool_block(IVec3::new(x + dx, height - 1, z + dz), height)
+                    .is_some_and(|b| b.fluid().is_some() || b == Block::Ice)
+                {
+                    hi = hi.min(height - 13);
+                }
+            }
+        }
+        (hi >= lo).then_some((lo, hi))
+    }
+
+    /// Rare cave formations may receive a natural underground waterfall.
+    fn cave_sink(&self, x: i32, z: i32) -> bool {
+        hash(
+            self.seed ^ 0xca7e_2026,
+            x.div_euclid(160),
+            0,
+            z.div_euclid(160),
+        )
+        .is_multiple_of(32)
+    }
+
+    pub(crate) fn raw_cave_column(&self, x: i32, z: i32) -> Option<(i32, i32)> {
         if (x as f64).hypot(z as f64) < 32. {
             return None;
         }
@@ -567,14 +702,76 @@ impl World {
         }
         interval
     }
-    fn natural_column(
-        &self,
-        p: IVec3,
-        height: i32,
-        tree: Option<(i32, i32, i32)>,
-        ruin: Option<IVec3>,
-        cave: Option<(i32, i32)>,
-    ) -> Block {
+    /// Cell-contained additions and slope cutouts share all query/halo paths.
+    fn surface_rock(&self, p: IVec3, height: i32, biome: Biome) -> Option<Block> {
+        if p.y >= height && p.y <= height + 16 && (biome.is_grassland() || biome.is_snow()) {
+            let cx = p.x.div_euclid(48);
+            let cz = p.z.div_euclid(48);
+            let h = hash(self.seed ^ 0x726f636b, cx, 0, cz);
+            if h.is_multiple_of(9) {
+                let rx = cx * 48 + 16 + ((h >> 8) % 16) as i32;
+                let rz = cz * 48 + 16 + ((h >> 24) % 16) as i32;
+                let top = outcrop_top(h, p.x - rx, p.z - rz);
+                if top > 0 {
+                    let base = self.height(rx, rz);
+                    // Follow slopes without floating; taper the uphill edge into terrain.
+                    let roof = base + top;
+                    if base > SEA_LEVEL + 1
+                        && height <= roof
+                        && (height - base).abs() <= 6
+                        && p.y <= roof
+                    {
+                        return Some(if biome.is_snow() && p.y == roof {
+                            Block::Snow
+                        } else {
+                            Block::Stone
+                        });
+                    }
+                }
+            }
+        }
+        if matches!(
+            biome,
+            Biome::GrasslandMountains
+                | Biome::GrasslandMegaMountains
+                | Biome::SnowMountains
+                | Biome::SnowMegaMountains
+        ) && p.y <= height
+            && p.y >= height - 40
+            && height > SEA_LEVEL + 16
+        {
+            let cx = p.x.div_euclid(96);
+            let cz = p.z.div_euclid(96);
+            let h = hash(self.seed ^ 0x61726368, cx, 0, cz);
+            if h.is_multiple_of(5) {
+                let rx = cx * 96 + 32 + ((h >> 8) % 32) as i32;
+                let rz = cz * 96 + 32 + ((h >> 24) % 32) as i32;
+                let (along, across) = if h & 0x10000 == 0 {
+                    (p.x - rx, p.z - rz)
+                } else {
+                    (p.z - rz, p.x - rx)
+                };
+                if along.abs() <= 22 && across.abs() <= 15 {
+                    let base = self.height(rx, rz) - 12;
+                    if let Some(rock) = mountain_cutout(h, along, across, p.y - base, height - base)
+                    {
+                        return Some(rock);
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    fn natural_column(&self, p: IVec3, column: &TerrainColumn) -> Block {
+        let TerrainColumn {
+            height,
+            biome,
+            tree,
+            ruin,
+            cave,
+            water,
+        } = *column;
         if !(MIN_Y..=MAX_Y).contains(&p.y) {
             return if p.y < MIN_Y {
                 Block::Stone
@@ -608,8 +805,42 @@ impl World {
                 return Block::Air;
             }
         }
-        if let Some(water) = self.waterway_block(p, height) {
+        if let Some(water) = water.and_then(|column| column.block(self, p, height)) {
             return water;
+        }
+        // A rare cave that actually intersects a submerged bed receives a falling
+        // column supplied by the ordinary sea-level source above it. Other beds seal.
+        if height < SEA_LEVEL
+            && self.cave_sink(p.x, p.z)
+            && let Some((lo, hi)) = cave
+            && hi >= height - 3
+            && p.y >= lo
+            && p.y <= height
+        {
+            return Block::FlowingWater(8);
+        }
+        // Seal the upper bed before carving caves; surface water is generated as sources.
+        if height <= SEA_LEVEL + 1 {
+            if p.y > height && p.y <= SEA_LEVEL {
+                return Block::Water;
+            }
+            if p.y <= height && p.y >= height - 3 {
+                return if hash(
+                    self.seed ^ 0x73686f72,
+                    p.x.div_euclid(3),
+                    0,
+                    p.z.div_euclid(3),
+                )
+                .is_multiple_of(5)
+                {
+                    Block::Gravel
+                } else {
+                    Block::Sand
+                };
+            }
+            if height < SEA_LEVEL && p.y > SEA_LEVEL {
+                return Block::Air;
+            }
         }
         if let Some(pool) = self.pool_block(p, height) {
             return pool;
@@ -617,22 +848,8 @@ impl World {
         if p.y > MIN_Y + 3 && cave.is_some_and(|(lo, hi)| (lo..=hi).contains(&p.y)) {
             return Block::Air;
         }
-        // Keep each formation inside its cell so neighboring outcrops stay separated.
-        if p.y >= height && p.y <= height + 4 && self.biome(p.x, p.z) == Biome::Grassland {
-            let cx = p.x.div_euclid(48);
-            let cz = p.z.div_euclid(48);
-            let h = hash(self.seed ^ 0x726f636b, cx, 0, cz);
-            if h.is_multiple_of(3) {
-                let rx = cx * 48 + 10 + ((h >> 8) % 28) as i32;
-                let rz = cz * 48 + 10 + ((h >> 24) % 28) as i32;
-                let top = outcrop_top(h, p.x - rx, p.z - rz);
-                if top > 0 {
-                    let base = self.height(rx, rz);
-                    if (height - base).abs() <= 1 && p.y <= base + top {
-                        return Block::Stone;
-                    }
-                }
-            }
+        if let Some(rock) = self.surface_rock(p, height, biome) {
+            return rock;
         }
         if p.y > height {
             if let Some((tx, ty, tz)) = tree {
@@ -662,7 +879,7 @@ impl World {
                     return Block::Leaves;
                 }
             }
-            if p.y == height + 1 && self.biome(p.x, p.z) != Biome::Tundra {
+            if p.y == height + 1 && !biome.is_snow() {
                 return vegetation_block(self.seed, p - IVec3::Y);
             }
             return Block::Air;
@@ -671,7 +888,7 @@ impl World {
             return Block::Stone;
         }
         if p.y == height {
-            if self.biome(p.x, p.z) == Biome::Tundra {
+            if biome.is_snow() {
                 Block::Snow
             } else {
                 Block::Grass
@@ -685,11 +902,13 @@ impl World {
                 p.y.div_euclid(2),
                 p.z.div_euclid(2),
             ) % 101;
-            if vein < 5 {
+            // Shared 2x2x2 veins: coal is more plentiful than either metal.
+            // Iron starts just four blocks below copper; their deeper ranges overlap.
+            if vein < 2 {
                 Block::Copper
-            } else if vein < 10 {
+            } else if vein < 5 {
                 Block::Coal
-            } else if vein < 13 && p.y < height - 12 {
+            } else if vein < 7 && p.y <= height - 8 {
                 Block::Iron
             } else {
                 Block::Stone
@@ -703,23 +922,18 @@ impl World {
         if let Some(c) = self.chunks.get(&chunk(p)) {
             return self.supported_plant(p, c[index(p)]);
         }
-        self.supported_plant(
-            p,
-            self.natural_column(
-                p,
-                self.height(p.x, p.z),
-                self.tree(p.x, p.z),
-                self.nearby_ruin(p.x, p.z),
-                self.cave_column(p.x, p.z),
-            ),
-        )
+        self.supported_plant(p, self.natural_column(p, &self.terrain_column(p.x, p.z)))
     }
     fn terrain_column(&self, x: i32, z: i32) -> TerrainColumn {
+        let climate = self.climate(x, z);
+        let relief = self.relief(x, z);
         TerrainColumn {
-            height: self.height(x, z),
+            height: self.height_from_fields(x, z, relief, climate),
+            biome: Self::biome_from_fields(climate, relief),
             tree: self.tree(x, z),
             ruin: self.nearby_ruin(x, z),
             cave: self.cave_column(x, z),
+            water: self.waterway_terrain_column(x, z),
         }
     }
     /// Prepare one column for both roof searches and ray occupancy queries.
@@ -762,10 +976,7 @@ impl World {
             for z in -1..=SIZE {
                 let wx = base.x + x;
                 let wz = base.z + z;
-                let h = self.height(wx, wz);
-                let t = self.tree(wx, wz);
-                let ruin = self.nearby_ruin(wx, wz);
-                let cave = self.cave_column(wx, wz);
+                let column = self.terrain_column(wx, wz);
                 for y in -1..=SIZE {
                     let p = IVec3::new(wx, base.y + y, wz);
                     let block = self
@@ -773,7 +984,7 @@ impl World {
                         .get(&p.to_array())
                         .copied()
                         .or_else(|| self.chunks.get(&chunk(p)).map(|c| c[index(p)]))
-                        .unwrap_or_else(|| self.natural_column(p, h, t, ruin, cave));
+                        .unwrap_or_else(|| self.natural_column(p, &column));
                     blocks[((x + 1) + 18 * ((z + 1) + 18 * (y + 1))) as usize] =
                         self.supported_plant(p, block);
                 }
@@ -816,6 +1027,7 @@ impl World {
                 }
             }
         }
+        self.roof_dirty.insert((p.x, p.z));
         self.revision += 1;
         true
     }
@@ -879,12 +1091,12 @@ impl World {
                         for dz in 0..SIZE {
                             let h = self.height(x * SIZE + dx, z * SIZE + dz);
                             low = low.min(h);
-                            high = high.max(h + 6);
-                            if let Some((_, level)) =
-                                self.waterway_column(x * SIZE + dx, z * SIZE + dz)
+                            high = high.max(h.max(SEA_LEVEL) + 16);
+                            if let Some((bed, top)) =
+                                self.waterway_bounds(x * SIZE + dx, z * SIZE + dz, h)
                             {
-                                low = low.min(level - 8);
-                                high = high.max(level + 1);
+                                low = low.min(bed);
+                                high = high.max(top);
                             }
                         }
                     }
@@ -908,6 +1120,20 @@ impl World {
         desired
     }
     pub fn stream(&mut self, pos: Vec3, radius: i32) -> Vec<IVec3> {
+        self.stream_until(
+            pos,
+            radius,
+            std::time::Instant::now() + std::time::Duration::from_millis(2),
+        )
+    }
+    /// Poll and dispatch without waiting; stop between chunks at the shared deadline.
+    pub(crate) fn stream_until(
+        &mut self,
+        pos: Vec3,
+        radius: i32,
+        deadline: std::time::Instant,
+    ) -> Vec<IVec3> {
+        self.stream_roofs.clear();
         let c = chunk(pos.floor().as_ivec3());
         let mut removed = vec![];
         let radius = radius.max(0);
@@ -975,6 +1201,7 @@ impl World {
                 c,
                 radius,
                 std::mem::take(&mut self.surface_bounds),
+                self.waterways.clone(),
             );
             self.planning = true;
         }
@@ -993,9 +1220,8 @@ impl World {
         let workers = self
             .workers
             .get_or_insert_with(crate::streaming::Workers::new);
-        let accept_start = std::time::Instant::now();
         while self.meshes.len() < crate::streaming::UPLOAD_BACKLOG
-            && accept_start.elapsed() < std::time::Duration::from_millis(2)
+            && std::time::Instant::now() < deadline
         {
             let Some(result) = workers.receive() else {
                 break;
@@ -1018,21 +1244,13 @@ impl World {
                 continue;
             }
             self.pending.retain(|k| *k != result.key);
-            for (i, b) in result.blocks.iter().enumerate() {
-                if b.fluid().is_some() || matches!(b, Block::Sand | Block::Gravel | Block::Leaves) {
-                    let p = result.key * SIZE
-                        + IVec3::new(
-                            i as i32 % SIZE,
-                            i as i32 / (SIZE * SIZE),
-                            i as i32 / SIZE % SIZE,
-                        );
-                    if b.fluid().is_some() {
-                        self.fluid_pending.insert(p.to_array());
-                    } else {
-                        self.physics_pending.insert(p.to_array());
-                    }
-                }
+            // Edits already wake fluids. Remeshing must not repeatedly requeue
+            // settled ocean interiors and starve spill edges.
+            if !self.chunks.contains_key(&result.key) {
+                self.fluid_pending.extend(result.fluid_frontier);
             }
+            self.physics_pending.extend(result.physics_frontier);
+            self.stream_roofs.extend(result.roofs);
             self.chunks.insert(result.key, result.blocks);
             self.meshes.retain(|(key, _)| *key != result.key);
             self.meshes.push((result.key, result.mesh));
@@ -1043,10 +1261,9 @@ impl World {
                 .sort_by_key(|p| ((*p - c).length_squared(), p.x, p.y, p.z));
         }
         // A bounded backlog keeps workers running between redraws.
-        let dispatch_start = std::time::Instant::now();
         while self.plan_ready
             && self.active.len() < crate::streaming::MAX_OUTSTANDING
-            && dispatch_start.elapsed() < std::time::Duration::from_millis(2)
+            && std::time::Instant::now() < deadline
         {
             let Some(i) = self.pending.iter().position(|k| !self.active.contains(k)) else {
                 break;
@@ -1057,6 +1274,7 @@ impl World {
             }
             let base = key * SIZE;
             let mut snapshot = World::new(self.seed);
+            snapshot.waterways = self.waterways.clone();
             snapshot.torch_mounts = self.torch_mounts.clone();
             // Include the full vertical columns for sky occlusion above the AO halo.
             snapshot.edits = self
@@ -1181,6 +1399,20 @@ impl World {
     }
 }
 
+// An elliptical passage opens through a ridge; a shorter blind recess makes
+// an overhang. Preserve a minimum three-block roof and expose stone inside it.
+fn mountain_cutout(h: u64, along: i32, across: i32, y: i32, surface: i32) -> Option<Block> {
+    let length = if h & 0x20000 == 0 { 22. } else { 11. };
+    let arch = (across as f32 / 10.).powi(2) + ((y - 3) as f32 / 8.).powi(2);
+    if (along as f32).abs() <= length && arch < 1. && y <= surface - 3 {
+        Some(Block::Air)
+    } else if (along as f32).abs() <= length && arch < 1.6 && y < surface {
+        Some(Block::Stone)
+    } else {
+        None
+    }
+}
+
 // Union of offset, elliptical lobes avoids the repeated diamond-and-cap silhouette.
 // Zero means outside the footprint; positive values are heights above the ground.
 fn outcrop_top(h: u64, mut x: i32, mut z: i32) -> i32 {
@@ -1190,8 +1422,20 @@ fn outcrop_top(h: u64, mut x: i32, mut z: i32) -> i32 {
     if (h >> 42) & 1 != 0 {
         x = -x;
     }
-    let size = ((h >> 44) & 1) as i32;
-    let lobes: &[(i32, i32, i32, i32, i32)] = match (h >> 48) % 5 {
+    let scale_for = |tier| match tier {
+        0 => 3,
+        1..=4 => 2,
+        _ => 1,
+    };
+    let height_scale = scale_for((h >> 44) & 15);
+    // Independent horizontal axes allow wide slabs, narrow spires and long ridges
+    // at every height tier, while keeping the footprint within its cell.
+    let width_scale = scale_for((h >> 52) & 15);
+    let depth_scale = scale_for((h >> 56) & 15);
+    let size = ((h >> 43) & 1) as i32;
+    let x = x as f32 / width_scale as f32;
+    let z = z as f32 / depth_scale as f32;
+    let lobes: &[(i32, i32, i32, i32, i32)] = match ((h >> 48) & 15) % 5 {
         0 => &[(0, 0, 2 + size, 2, 3), (1, 0, 2, 2, 2)],
         1 => &[(0, 0, 3 + size, 2 + size, 1), (-1, 0, 2, 2, 2)],
         2 => &[(-1, 0, 3 + size, 1 + size, 2), (2, 0, 2, 1, 3)],
@@ -1199,13 +1443,17 @@ fn outcrop_top(h: u64, mut x: i32, mut z: i32) -> i32 {
         _ => &[(-2, -1, 2, 2, 2), (1, 1, 2 + size, 2, 3), (2, -2, 1, 1, 1)],
     };
     lobes.iter().fold(0, |top, &(cx, cz, rx, rz, height)| {
-        let distance = (x - cx).pow(2) * rz * rz + (z - cz).pow(2) * rx * rx;
+        let distance =
+            (x - cx as f32).powi(2) * (rz * rz) as f32 + (z - cz as f32).powi(2) * (rx * rx) as f32;
         let radius = rx * rx * rz * rz;
-        if distance > radius {
+        if distance > radius as f32 {
             top
         } else {
             // Broad tops and uneven shoulders instead of a mandatory single-block peak.
-            top.max(height - i32::from(distance * 3 > radius * 2 && height > 1))
+            top.max(
+                height * height_scale
+                    - i32::from(distance * 3. > (radius * 2) as f32 && height > 1) * height_scale,
+            )
         }
     })
 }
@@ -1214,11 +1462,235 @@ fn outcrop_top(h: u64, mut x: i32, mut z: i32) -> i32 {
 mod tests {
     use super::*;
     #[test]
+    fn ore_abundance_and_overlapping_depth_ranges() {
+        let mut counts = [0usize; 3];
+        let mut shallow_copper = 0;
+        for seed in [1, 42, 314159] {
+            let world = World::new(seed);
+            for x in -16..16 {
+                for z in -16..16 {
+                    let surface = world.height(x, z);
+                    for depth in 4..40 {
+                        let block = world.get(IVec3::new(x, surface - depth, z));
+                        if depth < 8 {
+                            assert_ne!(block, Block::Iron);
+                            shallow_copper += usize::from(block == Block::Copper);
+                        } else {
+                            match block {
+                                Block::Copper => counts[0] += 1,
+                                Block::Coal => counts[1] += 1,
+                                Block::Iron => counts[2] += 1,
+                                _ => {}
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        assert!(shallow_copper > 0);
+        let [copper, coal, iron] = counts;
+        assert!(coal > copper && coal > iron, "{counts:?}");
+        assert!(iron * 4 > copper * 3 && copper * 4 > iron * 3, "{counts:?}");
+        let samples = 3 * 32 * 32 * 32;
+        assert!(copper < samples * 3 / 100, "{counts:?}");
+        assert!(coal < samples * 4 / 100, "{counts:?}");
+    }
+
+    #[test]
+    fn open_water_keeps_land_within_the_normal_view_distance() {
+        for seed in [1, 41, 314159] {
+            let w = World::new(seed);
+            let mut checked = 0;
+            for x in (-2048..=2048).step_by(96) {
+                for z in (-2048..=2048).step_by(96) {
+                    if w.height(x, z) >= SEA_LEVEL {
+                        continue;
+                    }
+                    checked += 1;
+                    let shore = (0..16).any(|ray| {
+                        let angle = ray as f32 * std::f32::consts::TAU / 16.;
+                        (16..=144).step_by(16).any(|distance| {
+                            let qx = x + (angle.cos() * distance as f32).round() as i32;
+                            let qz = z + (angle.sin() * distance as f32).round() as i32;
+                            w.height(qx, qz) >= SEA_LEVEL
+                                && w.get(IVec3::new(qx, SEA_LEVEL, qz)).solid()
+                        })
+                    });
+                    assert!(shore, "no nearby shore at ({x}, {z}), seed={seed}");
+                }
+            }
+            assert!(checked > 30);
+        }
+    }
+
+    #[test]
+    fn ordinary_caves_leave_thick_roofs_near_surface_water() {
+        let w = World::new(41);
+        let mut checked = 0;
+        for x in (-1600..1600).step_by(8) {
+            for z in (-1600..1600).step_by(8) {
+                if w.cave_sink(x, z) {
+                    continue;
+                }
+                let Some((_, raw_hi)) = w.raw_cave_column(x, z) else {
+                    continue;
+                };
+                if raw_hi <= SEA_LEVEL - 12 {
+                    continue;
+                }
+                let near_water = [(0, 0), (-12, 0), (12, 0), (0, -12), (0, 12)]
+                    .iter()
+                    .any(|&(dx, dz)| w.height(x + dx, z + dz) < SEA_LEVEL);
+                if near_water {
+                    checked += 1;
+                    assert!(
+                        w.cave_column(x, z)
+                            .is_none_or(|(_, hi)| hi <= SEA_LEVEL - 12)
+                    );
+                    assert_ne!(w.get(IVec3::new(x, SEA_LEVEL - 1, z)), Block::Air);
+                }
+            }
+        }
+        assert!(checked > 10, "water-adjacent caves must be exercised");
+    }
+
+    #[test]
+    fn rare_submerged_cave_openings_receive_a_supplied_waterfall() {
+        let mut w = World::new(41);
+        let mut fall = None;
+        'cells: for cx in -24..24 {
+            for cz in -24..24 {
+                if !w.cave_sink(cx * 160, cz * 160) {
+                    continue;
+                }
+                for dx in (16..144).step_by(4) {
+                    for dz in (16..144).step_by(4) {
+                        let (x, z) = (cx * 160 + dx, cz * 160 + dz);
+                        let height = w.height(x, z);
+                        if height >= SEA_LEVEL {
+                            continue;
+                        }
+                        let Some((lo, hi)) = w.cave_column(x, z) else {
+                            continue;
+                        };
+                        if hi < height - 3 || lo >= height - 2 {
+                            continue;
+                        }
+                        let p = IVec3::new(x, height, z);
+                        if w.get(p) == Block::FlowingWater(8) {
+                            fall = Some((p, lo));
+                            break 'cells;
+                        }
+                    }
+                }
+            }
+        }
+        let (p, lo) = fall.expect("occasional natural underground waterfall");
+        for y in lo..=p.y {
+            assert_eq!(w.get(IVec3::new(p.x, y, p.z)), Block::FlowingWater(8));
+        }
+        assert_eq!(w.get(p + IVec3::Y), Block::Water);
+        w.wake_fluid(p);
+        for _ in 0..12 {
+            w.tick_fluids(p, false);
+        }
+        assert!(w.get(p).fluid().is_some());
+        let key = chunk(p);
+        let halo = w.halo(key);
+        let local = p - key * SIZE + IVec3::ONE;
+        assert_eq!(
+            halo[(local.x + 18 * (local.z + 18 * local.y)) as usize],
+            w.get(p)
+        );
+    }
+
+    #[test]
+    fn seas_have_flat_sources_sealed_beds_and_streamed_surfaces() {
+        let mut w = World::new(314159);
+        let mut deep = None;
+        let mut shallow = None;
+        for x in (-4096..=4096).step_by(32) {
+            for z in (-4096..=4096).step_by(32) {
+                let h = w.height(x, z);
+                if h < SEA_LEVEL - 12 && deep.is_none() {
+                    deep = Some(IVec3::new(x, SEA_LEVEL, z));
+                }
+                if h == SEA_LEVEL - 4 && shallow.is_none() {
+                    shallow = Some(IVec3::new(x, SEA_LEVEL, z));
+                }
+            }
+        }
+        for p in [deep.expect("deep ocean"), shallow.expect("shallow water")] {
+            let h = w.height(p.x, p.z);
+            for y in h + 1..=SEA_LEVEL {
+                assert_eq!(w.get(IVec3::new(p.x, y, p.z)), Block::Water);
+            }
+            assert_eq!(w.get(p + IVec3::Y), Block::Air);
+            for y in h - 3..=h {
+                assert!(matches!(
+                    w.get(IVec3::new(p.x, y, p.z)),
+                    Block::Sand | Block::Gravel
+                ));
+            }
+            let key = chunk(p);
+            assert!(w.plan_surface(key, 0).contains(&key));
+            let halo = w.halo(key);
+            for y in -1..=SIZE {
+                for z in -1..=SIZE {
+                    for x in -1..=SIZE {
+                        assert_eq!(
+                            halo[((x + 1) + 18 * ((z + 1) + 18 * (y + 1))) as usize],
+                            w.get(key * SIZE + IVec3::new(x, y, z))
+                        );
+                    }
+                }
+            }
+            w.set(p, Block::Stone);
+            assert_eq!(w.get(p), Block::Stone);
+        }
+    }
+
+    #[test]
+    fn river_valleys_cut_continental_land_to_sea_level() {
+        let w = World::new(41);
+        let mut river = None;
+        for x in (-4096..=4096).step_by(16) {
+            for z in (-4096..=4096).step_by(16) {
+                if noise(w.seed ^ 0x736561, x as f32 / 1200., z as f32 / 1200.) > 0.6
+                    && w.height(x, z) == SEA_LEVEL - 4
+                {
+                    river = Some(IVec3::new(x, SEA_LEVEL, z));
+                    break;
+                }
+            }
+            if river.is_some() {
+                break;
+            }
+        }
+        let p = river.expect("river crossing continental land");
+        assert_eq!(w.get(p), Block::Water);
+        assert_eq!(w.get(p - IVec3::Y * 3), Block::Water);
+        assert_eq!(w.get(p + IVec3::Y), Block::Air);
+    }
+
+    #[test]
+    fn sea_generation_preserves_dry_spawn_across_seeds() {
+        for seed in [0, 1, 41, 314159, u64::MAX] {
+            let w = World::new(seed);
+            for x in (-128..=128).step_by(16) {
+                for z in (-128..=128).step_by(16) {
+                    assert!(w.height(x, z) >= SEA_LEVEL);
+                }
+            }
+        }
+    }
+
+    #[test]
     fn outcrop_shapes_have_distinct_footprints_and_broad_tops() {
         let mut shapes = HashSet::new();
         for family in 0..5_u64 {
             for size in 0..2_u64 {
-                let h = (family << 48) | (size << 44);
+                let h = (family << 48) | (5 << 44) | (size << 43) | (5 << 52) | (5 << 56);
                 let mut shape = Vec::new();
                 for x in -10..=10 {
                     for z in -10..=10 {
@@ -1239,6 +1711,132 @@ mod tests {
     }
 
     #[test]
+    fn outcrop_width_and_depth_vary_independently_of_height() {
+        let bounds = |h| {
+            let (mut width, mut depth, mut peak) = (0, 0, 0);
+            for x in -16_i32..=16 {
+                for z in -16_i32..=16 {
+                    let top = outcrop_top(h, x, z);
+                    if top > 0 {
+                        width = width.max(x.abs());
+                        depth = depth.max(z.abs());
+                        peak = peak.max(top);
+                    }
+                }
+            }
+            (width, depth, peak)
+        };
+        for height in [0, 5] {
+            let small = bounds((height << 44) | (5 << 52) | (5 << 56));
+            let wide = bounds((height << 44) | (5 << 56));
+            let deep = bounds((height << 44) | (5 << 52));
+            assert!(wide.0 >= small.0 * 3 && wide.1 == small.1);
+            assert!(deep.1 >= small.1 * 3 && deep.0 == small.0);
+            assert_eq!(small.2, wide.2);
+            assert_eq!(small.2, deep.2);
+            assert!(wide.0 <= 15 && deep.1 <= 15);
+        }
+    }
+
+    #[test]
+    fn snow_outcrops_have_stone_beneath_snow_and_large_variants() {
+        let w = World::new(314159);
+        let mut found = false;
+        for cx in -80..80 {
+            for cz in -80..80 {
+                let h = hash(w.seed ^ 0x726f636b, cx, 0, cz);
+                if !h.is_multiple_of(9) {
+                    continue;
+                }
+                let x = cx * 48 + 16 + ((h >> 8) % 16) as i32;
+                let z = cz * 48 + 16 + ((h >> 24) % 16) as i32;
+                if !w.biome(x, z).is_snow() {
+                    continue;
+                }
+                let base = w.height(x, z);
+                let top = outcrop_top(h, 0, 0);
+                if base <= SEA_LEVEL + 1 || top < 2 {
+                    continue;
+                }
+                let p = IVec3::new(x, base + top, z);
+                if w.get(p) != Block::Snow {
+                    continue;
+                }
+                assert_eq!(w.get(p - IVec3::Y), Block::Stone);
+                let key = chunk(p);
+                let q = p - key * SIZE;
+                assert_eq!(
+                    w.halo(key)[((q.x + 1) + 18 * ((q.z + 1) + 18 * (q.y + 1))) as usize],
+                    Block::Snow
+                );
+                found = true;
+                break;
+            }
+            if found {
+                break;
+            }
+        }
+        assert!(found);
+        let mut peak = 0;
+        let mut width = 0;
+        for x in -16..=16 {
+            for z in -16..=16 {
+                let top = outcrop_top(0, x, z);
+                peak = peak.max(top);
+                if top > 0 {
+                    width = width.max(x.abs());
+                }
+            }
+        }
+        assert!(peak >= 9 && width >= 9);
+    }
+
+    #[test]
+    fn mountain_arch_has_open_passage_and_solid_roof() {
+        for along in [-22, 0, 22] {
+            assert_eq!(mountain_cutout(0, along, 0, 3, 18), Some(Block::Air));
+            assert_eq!(mountain_cutout(0, along, 0, 12, 18), Some(Block::Stone));
+        }
+        assert_eq!(mountain_cutout(0, 0, 0, 3, 5), Some(Block::Stone));
+        assert_eq!(mountain_cutout(0x20000, 18, 0, 3, 18), None);
+    }
+
+    #[test]
+    fn mountain_passages_generate_in_world_and_match_halos() {
+        let w = World::new(41);
+        let mut found = false;
+        for cx in -80..80 {
+            for cz in -80..80 {
+                let h = hash(w.seed ^ 0x61726368, cx, 0, cz);
+                if !h.is_multiple_of(5) {
+                    continue;
+                }
+                let x = cx * 96 + 32 + ((h >> 8) % 32) as i32;
+                let z = cz * 96 + 32 + ((h >> 24) % 32) as i32;
+                let height = w.height(x, z);
+                let p = IVec3::new(x, height - 9, z);
+                if w.surface_rock(p, height, w.biome(p.x, p.z)) != Some(Block::Air) {
+                    continue;
+                }
+                assert_eq!(w.get(p), Block::Air);
+                assert!(w.get(IVec3::new(x, height - 1, z)).solid());
+                let key = chunk(p);
+                let q = p - key * SIZE;
+                assert_eq!(
+                    w.halo(key)[((q.x + 1) + 18 * ((q.z + 1) + 18 * (q.y + 1))) as usize],
+                    Block::Air
+                );
+                found = true;
+                break;
+            }
+            if found {
+                break;
+            }
+        }
+        assert!(found);
+    }
+
+    #[test]
     fn grassland_outcrops_are_sparse_and_match_chunk_halos() {
         let w = World::new(314159);
         let mut rocks = Vec::new();
@@ -1246,7 +1844,7 @@ mod tests {
             for z in -64..64 {
                 let p = IVec3::new(x, w.height(x, z) + 1, z);
                 if w.get(p) == Block::Stone {
-                    assert_eq!(w.biome(x, z), Biome::Grassland);
+                    assert!(w.biome(x, z).is_grassland());
                     rocks.push(p);
                 }
             }
@@ -1336,7 +1934,8 @@ mod tests {
         wait_for_chunk(&mut w, pos, key);
         assert_eq!(w.get(edit), Block::Planks);
         let data = w.meshes.iter().find(|(k, _)| *k == key).unwrap();
-        let expected = crate::render::mesh_chunk(&w, key);
+        let mut expected = crate::render::mesh_chunk(&w, key);
+        crate::render::prepare_chunk_mesh(&mut expected);
         assert_eq!(
             bytemuck::cast_slice::<_, u8>(&data.1),
             bytemuck::cast_slice::<_, u8>(&expected)
@@ -1351,6 +1950,46 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn streamed_physics_frontier_and_mixed_mesh_match_direct_queries() {
+        use std::collections::BTreeSet;
+        let mut w = World::new(42);
+        let key = IVec3::new(-1, 60, 1);
+        let base = key * SIZE;
+        for (offset, block) in [
+            Block::Sand,
+            Block::Gravel,
+            Block::Leaves,
+            Block::Water,
+            Block::Stone,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            w.set(base + IVec3::new(offset as i32 * 2, 2, 2), block);
+        }
+        // Discard the edit wakeups so this verifies the worker's scan alone.
+        w.physics_pending.clear();
+        wait_for_chunk(&mut w, (base + IVec3::splat(8)).as_vec3(), key);
+        let expected: BTreeSet<_> = (0..3)
+            .map(|i| (base + IVec3::new(i * 2, 2, 2)).to_array())
+            .collect();
+        let actual: BTreeSet<_> = w
+            .physics_pending
+            .iter()
+            .copied()
+            .filter(|p| chunk(IVec3::from_array(*p)) == key)
+            .collect();
+        assert_eq!(actual, expected);
+        let mut expected = crate::render::mesh_chunk(&w, key);
+        crate::render::prepare_chunk_mesh(&mut expected);
+        let actual = &w.meshes.iter().find(|(k, _)| *k == key).unwrap().1;
+        assert_eq!(
+            bytemuck::cast_slice::<_, u8>(actual),
+            bytemuck::cast_slice::<_, u8>(&expected)
+        );
     }
     #[test]
     fn resident_edit_remesh_survives_stream_replanning() {
@@ -1367,7 +2006,8 @@ mod tests {
             w.meshes.clear();
             w.stream(moved, 1);
             if let Some((_, mesh)) = w.meshes.iter().find(|(k, _)| *k == key) {
-                let expected = crate::render::mesh_chunk(&w, key);
+                let mut expected = crate::render::mesh_chunk(&w, key);
+                crate::render::prepare_chunk_mesh(&mut expected);
                 assert_eq!(
                     bytemuck::cast_slice::<_, u8>(mesh),
                     bytemuck::cast_slice::<_, u8>(&expected)
@@ -1408,7 +2048,8 @@ mod tests {
                 .all(|k| (k.x - key.x).abs() <= 1 && (k.z - key.z).abs() <= 1)
         );
         assert_eq!(w.chunks[&key][index(edit)], Block::Planks);
-        let expected = crate::render::mesh_chunk(&w, key);
+        let mut expected = crate::render::mesh_chunk(&w, key);
+        crate::render::prepare_chunk_mesh(&mut expected);
         let actual = &w.meshes.iter().find(|(k, _)| *k == key).unwrap().1;
         assert_eq!(
             bytemuck::cast_slice::<_, u8>(actual),
@@ -1445,6 +2086,50 @@ mod tests {
         assert_eq!(hit, IVec3::new(2, 100, 0));
         assert_eq!(before, IVec3::new(1, 100, 0));
         assert!(w.raycast(Vec3::new(0.5, 100.5, 0.5), Vec3::X, 1.).is_none());
+    }
+    #[test]
+    fn terrain_variants_are_bounded_and_mega_mountains_are_rare() {
+        let w = World::new(314159);
+        let mut counts = [0; 4];
+        let mut grass = [false; 4];
+        let mut snow = [false; 4];
+        let mut peaks = [i32::MIN; 4];
+        for x in (-32000..=32000).step_by(128) {
+            for z in (-32000..=32000).step_by(128) {
+                let biome = w.biome(x, z);
+                let tier = match biome {
+                    Biome::Grassland | Biome::Tundra => 0,
+                    Biome::GrasslandHills | Biome::SnowHills => 1,
+                    Biome::GrasslandMountains | Biome::SnowMountains => 2,
+                    Biome::GrasslandMegaMountains | Biome::SnowMegaMountains => 3,
+                    Biome::Forest => continue,
+                };
+                counts[tier] += 1;
+                grass[tier] |= biome.is_grassland();
+                snow[tier] |= biome.is_snow();
+                let height = w.height(x, z);
+                peaks[tier] = peaks[tier].max(height);
+                assert!((MIN_Y + 1..=MAX_Y - 16).contains(&height));
+                if tier == 0 {
+                    assert!(height <= 33);
+                }
+                if tier == 1 {
+                    assert!(height <= 66);
+                }
+                if tier == 2 {
+                    assert!(height <= 326);
+                }
+            }
+        }
+        assert!(grass.into_iter().all(|seen| seen));
+        assert!(snow.into_iter().all(|seen| seen));
+        assert!(counts[0] + counts[1] > counts[2] * 4);
+        assert!(counts[3] * 100 < counts.iter().sum::<usize>());
+        assert!(peaks[3] > peaks[2] && peaks[2] > peaks[1]);
+        // Flat terrain has only a few blocks of relief before water carving.
+        for x in -32..32 {
+            assert!((w.height(x + 1, 0) - w.height(x, 0)).abs() <= 1);
+        }
     }
     #[test]
     fn distant_mountains_exceed_legacy_world_heights() {
@@ -1500,12 +2185,12 @@ mod expansion_tests {
     fn tundra_ruin_is_deterministic_accessible_and_matches_chunk_halo() {
         for seed in [1, 42, 314159] {
             let world = World::new(seed);
-            assert_ne!(world.biome(2, 2), Biome::Tundra);
+            assert!(!world.biome(2, 2).is_snow());
             let home = (-8..=8)
                 .find_map(|x| (-8..=8).find_map(|z| world.ruin_in_cell(x, z)))
                 .unwrap();
             let other = World::new(seed);
-            assert_eq!(world.biome(home.x, home.z), Biome::Tundra);
+            assert!(world.biome(home.x, home.z).is_snow());
             assert_eq!(other.nearby_ruin(home.x, home.z), Some(home));
             assert_eq!(world.get(home + IVec3::Y), Block::Reliquary);
             assert_eq!(world.get(home + IVec3::new(0, 1, 5)), Block::Air);
@@ -1522,8 +2207,10 @@ mod expansion_tests {
                 );
             }
             let mut iron = false;
-            for y in home.y - 45..home.y - 12 {
-                for dx in -12..=12 {
+            for dx in -12..=12 {
+                // River valleys can sit far below the nearby ruin's elevation.
+                let surface = world.height(home.x + dx, home.z + 12);
+                for y in surface - 45..surface - 12 {
                     iron |= world.get(IVec3::new(home.x + dx, y, home.z + 12)) == Block::Iron;
                 }
             }
@@ -1733,10 +2420,13 @@ mod cave_tests {
                     let h = hash(seed ^ 0xca7e_2026, cx, 0, cz);
                     let x = cx * 160 + 72 + (h % 17) as i32;
                     let z = cz * 160 + 72 + ((h >> 8) % 17) as i32;
-                    let (lo, hi) = world.cave_column(x, z).unwrap();
+                    let (raw_lo, raw_hi) = world.raw_cave_column(x, z).unwrap();
                     let kind = ((h >> 20) % 3) as usize;
-                    kinds[kind] = true;
-                    assert!(hi - lo >= [4, 12, 36][kind]);
+                    assert!(raw_hi - raw_lo >= [4, 12, 36][kind]);
+                    let Some((lo, hi)) = world.cave_column(x, z) else {
+                        continue;
+                    };
+                    kinds[kind] |= hi - lo >= [4, 12, 36][kind];
                     assert_eq!(world.get(IVec3::new(x, (lo + hi) / 2, z)), Block::Air);
                     assert_eq!(world.get(IVec3::new(x, MIN_Y, z)), Block::Stone);
                     for d in 48..=60 {
@@ -2014,7 +2704,7 @@ mod vegetation_physics_tests {
             for z in (-400..400).step_by(3) {
                 if let Some((tx, ty, tz)) = w.tree(x, z) {
                     if roots.insert((tx, tz)) {
-                        assert_ne!(w.biome(tx, tz), Biome::Tundra);
+                        assert!(!w.biome(tx, tz).is_snow());
                         assert_eq!(w.get(IVec3::new(tx, ty + 1, tz)), Block::Log);
                         heights.insert(5 + hash(w.seed ^ 0x74726565, tx, 0, tz) % 5);
                     }
@@ -2023,5 +2713,42 @@ mod vegetation_physics_tests {
         }
         assert!(roots.len() > 100);
         assert_eq!(heights.len(), 5);
+    }
+}
+
+#[cfg(test)]
+mod terrain_column_regression {
+    use super::*;
+
+    #[test]
+    fn terrain_matches_before_column_reuse() {
+        // Golden fingerprints captured from 61f70c7 before column reuse. Include
+        // surface/cave halos, negative chunk boundaries and distant terrain.
+        for (seed, expected) in [
+            (42, 4398968496163188796_u64),
+            (314159, 17942618388807863753_u64),
+            (987654, 3255627759975004419_u64),
+        ] {
+            let world = World::new(seed);
+            let mut fingerprint = 0xcbf29ce484222325_u64;
+            for (x, z) in [
+                (-17, -16),
+                (0, 0),
+                (255, 256),
+                (-256, -256),
+                (1024, -1024),
+                (-4096, 8192),
+                (16384, -24576),
+            ] {
+                let height = world.height(x, z);
+                for y in [height, height - 48] {
+                    let blocks = world.halo(chunk(IVec3::new(x, y, z)));
+                    for byte in serde_json::to_vec(&blocks).unwrap() {
+                        fingerprint = (fingerprint ^ u64::from(byte)).wrapping_mul(0x100000001b3);
+                    }
+                }
+            }
+            assert_eq!(fingerprint, expected, "seed={seed}");
+        }
     }
 }

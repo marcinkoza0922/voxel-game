@@ -5,9 +5,14 @@ mod ecs;
 mod expedition;
 mod feedback;
 mod fluid;
+#[path = "../tools/frontier_review.rs"]
+mod frontier_review;
 mod game;
+#[path = "../tools/gpu_profile.rs"]
+mod gpu_profile;
 #[path = "../tools/headless.rs"]
 mod headless;
+mod hydrology;
 mod items;
 #[cfg(feature = "native-upscalers")]
 mod native_upscale;
@@ -18,11 +23,15 @@ mod playtest;
 mod render;
 mod save;
 mod settings;
+#[path = "../tools/still_review.rs"]
+mod still_review;
 mod streaming;
 #[path = "../tools/stress.rs"]
 mod stress;
 mod temporal;
 mod ui;
+#[path = "../tools/water_review.rs"]
+mod water_review;
 mod world;
 
 use game::{Game, Input, STEP};
@@ -37,6 +46,9 @@ use winit::{
 
 struct Options {
     stress: bool,
+    frontier_review: bool,
+    still_review: bool,
+    water_review: bool,
     headless: bool,
     title: bool,
     settings_path: PathBuf,
@@ -56,6 +68,9 @@ struct Options {
 fn options() -> Result<Options, String> {
     let mut o = Options {
         stress: false,
+        frontier_review: false,
+        still_review: false,
+        water_review: false,
         headless: false,
         title: false,
         settings_path: PathBuf::from("saves/settings.json"),
@@ -77,7 +92,9 @@ fn options() -> Result<Options, String> {
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
+            "--still-review" => o.still_review = true,
             "--stress" => o.stress = true,
+            "--water-review" => o.water_review = true,
             "--headless" => o.headless = true,
             "--title" => o.title = true,
             "--settings" => {
@@ -93,6 +110,7 @@ fn options() -> Result<Options, String> {
                     .parse()
                     .map_err(|_| "Invalid seed")?
             }
+            "--frontier-review" => o.frontier_review = true,
             "--save" => {
                 o.save = PathBuf::from(args.next().ok_or("--save needs a path")?);
                 explicit_save = true;
@@ -122,7 +140,7 @@ fn options() -> Result<Options, String> {
             }
             "--help" | "-h" => {
                 println!(
-                    "Voxel Adventure\n  --stress       CPU stress suite; --frames sets repetitions (default 12), --profile writes samples\n  --headless     render offscreen without display/audio (default 240 frames)\n  --new          create a separate fresh save with a random seed\n  --seed N       seed for a new world (default 314159)\n  --save PATH    world file (default saves/world.json)\n  --smoke        headless gameplay/persistence check; uses a temporary save\n  --frames N     render N frames then save and exit\n  --capture PATH save final frame as PPM (defaults to 240 frames)\n  --tour         scripted camera relocations for streaming measurements\n  --playtest     run headless mechanics course and progression expedition\n  --expedition   run controlled headless progression expedition\n  --profile PATH write frame timings and chunk backlog as CSV\n  --mute         disable sound playback\n  --pack         start with the inventory open\n  --title        show title screen (also supports headless previews)\n  --settings PATH graphics settings JSON (default saves/settings.json)\n\nWASD move; mouse look; Space jump; double-tap W sprint; Shift walk\nLMB mine/attack; RMB place/eat/use; wheel or 1-9 select\nE inventory/crafting/stats; R sleep near bed; F5 save; Esc menu"
+                    "Voxel Adventure\n  --still-review frozen temporal captures; --save is read only, --capture is output directory\n  --frontier-review benchmark mining invalidation without writing saves\n  --water-review render a natural waterfall to target/water-review (isolated save/settings)\n  --stress       CPU stress suite; --frames sets repetitions (default 12), --profile writes samples\n  --headless     render offscreen without display/audio (default 240 frames)\n  --new          create a separate fresh save with a random seed\n  --seed N       seed for a new world (default 314159)\n  --save PATH    world file (default saves/world.json)\n  --smoke        headless gameplay/persistence check; uses a temporary save\n  --frames N     render N frames then save and exit\n  --capture PATH save final frame as PPM (defaults to 240 frames)\n  --tour         scripted camera relocations for streaming measurements\n  --playtest     run headless mechanics course and progression expedition\n  --expedition   run controlled headless progression expedition\n  --profile PATH write frame timings and chunk backlog as CSV\n  --mute         disable sound playback\n  --pack         start with the inventory open\n  --title        show title screen (also supports headless previews)\n  --settings PATH graphics settings JSON (default saves/settings.json)\n\nWASD move; mouse look; Space jump; double-tap W sprint; Shift walk\nLMB mine/attack; RMB place/eat/use; wheel or 1-9 select\nE inventory/crafting/stats; R sleep near bed; F5 save; Esc menu"
                 );
                 std::process::exit(0);
             }
@@ -442,7 +460,10 @@ impl ApplicationHandler for App {
                     )
                     .map_err(|e| e.to_string())?,
             );
-            let renderer = pollster::block_on(render::Renderer::new(window.clone()))?;
+            let mut renderer = pollster::block_on(render::Renderer::new(window.clone()))?;
+            if let Some(profile) = &self.profile {
+                renderer.enable_gpu_profile(profile.gpu_sender());
+            }
             Ok::<_, String>((window, renderer))
         })();
         match result {
@@ -574,6 +595,9 @@ impl ApplicationHandler for App {
                                 if let Err(e) = self.settings.write(&self.options.settings_path) {
                                     self.notice = e;
                                 }
+                            }
+                            KeyCode::F6 if !self.pack && !self.paused => {
+                                self.game.toggle_god_mode();
                             }
                             KeyCode::F5 => {
                                 self.save();
@@ -758,6 +782,7 @@ impl ApplicationHandler for App {
                     );
                     let stream_ms = stream_start.elapsed().as_secs_f64() * 1000.;
                     r.profile_draw = self.profile.is_some();
+                    r.profile_frame = self.frames;
                     let draw_start = Instant::now();
                     if let Err(e) = r.draw(
                         &self.game,
@@ -891,6 +916,15 @@ fn saved_worlds(current: &std::path::Path, settings: &std::path::Path) -> Vec<Pa
 
 fn run() -> Result<(), String> {
     let mut options = options()?;
+    if options.still_review {
+        return still_review::run(&options);
+    }
+    if options.frontier_review {
+        return frontier_review::run(&options);
+    }
+    if options.water_review {
+        return water_review::run(options);
+    }
     if options.stress {
         return stress::run(
             options.seed,
@@ -984,3 +1018,7 @@ fn main() {
         std::process::exit(1);
     }
 }
+
+#[cfg(test)]
+#[path = "../tools/movement_review.rs"]
+mod movement_review;

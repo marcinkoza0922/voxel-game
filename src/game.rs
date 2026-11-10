@@ -108,6 +108,7 @@ pub struct WorldDrop {
     pub count: u32,
 }
 pub struct Game {
+    pub god_mode: bool,
     pub drops: Vec<WorldDrop>,
     pub feedback: crate::feedback::Feedback,
     pub world: World,
@@ -136,6 +137,7 @@ impl Game {
         let world = World::new(seed);
         let player = Player::new(&world);
         Self {
+            god_mode: false,
             drops: Vec::new(),
             feedback: Default::default(),
             world,
@@ -159,6 +161,18 @@ impl Game {
             active_furnace: None,
             torch_life: Default::default(),
         }
+    }
+    pub fn toggle_god_mode(&mut self) {
+        self.god_mode = !self.god_mode;
+        self.velocity = Vec3::ZERO;
+        self.grounded = false;
+        self.mining = None;
+        self.mining_progress = 0.;
+        self.say(if self.god_mode {
+            "God mode ON: WASD fly, Space up, Shift down, LMB instant mine"
+        } else {
+            "God mode OFF"
+        });
     }
     pub fn say(&mut self, s: impl Into<String>) {
         self.message = s.into();
@@ -587,105 +601,122 @@ impl Game {
                 self.world.set(IVec3::from_array(p), Block::Air);
             }
         }
-        let sprint = input.sprint && !input.walk && self.player.hunger > 10.;
-        let body_fluid = [0.1, 0.9].into_iter().find_map(|y| {
-            self.world
-                .fluid_at(Vec3::from_array(self.player.pos) + Vec3::Y * y)
-        });
-        let swimming = body_fluid.is_some();
-        let speed = (if swimming { 2.2 } else { 4.5 })
-            * (1. + (self.player.stats[5] as f32 * 0.012).min(0.24))
-            * if input.walk {
-                0.45
-            } else if sprint {
-                1.45
-            } else {
-                1.
-            };
-        let forward = Vec3::new(self.player.yaw.sin(), 0., -self.player.yaw.cos());
-        let right = Vec3::new(self.player.yaw.cos(), 0., self.player.yaw.sin());
-        let walk = (forward * input.forward + right * input.right).normalize_or_zero() * speed;
-        self.velocity.x = walk.x;
-        self.velocity.z = walk.z;
-        let position = Vec3::from_array(self.player.pos);
-        let ahead = position + walk.normalize_or_zero() * 0.45;
-        let auto_jump = !input.walk
-            && walk.length_squared() > 0.
-            && collides(&self.world, ahead)
-            && !collides(&self.world, ahead + Vec3::Y)
-            && !collides(&self.world, position + Vec3::Y);
-        if !swimming && (input.jump || auto_jump) && self.grounded {
-            self.velocity.y = 7.2 * (1. + self.player.stats[5] as f32 * 0.008);
+        let pos = if self.god_mode {
+            let right = Vec3::new(self.player.yaw.cos(), 0., self.player.yaw.sin());
+            let vertical = input.jump as i32 as f32 - input.walk as i32 as f32;
+            let direction = (self.player.direction() * input.forward
+                + right * input.right
+                + Vec3::Y * vertical)
+                .normalize_or_zero();
+            self.velocity = direction * if input.sprint { 30. } else { 12. };
             self.grounded = false;
-        }
-        if swimming {
-            self.velocity.y = (self.velocity.y * (1. - 4. * dt).max(0.)
-                + if input.jump { 12. * dt } else { -3. * dt })
-            .clamp(-2., 3.);
-            // A clear bank needs a jump impulse: swim drag alone stalls at
-            // the surface before the player's feet can clear the ledge.
-            if auto_jump && self.world.fluid_at(self.player.eye()).is_none() {
-                self.velocity.y = 7.2;
-            }
+            let pos = Vec3::from_array(self.player.pos) + self.velocity * dt;
+            self.player.pos = pos.to_array();
+            self.breath = 15.;
+            pos
         } else {
-            self.velocity.y = (self.velocity.y - 22. * dt).max(-45.);
-        }
-        let mut pos = Vec3::from_array(self.player.pos);
-        let was_falling = self.velocity.y;
-        let edge_guard = input.walk && self.grounded && !swimming;
-        self.grounded = false;
-        for axis in [0, 2, 1] {
-            let delta = self.velocity[axis] * dt;
-            let steps = (delta.abs() / 0.2).ceil().max(1.) as u32;
-            for _ in 0..steps {
-                let mut next = pos;
-                next[axis] += delta / steps as f32;
-                if axis != 1 && edge_guard && !collides(&self.world, next - Vec3::Y * 0.06) {
-                    break;
+            let sprint = input.sprint && !input.walk && self.player.hunger > 10.;
+            let body_fluid = [0.1, 0.9].into_iter().find_map(|y| {
+                self.world
+                    .fluid_at(Vec3::from_array(self.player.pos) + Vec3::Y * y)
+            });
+            let swimming = body_fluid.is_some();
+            let speed = (if swimming { 2.2 } else { 4.5 })
+                * (1. + (self.player.stats[5] as f32 * 0.012).min(0.24))
+                * if input.walk {
+                    0.45
+                } else if sprint {
+                    1.45
+                } else {
+                    1.
+                };
+            let forward = Vec3::new(self.player.yaw.sin(), 0., -self.player.yaw.cos());
+            let right = Vec3::new(self.player.yaw.cos(), 0., self.player.yaw.sin());
+            let walk = (forward * input.forward + right * input.right).normalize_or_zero() * speed;
+            self.velocity.x = walk.x;
+            self.velocity.z = walk.z;
+            let position = Vec3::from_array(self.player.pos);
+            let ahead = position + walk.normalize_or_zero() * 0.45;
+            let auto_jump = !input.walk
+                && walk.length_squared() > 0.
+                && collides(&self.world, ahead)
+                && !collides(&self.world, ahead + Vec3::Y)
+                && !collides(&self.world, position + Vec3::Y);
+            if !swimming && (input.jump || auto_jump) && self.grounded {
+                self.velocity.y = 7.2 * (1. + self.player.stats[5] as f32 * 0.008);
+                self.grounded = false;
+            }
+            if swimming {
+                self.velocity.y = (self.velocity.y * (1. - 4. * dt).max(0.)
+                    + if input.jump { 12. * dt } else { -3. * dt })
+                .clamp(-2., 3.);
+                // A clear bank needs a jump impulse: swim drag alone stalls at
+                // the surface before the player's feet can clear the ledge.
+                if auto_jump && self.world.fluid_at(self.player.eye()).is_none() {
+                    self.velocity.y = 7.2;
                 }
-                if collides(&self.world, next) {
-                    if axis == 1 {
-                        if self.velocity.y < 0. {
-                            self.grounded = true;
-                            if was_falling < -12. && !swimming {
-                                let damage = (-was_falling - 12.)
-                                    * 3.
-                                    * (1. - self.player.stats[5] as f32 * 0.02);
-                                self.player.health -= damage.max(0.);
-                            }
-                        }
-                        self.velocity.y = 0.;
+            } else {
+                self.velocity.y = (self.velocity.y - 22. * dt).max(-45.);
+            }
+            let mut pos = Vec3::from_array(self.player.pos);
+            let was_falling = self.velocity.y;
+            let edge_guard = input.walk && self.grounded && !swimming;
+            self.grounded = false;
+            for axis in [0, 2, 1] {
+                let delta = self.velocity[axis] * dt;
+                let steps = (delta.abs() / 0.2).ceil().max(1.) as u32;
+                for _ in 0..steps {
+                    let mut next = pos;
+                    next[axis] += delta / steps as f32;
+                    if axis != 1 && edge_guard && !collides(&self.world, next - Vec3::Y * 0.06) {
+                        break;
                     }
-                    break;
+                    if collides(&self.world, next) {
+                        if axis == 1 {
+                            if self.velocity.y < 0. {
+                                self.grounded = true;
+                                if was_falling < -12. && !swimming {
+                                    let damage = (-was_falling - 12.)
+                                        * 3.
+                                        * (1. - self.player.stats[5] as f32 * 0.02);
+                                    self.player.health -= damage.max(0.);
+                                }
+                            }
+                            self.velocity.y = 0.;
+                        }
+                        break;
+                    }
+                    pos = next;
                 }
-                pos = next;
             }
-        }
-        self.player.pos = pos.to_array();
-        if body_fluid.is_some_and(|(lava, _)| lava) {
-            self.player.health -= dt * 25.;
-        }
-        if self
-            .world
-            .fluid_at(self.player.eye())
-            .is_some_and(|(lava, _)| !lava)
-        {
-            self.breath = (self.breath - dt).max(0.);
-            if self.breath == 0. {
-                self.player.health -= dt * 8.;
+            self.player.pos = pos.to_array();
+            if body_fluid.is_some_and(|(lava, _)| lava) {
+                self.player.health -= dt * 25.;
             }
-        } else {
-            self.breath = (self.breath + dt * 5.).min(15.);
-        }
+            if self
+                .world
+                .fluid_at(self.player.eye())
+                .is_some_and(|(lava, _)| !lava)
+            {
+                self.breath = (self.breath - dt).max(0.);
+                if self.breath == 0. {
+                    self.player.health -= dt * 8.;
+                }
+            } else {
+                self.breath = (self.breath + dt * 5.).min(15.);
+            }
+            self.player.hunger =
+                (self.player.hunger - dt * if sprint { 0.12 } else { 0.055 }).max(0.);
+            self.player.rest = (self.player.rest - dt * 0.035).max(0.);
+            if self.player.hunger == 0. || self.player.rest == 0. {
+                self.player.health -= dt * 1.5;
+            } else if self.player.hunger > 60. && self.player.rest > 25. {
+                self.player.health = (self.player.health + dt * 0.6).min(self.player.max_health());
+            }
+            pos
+        };
         self.tick_drops(dt);
         self.collect_drops();
-        self.player.hunger = (self.player.hunger - dt * if sprint { 0.12 } else { 0.055 }).max(0.);
-        self.player.rest = (self.player.rest - dt * 0.035).max(0.);
-        if self.player.hunger == 0. || self.player.rest == 0. {
-            self.player.health -= dt * 1.5;
-        } else if self.player.hunger > 60. && self.player.rest > 25. {
-            self.player.health = (self.player.health + dt * 0.6).min(self.player.max_health());
-        }
         let biome = self.world.biome(pos.x as i32, pos.z as i32);
         self.player.discover(format!("biome:{}", biome.name()), 30);
         self.target();
@@ -704,7 +735,7 @@ impl Game {
             self.feedback.hurt = 0.3;
             self.feedback.sound(crate::feedback::Cue::Hurt);
         }
-        if self.player.health <= 0. || pos.y < crate::world::MIN_Y as f32 {
+        if !self.god_mode && (self.player.health <= 0. || pos.y < crate::world::MIN_Y as f32) {
             self.player.pos = self.player.spawn;
             self.velocity = Vec3::ZERO;
             self.player.health = self.player.max_health();
@@ -823,11 +854,12 @@ impl Game {
                 | Block::Reliquary
                 | Block::Obsidian
         );
-        if (hard && pick == 0)
-            || (b == Block::Copper && pick < 2)
-            || (b == Block::Iron && pick < 3)
-            || (b == Block::Obsidian && pick < 4)
-            || (b == Block::Log && axe == 0)
+        if !self.god_mode
+            && ((hard && pick == 0)
+                || (b == Block::Copper && pick < 2)
+                || (b == Block::Iron && pick < 3)
+                || (b == Block::Obsidian && pick < 4)
+                || (b == Block::Log && axe == 0))
         {
             if self.message_time < 1. {
                 self.say(if b == Block::Obsidian {
@@ -844,7 +876,8 @@ impl Game {
             }
             return;
         }
-        if b == Block::Reliquary
+        if !self.god_mode
+            && b == Block::Reliquary
             && self.world.nearby_ruin(p.x, p.z).is_some_and(|home| {
                 !self
                     .player
@@ -869,7 +902,7 @@ impl Game {
             0.35
         };
         let previous_progress = self.mining_progress;
-        self.mining_progress += dt / seconds;
+        self.mining_progress += if self.god_mode { 1. } else { dt / seconds };
         if previous_progress == 0.
             || (previous_progress * seconds / 0.32).floor()
                 < (self.mining_progress * seconds / 0.32).floor()
@@ -940,7 +973,7 @@ impl Game {
             self.world.set(p, Block::Air);
             self.torch_life.remove(&p.to_array());
             self.furnaces.remove(&p.to_array());
-            if !b.plant() {
+            if !self.god_mode && !b.plant() {
                 self.player.inventory.damage_tool(tool);
             }
             self.mining_progress = 0.;
@@ -1025,7 +1058,7 @@ impl Game {
                     let z = (player.z + angle.cos() * 26.) as i32;
                     let y = self.world.height(x, z) + 1;
                     let pos = Vec3::new(x as f32 + 0.5, y as f32 + 0.01, z as f32 + 0.5);
-                    if self.world.biome(x, z) == Biome::Grassland
+                    if self.world.biome(x, z).is_grassland()
                         && self.world.get(IVec3::new(x, y - 1, z)) == Block::Grass
                         && !collides(&self.world, pos)
                     {
@@ -1138,11 +1171,13 @@ impl Game {
                     )
                     .is_none()
             {
-                self.player.health -= if matches!(mob.kind, MobKind::Guardian(_)) {
-                    12.
-                } else {
-                    7.
-                };
+                if !self.god_mode {
+                    self.player.health -= if matches!(mob.kind, MobKind::Guardian(_)) {
+                        12.
+                    } else {
+                        7.
+                    };
+                }
                 mob.cooldown = 1.2;
             }
         }
@@ -1193,6 +1228,49 @@ pub fn collides(world: &World, pos: Vec3) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn god_mode_flies_through_blocks_and_preserves_survival() {
+        let mut g = Game::new(42);
+        g.player.pos = [0.5, 1000., 0.5];
+        g.world.set(IVec3::new(0, 1000, 0), Block::Stone);
+        g.player.hunger = 0.;
+        g.player.rest = 0.;
+        g.toggle_god_mode();
+        g.tick(
+            &Input {
+                jump: true,
+                ..Default::default()
+            },
+            0.1,
+        );
+        assert!((g.player.pos[1] - 1001.2).abs() < 0.001);
+        assert_eq!(g.player.health, 100.);
+        assert_eq!(g.player.hunger, 0.);
+        assert_eq!(g.player.rest, 0.);
+        g.tick(&Input::default(), 0.1);
+        assert!((g.player.pos[1] - 1001.2).abs() < 0.001);
+        g.toggle_god_mode();
+        assert_eq!(g.velocity, Vec3::ZERO);
+        g.tick(&Input::default(), 0.1);
+        assert!(g.player.pos[1] < 1001.2);
+    }
+
+    #[test]
+    fn god_mode_instantly_mines_obsidian_without_tools() {
+        let mut g = Game::new(42);
+        let p = IVec3::new(0, 1000, -2);
+        g.player.pos = [0.5, 999., 0.5];
+        g.world.set(p, Block::Obsidian);
+        g.target = Some((p, p + IVec3::Z));
+        g.attack(1. / 60.);
+        assert_eq!(g.world.get(p), Block::Obsidian);
+        g.toggle_god_mode();
+        let inventory = g.player.inventory.clone();
+        g.attack(1. / 60.);
+        assert_eq!(g.world.get(p), Block::Air);
+        assert_eq!(g.player.inventory, inventory);
+    }
+
     #[test]
     fn sheep_are_passive_and_daylight_spawning_is_bounded() {
         let mut g = Game::new(314159);

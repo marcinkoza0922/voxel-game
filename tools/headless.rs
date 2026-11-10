@@ -21,6 +21,9 @@ pub fn run(mut game: Game, options: &Options) -> Result<(), String> {
             .as_deref()
             .map(performance::Profile::new)
             .transpose()?;
+        if let Some(profile) = &profile {
+            renderer.enable_gpu_profile(profile.gpu_sender());
+        }
         let mut last = Instant::now();
         for frame in 0..options.frames.unwrap_or(240) {
             let start = Instant::now();
@@ -71,6 +74,7 @@ pub fn run(mut game: Game, options: &Options) -> Result<(), String> {
             }
             let stream_ms = streaming.elapsed().as_secs_f64() * 1000.;
             renderer.profile_draw = profile.is_some();
+            renderer.profile_frame = frame;
             let draw = Instant::now();
             renderer.draw(
                 &game,
@@ -99,6 +103,7 @@ pub fn run(mut game: Game, options: &Options) -> Result<(), String> {
                 )?;
             }
         }
+        renderer.drain_gpu_profile()?;
         if let Some(profile) = &mut profile {
             profile.finish()?;
         }

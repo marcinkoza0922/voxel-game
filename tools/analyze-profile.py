@@ -3,6 +3,7 @@
 import argparse
 import csv
 import math
+from pathlib import Path
 
 parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument('csv')
@@ -51,3 +52,20 @@ if args.tour:
         settled = next((row['frame'] for row in group if int(row['queued']) == 0 and int(row['active']) == 0), 'not settled')
         print(f"  stage {stage}: first settled frame={settled}; ending resident/queued/active="
               + '/'.join(group[-1][key] for key in ('resident', 'queued', 'active')))
+
+# Separate asynchronous GPU rows retain their source frame, not readback frame.
+gpu_path = Path(args.csv).with_suffix('.gpu.csv')
+if gpu_path.exists():
+    with gpu_path.open(newline='') as source:
+        gpu_rows = [r for r in csv.DictReader(source)
+                    if int(r['frame']) >= args.skip
+                    and (args.limit is None or int(r['frame']) < args.skip + args.limit)]
+    valid = [r for r in gpu_rows if r.get('gpu_total_ms')]
+    print(f'GPU timestamps: {len(valid)} measured, {len(gpu_rows) - len(valid)} unavailable; '
+          f'{len(rows) - len(gpu_rows)} CPU frames without GPU rows')
+    for field in ('gpu_shadow_ms', 'gpu_world_ms', 'gpu_temporal_ms',
+                  'gpu_held_ms', 'gpu_ui_ms', 'gpu_total_ms'):
+        values = sorted(float(r[field]) for r in valid)
+        if values:
+            q = lambda f: values[max(0, math.ceil(len(values) * f) - 1)]
+            print(f'{field}: median {q(.5):.3f}, p95 {q(.95):.3f}, worst {values[-1]:.3f} ms')
