@@ -84,7 +84,7 @@ fn shade(v:Out)->vec4<f32> {
         let l=camera.lights[i];let d=distance(v.world,l.xyz);let falloff=max(1.0-d/9.0,0.0);
         light+=vec3(1.0,0.49,0.16)*falloff*falloff*l.w;
     }
-    let tile_color=textureSample(tiles,tile_sampler,v.tile.xy,i32(round(max(v.tile.z,0.0)))).rgb;
+    let tile_color=textureSampleBias(tiles,tile_sampler,v.tile.xy,i32(round(max(v.tile.z,0.0))),camera.sky.z).rgb;
     let surface=select(vec3(1.0),tile_color,v.tile.z>=0.0);
     var color=select(v.color*surface*light,v.color,v.tile.z < -1.5 && v.tile.z > -2.5);
     if(v.tile.z < -4.5) {

@@ -48,12 +48,17 @@ struct Out { @builtin(position) position: vec4<f32>, @location(0) uv: vec2<f32> 
 }
 
 @fragment fn velocity(v: Out) -> @location(0) vec2<f32> {
+    // An unchanged camera has exactly zero motion, independently of jitter.
+    // Avoid inverse-projection error being accumulated as apparent movement.
+    if params.flags.w > 0.5 { return vec2(0.); }
     let size = vec2<i32>(textureDimensions(depth));
     let d = textureLoad(depth,clamp(vec2<i32>(v.uv*vec2<f32>(size)),vec2(0),size-1),0);
     var world = params.inverse*vec4(v.uv*vec2(2.,-2.)+vec2(-1.,1.),d,1.);
     world /= world.w;
     if d >= 0.999999 { world = vec4(world.xyz+params.eye_delta.xyz,1.); }
     let previous = params.previous*world;
+    // Previous projection is unjittered; remove current geometry jitter from
+    // the current UV as well. SDK motion must not contain projection jitter.
     return previous.xy/previous.w*vec2(0.5,-0.5)+0.5-v.uv+params.flags.yz;
 }
 

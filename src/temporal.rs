@@ -20,8 +20,6 @@ pub struct Temporal {
     velocity: wgpu::RenderPipeline,
     #[cfg(feature = "native-upscalers")]
     depth_copy: wgpu::RenderPipeline,
-    #[cfg(feature = "native-upscalers")]
-    previous_jitter: glam::Vec2,
     layout: wgpu::BindGroupLayout,
     sampler: wgpu::Sampler,
     uniform: wgpu::Buffer,
@@ -168,8 +166,6 @@ impl Temporal {
             velocity,
             #[cfg(feature = "native-upscalers")]
             depth_copy,
-            #[cfg(feature = "native-upscalers")]
-            previous_jitter: glam::Vec2::ZERO,
             depth,
             history,
             resolve,
@@ -264,14 +260,15 @@ impl Temporal {
         queue: &wgpu::Queue,
         encoder: &mut wgpu::CommandEncoder,
         output: &wgpu::TextureView,
-        camera: Mat4,
+        stable_camera: Mat4,
         eye: glam::Vec3,
         native: &mut crate::native_upscale::Native,
         dt: f32,
     ) -> Result<(), String> {
         let delta = self.previous_eye - eye;
         let jitter = self.jitter(true);
-        let correction = (jitter - self.previous_jitter) * glam::Vec2::new(0.5, -0.5);
+        let camera = Mat4::from_translation(jitter.extend(0.)) * stable_camera;
+        let offset = jitter * glam::Vec2::new(0.5, -0.5);
         queue.write_buffer(
             &self.uniform,
             0,
@@ -279,7 +276,18 @@ impl Temporal {
                 inverse: camera.inverse().to_cols_array_2d(),
                 previous: self.previous.to_cols_array_2d(),
                 eye_delta: [delta.x, delta.y, delta.z, 0.],
-                flags: [0., correction.x, correction.y, 0.],
+                flags: [
+                    0.,
+                    offset.x,
+                    offset.y,
+                    stationary_history(
+                        self.valid,
+                        stable_camera,
+                        self.previous,
+                        eye,
+                        self.previous_eye,
+                    ) as u32 as f32,
+                ],
             }),
         );
         self.pass(
@@ -316,9 +324,8 @@ impl Temporal {
             &self.history[0],
             &self.present,
         );
-        self.previous = camera;
+        self.previous = stable_camera;
         self.previous_eye = eye;
-        self.previous_jitter = jitter;
         self.valid = true;
         self.frame = self.frame.wrapping_add(1);
         Ok(())
@@ -398,6 +405,31 @@ fn stationary_history(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn native_motion_reprojects_to_previous_unjittered_pixel() {
+        use glam::{Vec2, Vec3, Vec4};
+        let projection = Mat4::perspective_rh(75_f32.to_radians(), 1.6, 0.05, 1024.);
+        let previous = projection * Mat4::look_at_rh(Vec3::ZERO, Vec3::NEG_Z, Vec3::Y);
+        let eye = Vec3::new(0.2, 0.1, 0.);
+        let stable = projection * Mat4::look_at_rh(eye, eye + Vec3::NEG_Z, Vec3::Y);
+        let point = Vec4::new(1., 0.5, -8., 1.);
+        let uv = |clip: Vec4| {
+            clip.truncate().truncate() / clip.w * Vec2::new(0.5, -0.5) + Vec2::splat(0.5)
+        };
+        let expected = uv(previous * point) - uv(stable * point);
+        assert!(expected.length() > 0.001);
+        for jitter in [Vec2::new(-0.0007, 0.001), Vec2::new(0.0005, -0.0008)] {
+            let camera = Mat4::from_translation(jitter.extend(0.)) * stable;
+            let clip = camera * point;
+            let current_uv = uv(clip);
+            let ndc = clip / clip.w;
+            let world = camera.inverse() * ndc;
+            let motion =
+                uv(previous * (world / world.w)) - current_uv + jitter * Vec2::new(0.5, -0.5);
+            assert!((motion - expected).length() < 0.00001);
+        }
+    }
 
     #[test]
     fn stationary_history_requires_identical_view_and_valid_history() {

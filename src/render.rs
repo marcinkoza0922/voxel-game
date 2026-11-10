@@ -836,11 +836,16 @@ impl Renderer {
         };
         let strength = daylight + (1. - daylight) * 0.025 * sun.y.max(0.).sqrt();
         let eye = g.player.eye();
-        let sky = [daylight, g.time.fract(), 0., 1.];
+        let mut sky = [daylight, g.time.fract(), 0., 1.];
         #[cfg(feature = "native-upscalers")]
         let native_active = self.native.active();
         #[cfg(not(feature = "native-upscalers"))]
         let native_active = false;
+        // Preserve texture detail for temporal reconstruction at the output resolution.
+        // sky.z is unused by atmosphere and carries the world texture LOD bias.
+        if native_active {
+            sky[2] = (self.temporal.size.0 as f32 / self.width as f32).log2() - 1.;
+        }
         let jitter = self.temporal.jitter(self.settings.taa || native_active);
         let jitter_matrix = Mat4::from_translation(Vec3::new(jitter.x, jitter.y, 0.));
         let stable_camera = Mat4::perspective_rh(
@@ -1296,7 +1301,7 @@ impl Renderer {
                 &self.queue,
                 &mut encoder,
                 &view,
-                camera_view,
+                stable_camera,
                 eye,
                 &mut self.native,
                 now.duration_since(self.last_draw)

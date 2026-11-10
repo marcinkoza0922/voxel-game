@@ -1626,3 +1626,101 @@ explicitly enabled. Exact-view regression coverage checks history invalidation,
 small translations, rotations and projection changes. Clippy, all 150 nextest
 tests and a 64-frame headless moving-camera tour passed. User saves/settings
 were read only.
+
+### Native upscaler texture detail
+
+World tile sampling applies `log2(render_width / output_width) - 1` LOD
+bias while a native temporal upscaler is active, including Native AA. This
+matches the DLSS adapter's suggested mip bias (about -1.585 in Quality),
+keeping fine texture information in the input for temporal reconstruction.
+Without it, lower-resolution rendering selected coarser mips before DLSS could
+recover detail. The bias travels in the otherwise unused camera `sky.z` field;
+ordinary rendering uses zero bias. This affects both opaque and cutout tiles.
+
+### AA and DLSS visual comparison (2026-11-10)
+
+Frozen captures of `saves/world.json` used the same camera, simulation state,
+settled terrain and 1280×800 output for all eight modes. Each run rendered 240
+frames and retained frames 224–239; comparison images use frame 239. The native
+upscaler mip-bias change above was active. Saves and user settings were read
+only; each mode used a separate temporary settings file.
+
+| Mode | World input | Observed appearance |
+| --- | --- | --- |
+| All AA off | 1280×800 | Crispest texture contrast; jagged foliage holes and silhouettes |
+| TAA | 1280×800 | Smoother edges, softer texture detail |
+| 67% scale, AA off | 858×536 | Fine detail lost, visible pixelation |
+| 67% scale, TAA | 858×536 | Further texture softening |
+| DLSS Quality | 853×533 | Visibly smeared foliage, softer than native TAA |
+| DLSS Balanced | 753×471 | Similar smearing with less fine detail |
+| DLSS Performance | 640×400 | Greatest fine-detail loss |
+| DLAA (Native AA) | 1280×800 | Clearly sharper than DLSS Quality, softer than AA off |
+
+The reported excessive blur in DLSS Quality remains reproducible. Adding the
+recommended mip bias alone did **not** resolve it. These observations identify
+an unresolved image-quality issue, not its cause. Investigate SDK jitter
+conventions, motion-vector reprojection and temporal reconstruction next.
+Static captures do not establish moving-view quality, ghosting or shimmer.
+
+Local artifacts are in `target/aa-comparison/` (generated, not versioned):
+`overview.png` contains half-size full views; `detail.png` contains matching
+unscaled 320×240 crops starting at pixel (400,390). Each mode directory contains
+`settings.json`, sixteen PPM frames and a full-resolution `final.png`.
+`README.md` records the setup and reproduction command. These artifacts depend
+on the current local save and are not a permanent visual regression fixture.
+
+Build with `tools/run-native.sh` to prepare the native SDKs, then reproduce a
+mode with the existing frozen-capture helper:
+
+```sh
+DLSS_SDK="$PWD/target/native-sdk/DLSS" \
+LD_LIBRARY_PATH="$PWD/target/native-sdk/runtime" \
+target/debug/voxel-game --still-review --save saves/world.json \
+  --frames 240 --settings target/aa-comparison/dlss-quality/settings.json \
+  --capture target/aa-comparison/dlss-quality
+```
+
+The DLSS runs used an RTX 3060 Ti with NVIDIA driver 595.112.07, with
+`VK_DRIVER_FILES=/usr/share/vulkan/icd.d/nvidia_icd.x86_64.json` set explicitly.
+GPU captures required execution outside the sandbox. Direct execution also
+requires `DLSS_SDK` at runtime for SDK library discovery, as provided by the
+native launcher; setting only `LD_LIBRARY_PATH` produced an NGX unsupported
+error on this setup. All eight capture runs completed after configuring this.
+
+### Native motion-vector blur correction
+
+Follow-up isolation replaced the frozen view's motion vectors with exact zero,
+which visibly restored foliage detail in DLSS Quality. Although the old path
+cancelled projection jitter algebraically, reconstructing a stationary point
+through depth, inverse projection and the previous jittered projection produced
+nonzero numerical motion. DLSS should receive exactly zero camera motion for
+an unchanged view.
+
+Native resolve now receives and retains the unjittered camera matrix. It uses
+the jittered inverse only to reconstruct the current depth sample and removes
+the current UV jitter when comparing it with the previous unjittered projection.
+An identical camera/eye with valid history bypasses reconstruction and writes
+exact zero motion. Any translation, rotation, projection change or invalid
+history uses normal reprojection. SDK jitter signs, SDK presets, exposure and
+the existing history reset conditions remain unchanged. This motion generation
+is shared by DLSS and FSR 2. It still describes camera motion only; moving
+creatures do not yet have per-object motion vectors.
+
+Repeated 240-frame frozen captures at the original camera show clearer leaf
+texture and less smearing in Quality and Balanced; DLAA also gains texture
+clarity, while Performance still loses fine detail. Local before/after crops are in
+`target/aa-comparison/motion-fix-comparison.png`, with original captures in
+`dlss-{quality,balanced,performance}` and corrected captures in
+`fixed-{quality,balanced,performance}`, plus `dlaa` and `fixed-dlaa`.
+This supersedes the unresolved static
+blur finding above, but does not claim native/no-AA sharpness or eliminate
+every temporal artifact. The historical baseline artifacts were retained.
+
+A projection regression checks that translated-camera motion maps to the
+previous unjittered pixel independently of current jitter. Existing identity
+tests cover valid history and camera/eye changes. All 151 quiet nextest tests,
+native-feature short-format Clippy, and native DLSS frozen captures passed.
+A 64-frame native DLSS Quality moving-camera tour rendered and exited using a
+temporary world. That is a functional check; moving-view ghosting and shimmer
+have not received equivalent comparative visual validation. FSR 2 visual
+quality has not been re-evaluated for this correction.
