@@ -59,22 +59,9 @@ Validation for this change: formatting, Clippy with warnings denied, all 30 quie
 
 VSync update validation: formatting, short-format Clippy with warnings denied, quiet nextest, and gameplay/persistence smoke passed. The initial sandboxed native run could not connect to the Wayland socket (EPERM). Repeating the 120-frame Vulkan run outside the sandbox connected to the compositor, rendered, saved to a temporary world, and exited successfully. Refresh-rate timing was not measured. The historical 60 FPS capture above used the removed software timer.
 
-## Measured playtest and streaming follow-up
+## Playtest and streaming follow-up
 
-Optional `--profile PATH` diagnostics live in `tools/performance.rs`, included as
-a Rust module. A buffered CSV records unclamped start-to-start frame intervals,
-simulation/autosave, streaming plus GPU uploads, draw/presentation wall times,
-and resident/queued/active chunk counts, plus focus/menu flags. The first frame
-has no interval. Memory use stays bounded; explicit flush errors propagate on
-exit. Draw times include surface waits and final capture readback, not GPU
-execution timestamps. A slow phase in row N typically affects interval N+1.
-`tools/analyze-profile.py` reports nearest-rank median/p95/max and chunk peaks;
-`--skip` and `--limit` select a frame range. Profiling is opt-in.
-
-`--tour` performs deterministic camera relocations every 180 frames, including
-adjacent chunk crossings and distant terrain, repeating after 1,800 frames.
-It requires a frame bound and an explicit unused save path. This is a streaming
-stress route, not a walked gameplay expedition. `tools/expedition.rs` implements
+`tools/expedition.rs` implements
 `--expedition`: fresh inventory, controlled resource arena, DDA mining, recipe
 transactions, station placement, copper gear, combat/loot, eating, sleep blocked
 by enemies and restored after victory, persistent torches, natural forest
@@ -90,7 +77,8 @@ surface heights. Replanning uses hash-set membership for queued remesh merging,
 and queue sorting runs only when priorities change rather than every redraw.
 Regression coverage compares desired chunks and cached bounds to fresh worlds
 across negative coordinates, elevation changes, distant moves and radius changes.
-See PLAYTEST.md for timings, actual checks and limitations.
+See [PLAYTEST.md](PLAYTEST.md) for gameplay checks and limitations, and
+[PROFILING.md](PROFILING.md) for profiling workflows and measurements.
 
 ## Slot inventory and shaped crafting
 
@@ -925,60 +913,11 @@ with an isolated preferences file to exercise graphics settings without changing
 normal preferences. Native debugging required an unrestricted driver run; a
 sandboxed native attempt crashed, while unrestricted FSR and DLSS completed.
 
-## CPU stress and sampling tools
+## Performance tools and measurements
 
-`cargo run --release -- --stress --frames 12 --profile target/cpu.csv`
-runs deterministic CPU workloads without creating a window, reading settings or
-accessing saves. `--seed` selects the terrain seed; `--frames` is the positive
-repetition count in this mode (default 12). One complete warmup is excluded.
-Samples rotate through four fixed surface locations, so distributions include
-terrain variation. CSV rows contain workload, repetition index, wall milliseconds
-and output units (halo cells, vertices, final fluid edits, or peak resident chunks).
-The console prints median/p95/max; timings are observations, not CI speed gates.
-
-`tools/stress.rs` measures halo generation, surface meshing, surface sky access,
-a synthetic checkerboard mesh, cave sky access, twelve fluid pulses from 512
-sources, and settled radius-one streaming through adjacent chunks and a distant
-teleport and return. Setup is outside each timer. Streaming includes planning,
-worker generation/lighting, polling and one-millisecond sleeps; it has a
-60-second deadline per repetition. Cave fixtures can be empty for some seeds;
-consult vertex units before comparing lighting timings. This is CPU coverage;
-it does not measure GPU execution, uploads or full render-radius throughput.
-
-`tools/profile-cpu.sh [output-directory] [repetitions]` builds release, records
-compiler/OS/git metadata, saves CSV and summaries, then attempts a separate
-`perf record --call-graph dwarf` run and writes a flat self-time report. Release
-builds retain line tables for symbolized stacks. Perf permission failures are
-reported in `perf-error.txt` while baseline timings remain available. For flame
-graphs, use `cargo flamegraph --release -- --stress --frames 12` where sampling
-permissions allow it. Sampling overhead is excluded from the baseline CSV.
-
-For end-to-end render profiling, existing `--headless --tour --frames 1800
---save /tmp/unique-world.json --profile target/render.csv --settings
-/tmp/isolated-settings.json` exercises the full scripted route with isolated
-files (the save must not exist). `tools/analyze-profile.py target/render.csv`
-summarizes it. Headless tour relocation frames deliberately wait for terrain
-settlement; analyze these separately from steady frames. Draw timings measure
-CPU submission/presentation waits, not GPU timestamp durations.
-
-Validation (2026-11-09): formatting, short Clippy and all 110 quiet nextest
-tests pass. Release stress completed 24 measured repetitions after warmup.
-Final baseline median/p95 milliseconds: halo 0.636/0.828, surface mesh
-0.326/0.498, surface sky 5.287/19.083, checkerboard 1.437/1.878,
-cave sky 5.388/37.843, twelve fluid pulses 149.931/151.824, and four
-settled streaming relocations 164.044/168.869. These are local wall-time
-observations; earlier runs varied substantially with machine load. Output is
-in `target/performance/{cpu.csv,summary.txt,environment.txt}`. Perf recording
-was attempted with user-space cycles both sandboxed and unrestricted, but
-host performance-counter access was denied; no sampled call graph was obtained.
-
-The offscreen 1,800-frame tour completed outside the sandbox (the sandboxed
-attempt stalled and was interrupted). `target/performance-render.csv` contains
-all frames: CPU draw/submission median 0.363 ms, p95 1.326 ms; peak residency
-1,284 chunks; longest stream settlement 2,215.413 ms. This run overlapped an
-initial CPU stress pass, so treat it as stress coverage rather than an isolated
-render benchmark. Interval timings describe the preceding frame, so a settlement
-at frame 1620 appears in interval 1621. GPU timestamps were not collected.
+See [PROFILING.md](PROFILING.md) for CPU/GPU/resource profiling workflows,
+benchmark results, sampling investigations and historical comparisons.
+The implementation decisions below describe the resulting caches and streaming architecture.
 
 ### Skylight CPU optimization
 
@@ -995,20 +934,6 @@ brightness rules are otherwise unchanged. A regression compares optimized roof
 queries and exposure against the original direct sampling and full ray traversal
 across three seeds, negative coordinates, cave depths, roof openings, leaves and
 removed high edits. All 111 quiet nextest tests, formatting and short Clippy pass.
-
-A fresh release comparison with 24 measured repetitions each (seed 314159) is
-in `target/performance/lighting-{before,after}.{csv,txt}`. Median/p95 ms changed:
-surface lighting 5.654/21.000 -> 1.214/8.991; cave lighting 6.288/39.734 ->
-2.368/15.680; settled streaming 170.369/175.045 -> 113.970/117.777. This is
-roughly 79% less median surface-lighting time, 62% less cave-lighting time and
-33% less streaming time on this machine. Unchanged workloads show some load
-variation, so these are local observations, not fixed performance guarantees.
-No new GPU measurement was needed: vertex exposure is checked for exact equality.
-
-Further candidates, not implemented: share procedural column metadata across
-occupancy ray queries, precompute ray offsets, and use a bounded dense occupancy
-cache in chunk workers. Persistent cross-mesh lighting caches would also need
-careful edit invalidation; current per-operation caches avoid that complexity.
 
 ### Shared occupancy column metadata
 
@@ -1027,50 +952,6 @@ across three seeds, generated terrain, deliberately different resident chunks,
 and stone/air/leaf/water/plant edits. All 112 quiet nextest tests, short Clippy,
 formatting and diff checks pass.
 
-The fresh 24-repetition release comparison is recorded in
-`target/performance/occupancy-{before,after}.{csv,txt}`. Cave-lighting median/p95
-fell from 1.669/9.161 to 0.667/4.745 ms (60%/48% reduction). Surface lighting
-changed from 0.889/5.269 to 0.916/6.025 ms, with no demonstrated improvement;
-settled streaming changed from 94.985/101.296 to 102.851/118.247 ms. Other
-unchanged workloads also varied substantially between runs, so this result
-supports faster cave occupancy sampling, not an overall streaming speedup.
-Column metadata sharing is now implemented; precomputed ray offsets and bounded
-dense occupancy storage remain possible future work.
-A 48-repetition confirmation (`occupancy-after-confirm.{csv,txt}`) measured
-cave-lighting median 0.669 ms and p95 5.918 ms, surface median 0.853 ms,
-and streaming median 98.972 ms, reinforcing the cave improvement while
-showing continuing tail and machine-load variability.
-
-### Profiling rerun (2026-11-09)
-
-`target/performance-rerun/` records a fresh release CPU run (24 repetitions,
-seed 314159) and a subsequent isolated 1,800-frame offscreen tour. CPU workload
-median/p95 ms: halo 0.430/0.823, surface mesh 0.236/0.452, surface sky
-0.954/6.265, checkerboard 0.859/2.254, cave sky 0.854/10.463, twelve fluid
-pulses 107.043/169.862, four settled relocations 98.194/124.865.
-The stress reporter uses the upper middle sample for even-sized medians.
-
-Tour steady frames (excluding relocation/final settlement) measured draw CPU
-wall time median 0.510 ms, p95 1.611 ms and max 83.974 ms. Simulation max
-was 0.917 ms. Initial settlement took 1,434.973 ms; distant relocations/return
-1,056.949–1,329.602 ms; adjacent moves 58.418–91.903 ms. Peak residency
-was 1,284 chunks. Settlement is deliberately blocking in the headless runner;
-these durations are terrain readiness latency, not native-window frame stalls.
-GPU execution timestamps remain unmeasured.
-
-Hardware sampling succeeded outside the sandbox with `perf record -e cycles:u
---user-callchains --call-graph dwarf`. The explicit user-callchain option is
-needed with this host's `perf_event_paranoid=2`; user-only counting worked
-without it, but recording failed. The helper now includes this flag. The sampled
-run is separate from baseline timing. Its core-PMU flat self-time report shows
-main-thread hypot 16.75%, height 16.26%, biome 9.61%, floorf 4.50%, tree
-3.16%; worker samples also highlight meshing, height/biome/waterway generation
-and skylight. These percentages describe this mixed synthetic workload and
-include fixture setup, not the game's frame budget. Repeated procedural terrain
-queries are the strongest CPU optimization candidate; fluid pulses and terrain
-readiness are the largest measured workload costs. Raw samples and report are
-`target/performance-rerun/perf.{data}` and `perf-report.txt`.
-
 ### Per-pulse fluid query cache
 
 `World::tick_fluids` uses a fresh `world::BlockQueries` cache during its read
@@ -1088,79 +969,6 @@ three seeds, negative/chunk-boundary/distant coordinates, cave and surface
 heights, world bounds, deliberately different resident chunks, fluid/air/leaf/
 plant edits and supported/unsupported plants. All 113 quiet nextest tests,
 short Clippy, formatting and diff checks pass.
-
-Fresh release measurements (48 repetitions, seed 314159, one excluded warmup)
-are in `target/performance-rerun/fluid-{before,after}.{csv,txt}`. Twelve-pulse
-median/p95 fell from 91.712/126.552 to 23.315/24.722 ms (75%/80% reduction).
-Every workload's output units match between runs. Other workloads were slower
-in the after run, consistent with machine-load variation; settled streaming
-changed from 93.534/109.694 to 111.570/114.769 ms. This demonstrates faster
-fluid stress updates, not a streaming or general frame-rate improvement.
-
-
-### Windowed profiling follow-up (2026-11-09)
-
-`--profile` now appends five CPU wall-time columns: `draw_prepare_ms`
-(dynamic geometry, lighting and UI), `surface_acquire_ms`, `draw_encode_ms`
-(including encoder finish), `queue_submit_ms`, and `present_capture_ms`
-(including optional capture readback). Phase clocks run only with profiling
-enabled. These remain CPU timings, not GPU execution timestamps. The analyzer
-accepts older CSVs, reports intervals exceeding common frame budgets, and
-attributes the five worst intervals to the preceding frame's phases. The
-remaining interval time includes event-loop/pacing waits and uninstrumented
-work, not necessarily a stall. `--tour` additionally reports settlement and
-ending queue counts per 180-frame stage; only use it for tour recordings.
-
-Fresh release native Wayland tours (seed 314159, isolated saves/preferences)
-and a separate 3,600-frame perf sampling run are in
-`target/performance-followup/`. The unsampled original 1,800-frame tour had
-interval median/p95/max 6.061/6.902/12.499 ms, with no intervals above
-16.667 ms. The instrumented repeat measured 6.081/6.669/20.640 ms,
-with three intervals above 16.667 ms. Its three worst intervals followed
-distant relocations: synchronous stream/upload consumed 18.619, 16.746 and
-15.635 ms. Streaming replans still evaluate all 256 heights and waterway
-inputs for every newly visible horizontal chunk column on the main thread,
-then evict, rebuild desired sets and sort jobs. Moving that planning work off
-the main thread or budgeting it is a strong hitch-reduction candidate.
-
-Detailed median/p95 CPU draw phases (ms): preparation 0.294/0.499,
-surface acquire 0.051/0.091, encoding 0.380/0.898, queue submission
-0.148/0.274, presentation 0.070/0.133. Surface acquisition max was
-0.276 ms. Run-to-run draw costs varied, so these are observations rather
-than an instrumentation overhead comparison or GPU throughput conclusion.
-
-A structural terrain-throughput limit is independent of these frame costs:
-only two jobs including completed results may be outstanding, and new jobs
-are dispatched only when the main thread polls once per redraw. Consequently,
-throughput cannot exceed twice the redraw rate: 120 chunks/second at 60 FPS,
-or about 330 at 165 FPS, even if workers finish early. The initial desired
-set contains 1,171 chunks; the original tour accepted 358 in its first 180
-frames and did not settle until frame 625 while crossing adjacent columns.
-Distant locations commonly remained incomplete at the next relocation.
-A further 1,800-frame run with an isolated 60-FPS setting accepted 354
-chunks in the first stage and first settled at frame 631 (10.576 seconds),
-versus frame 625 (3.795 seconds) in the original uncapped/VSync run.
-The route is frame-based, so relocation spacing in seconds also changes;
-the nearly identical settlement frame counts support the scheduling limit.
-The 60-FPS run had interval median/p95/max 16.767/16.861/26.799 ms
-and peak synchronous stream/upload 22.409 ms.
-Decoupling a bounded worker backlog from a separately budgeted per-frame
-upload queue is the leading terrain-readiness candidate. Simply adding
-workers or accelerating generation cannot remove the frame-dependent limit.
-
-The separate perf recording lost no samples (seven out-of-order events were
-reported). Core-PMU self time highlights worker height (7.13% across both
-workers), hypot (6.99%), skylight sampling (6.64%), biome (6.04%), halo
-meshing (5.71%) and waterway queries (5.32%). These are shares of sampled
-CPU cycles across the run, not frame-time percentages. UI rectangle generation
-also appears at 2.16%. Procedural/lighting optimization remains relevant,
-but should follow scheduling and synchronous planning investigation.
-
-Validation: release build, short Clippy, formatting, diff checks and all 114
-quiet nextest tests pass. Analyzer exercised against old and extended CSVs,
-including range selection. This change adds diagnostics; streaming behavior
-is unchanged. Native-upscaler builds and GPU execution timing were not tested.
-
 
 ### Buffered streaming and background planning fix (2026-11-09)
 
@@ -1189,41 +997,11 @@ Shutdown discards queued jobs and disconnects the completed receiver before
 joining workers, so full result channels cannot deadlock destruction. A planner
 can finish its sole outstanding plan during shutdown.
 
-Fresh sequential release tour recordings are in `target/performance-fix/`;
-comparisons use `target/performance-followup/` from the preceding investigation.
-Each tour uses seed 314159, 1,800 frames, and isolated saves/preferences:
-
-| Measurement | Before | After |
-| --- | ---: | ---: |
-| 60-FPS tour first settlement | 10.576 s (frame 631) | 0.752 s (frame 45) |
-| ~165-Hz tour first settlement | 4.002 s (frame 660) | 0.922 s (frame 147) |
-| 60-FPS peak stream/upload CPU | 22.409 ms | 3.982 ms |
-| ~165-Hz peak stream/upload CPU | 18.619 ms | 1.986 ms |
-| ~165-Hz interval p95 / max | 6.669 / 20.640 ms | 6.465 / 12.480 ms |
-
-All ten stages settled before the next relocation in both after runs, reaching
-1,284 resident chunks. Earlier tours commonly left distant stages incomplete
-and peaked at 1,200 resident chunks. Tours relocate every 180 frames; first
-settlement thus compares route readiness, not an identical stationary scene.
-Run-to-run CPU/driver load varies. The 60-FPS interval p95 changed from 16.861
-to 17.144 ms despite lower peak stream work; remaining pacing/scheduling tails
-are visible, and GPU execution time is still unmeasured. These results establish
-faster readiness and lower main-thread streaming peaks, not universal FPS gains.
-
-The release CPU stress completed 24 measured repetitions after warmup:
-settled radius-one streaming median/p95 73.787/77.045 ms, twelve fluid pulses
-26.468/28.305 ms. Its relocation timing includes worker polling and sleeps;
-it is separate from the native frame measurements.
-
 All 116 quiet nextest tests, short Clippy, formatting and diff checks pass.
 Regressions cover continuous worker progress without redraw polling, destruction
 with full result backpressure, obsolete plan rejection, and exact blocks/meshes
 for edits during planning, alongside the existing eviction, height bounds,
 column-cache, edit revision and resident-remesh checks.
-
-A separate 1,800-frame offscreen tour also completed successfully, including
-startup, relocation and final blocking settlement, with no queued/active work
-or pending uploads at exit (`target/performance-fix/headless.csv`).
 
 ### Tree variation, pond banks and block physics
 
@@ -1551,30 +1329,9 @@ save is never passed to a runner that writes it.
 Validation: formatting, Clippy with warnings denied, all 148 quiet nextest tests,
 gameplay/persistence smoke and automated playtest/expedition passed. Offscreen
 Vulkan captures of the latest save passed; the settled scene contained 1,446
-resident chunks. A three-frame profile measured settled streaming/upload calls
-at 0.17 and 0.39 ms; initial settling took 1.38 s. These are diagnostic samples,
-not a comparative performance benchmark.
+resident chunks.
 
-### Mining frontier performance review
-
-The original frontier implementation cleared all cached caps on every world
-revision. Offscreen mining updates against `saves/world-36.json` measured a
-351.98 ms median and 360.52 ms maximum across twelve edits. Limiting rebuilds
-to nearby dirty chunk columns reduced this to 20.20/20.88 ms, but still repeated
-unchanged roof queries. Shared roof caching plus exact changed-column tracking
-reduced the same workload to 0.555 ms median and 0.658 ms maximum. These debug
-build measurements cover the immediate renderer streaming/upload update after
-mining, excluding subsequent asynchronous remesh settling, drawing and simulation;
-they are not full-frame FPS measurements.
-
-`tools/frontier_review.rs`, invoked with `cargo run -- --frontier-review --save
-PATH [--profile CSV]`, loads an existing save without writing it, settles its
-view offscreen, and measures twelve stone-removal updates. Placement and remesh
-settling occur between samples. `--profile` writes each measured update in
-milliseconds. The tool bypasses window/audio initialization and does not advance
-the game simulation. Regression tests verify unchanged-roof reuse, distant cache
-retention, negative-coordinate dependencies, vertical invalidation, and exact
-cached/fresh cap geometry after roof placement and removal.
+### Mining frontier validation
 
 Mining fix validation: formatting, Clippy with warnings denied, all 149 quiet
 nextest tests, gameplay/persistence smoke and automated playtest/expedition
@@ -1725,90 +1482,7 @@ temporary world. That is a functional check; moving-view ghosting and shimmer
 have not received equivalent comparative visual validation. FSR 2 visual
 quality has not been re-evaluated for this correction.
 
-### CPU, GPU and memory profiling (2026-11-10)
-
-`--profile PATH.csv` now also writes `PATH.gpu.csv`. GPU timestamps measure
-shadow, world (sky/opaque/frontiers/fluids), temporal reconstruction and output,
-held item and UI stages, plus the span from the first stage to the last. These
-are GPU execution timeline measurements; they exclude CPU preparation, queue
-waiting before the first timestamp, presentation, uploads before the frame
-encoder and screenshot readback. Temporal timing includes native upscaling when
-that build/settings path is active. Stage boundaries use encoder timestamps;
-inter-stage GPU scheduling/barriers are included in the enclosing spans.
-
-`tools/gpu_profile.rs` requests optional timestamp capabilities exposed by the
-adapter and allocates queries only when a render profile is enabled. Four slots
-hold query/resolve/map buffers. Each draw polls callbacks without waiting;
-completed maps emit frame-ID-correlated samples to the CSV writer. A saturated
-ring emits an empty row instead of blocking. Unsupported timestamp capabilities
-produce a diagnostic and an empty GPU CSV. Map failures also emit empty rows.
-The analyzer automatically reads the sibling GPU CSV, reports missing samples
-and applies the same frame selection. Native shutdown drains the device before
-flushing the profile; headless profiling explicitly drains before its flush.
-`tools/analyze-profile.py PATH.csv --tour` summarizes CPU and GPU measurements.
-
-`python3 tools/profile-resources.py OUTPUT.csv COMMAND [ARG ...]` samples the
-child's aggregate thread CPU use and Linux RSS/high-water RSS, plus NVIDIA GPU
-load, memory-controller load, device VRAM, device power and child VRAM at 0.5 s.
-CPU 100% represents one logical core. NVIDIA load/power/device memory include
-other desktop applications; process VRAM is PID-specific. Peaks are sampled,
-including the most recently observed RSS high-water value; short-lived/final
-peaks may be missed. This measures resident memory, not allocator attribution
-or proof of a leak. It requires Linux `/proc` and `nvidia-smi`; unavailable GPU
-fields remain empty. Child output remains on stdout/stderr for caller logging.
-
-Release artifacts are in `target/performance-2026-11-10/`, at source base
-`6beed0856f3a56f3481bde784e15998c64bbbccc` plus the profiling instrumentation.
-Runs were sequential: 24-repetition deterministic CPU suite (seed 314159),
-1,800-frame native baseline tour, separate sampled CPU suite, instrumented
-1,800-frame native tour, and a 180-frame offscreen validation. Tour saves and
-settings are isolated in that directory. Native tours use 1280x800, full render
-scale, TAA, VSync on, no explicit cap and no native upscalers. Hardware is an
-RTX 3060 Ti (8 GiB), NVIDIA driver 595.112.07. No capture readback was requested.
-
-CPU stress median/p95 milliseconds: halo 5.551/8.615, surface mesh
-0.184/0.246, surface sky 1.008/1.545, checkerboard mesh 0.656/0.742,
-cave sky 0.000/1.366, twelve fluid pulses 16.415/17.181 and streaming
-relocations 108.177/115.132. Cave fixtures can be empty; consult output units.
-CPU stress sampled peak RSS was 18.87 MiB. Separate perf sampling succeeded,
-with zero lost samples. On the core PMU, waterway planning accounted for about
-23% self time across the two workers and contended mutex locking about 10%.
-The atom PMU is reported separately; percentages must not be added across PMUs.
-These are investigation candidates, not proof that any particular lock or
-waterway operation should be changed. World generation has changed since the
-prior profiling baseline, so terrain timings are not like-for-like regressions.
-
-Instrumented native tour GPU timings (milliseconds):
-
-| GPU stage | Median | p95 | Maximum |
-| --- | ---: | ---: | ---: |
-| Shadow | 0.260 | 0.400 | 0.520 |
-| World | 0.571 | 1.016 | 1.426 |
-| Temporal/output | 0.133 | 0.276 | 0.999 |
-| Held item | 0.051 | 0.074 | 0.109 |
-| UI | 0.002 | 0.004 | 0.219 |
-| Total span | 1.023 | 1.660 | 2.357 |
-
-All 1,800 GPU rows were measured, including the final frame, with no dropped
-samples. Frame interval median/p95/max was 6.072/10.975/16.109 ms; none
-exceeded 16.667 ms. Streaming/upload CPU peaked at 10.323 ms; peak resident
-chunks were 1,475. Some tour stages did not settle within their 180-frame
-window, so the GPU distribution includes partially populated scenes. Sampled
-process CPU median/p95 was 66%/238%, RSS peaked at 434 MiB and process VRAM
-at 483 MiB. Device GPU utilization median/p95 was 28%/41%. This short paced
-route does not establish sustained GPU throughput or long-term memory growth.
-The world pass is the largest measured GPU stage; terrain planning/streaming
-and pacing are more immediate CPU/frame-latency investigation targets here.
-
-Validation: formatting, clean short-format Clippy, all 151 quiet nextest tests,
-a complete native Vulkan tour and an offscreen timestamp/readback check.
-The uncapped 180-frame offscreen check produced eight measured GPU samples
-and 172 explicit unavailable rows as the CPU outran the four-slot ring. All
-frame IDs were retained and measured stage sums matched their total spans;
-this validates saturation/drop reporting without adding synchronization.
-Native-upscaler builds were not exercised in this pass.
-
-### Waterway lookup and lock investigation (2026-11-10)
+### Waterway column lookup reuse
 
 The expensive `waterway_plan` samples were principally repeated cached-plan
 lookups, not evidence that every query rebuilt a waterway. `natural_column`
@@ -1829,41 +1503,29 @@ No global cache capacity increase, new long-lived cache or lock primitive change
 was needed. Additional tree/support queries can still acquire the shared cache;
 324 is the halo's base water-column lookup count, not a total query count.
 
-Artifacts are in `target/waterway-investigation/`. Preserved `voxel-before`
-and `voxel-after` release binaries permit independent reproduction without
-symbol changes when rebuilding. Sequential unsampled runs use seed 314159,
-48 measured repetitions and one excluded warmup, with identical workload output
-counts across all 336 rows. First comparison median/p95 milliseconds:
-
-| Workload | Before | After |
-| --- | ---: | ---: |
-| Four settled streaming relocations | 108.014 / 112.890 | 72.946 / 79.463 |
-| Cold terrain halo | 5.515 / 6.976 | 5.376 / 6.913 |
-| Surface sky | 1.010 / 1.559 | 0.928 / 1.439 |
-| Twelve fluid pulses | 16.382 / 16.816 | 16.638 / 17.185 |
-
-A second sequential 48-repetition comparison reproduced the result: streaming
-median/p95 was 108.879/113.428 ms before and 71.990/75.492 ms after, with
-all workload output counts again matching.
-
-The streaming median improved about 32–34%; cold halo construction barely changed
-because new fixture worlds still pay cold plan-building and terrain-sampling
-costs. Fluid timing showed no improvement in this comparison. These are local
-CPU workloads, not an FPS claim.
-
-Separate hardware sampling on the core PMU measured aggregate waterway-plan
-self time falling from 23.47% to 1.24%, and contended mutex self time from
-10.24% to 0.05%. These percentages are sampled CPU-cycle shares, not wall time
-blocked on locks, and include the relevant process threads. The baseline
-sampling run lost 39 samples; the after run lowered sampling frequency to
-999 Hz and lost none. Treat exact percentages as approximate. Along with the
-code path and unsampled timings, this supports shared per-voxel lookup traffic
-as the dominant contention source. Remaining worker costs include height,
-relief and climate sampling and distance calculations; cold waterway plan
-construction remains a separate optimization candidate.
-
 Validation: all 152 quiet nextest tests pass, including new halo/direct-query
 equality around both lake centers and a descending reach. Existing resident/edit,
 fluid, skylight and cache-eviction tests also pass. Formatting, diff whitespace
 checks and standard short-format Clippy pass. An additional all-targets Clippy
 run reports existing warnings in unrelated tests; no new warnings were found.
+
+### Reusing terrain-column fields
+
+`TerrainColumn` includes the final biome alongside height, tree, ruin, cave and
+water inputs. Its constructor computes climate and relief once and passes those
+exact values to both height and biome classification. `natural_column` receives
+the shared column, so rock, snow and vegetation decisions reuse its biome across
+voxel heights. Halo, skylight and fluid read-phase queries use the same inputs;
+direct queries construct a fresh column. Existing edit/resident precedence and
+plant-support checks remain authoritative. Column lifetime stays local to the
+halo or existing lighting/fluid operation; no persistent cache or synchronization
+is added, and distance/noise formulas and arithmetic are unchanged.
+
+Tree selection rejects candidates outside the existing three-block canopy reach
+before computing biome fields. Each remaining candidate shares climate/relief
+between biome, root height and root-support queries. Candidate order and nearest
+root selection are preserved. Golden halo fingerprints captured from the original
+implementation cover three seeds, negative boundaries, surface/subterranean and
+distant terrain. Existing direct/halo, lighting, fluid, resident/edit and hydrology
+equivalence tests remain in place. See [PROFILING.md](PROFILING.md) for before/after
+measurements and validation.

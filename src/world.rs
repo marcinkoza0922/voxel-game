@@ -302,6 +302,7 @@ pub struct Edit {
 /// Immutable procedural inputs shared by queries at different column heights.
 struct TerrainColumn {
     height: i32,
+    biome: Biome,
     tree: Option<(i32, i32, i32)>,
     ruin: Option<IVec3>,
     cave: Option<(i32, i32)>,
@@ -319,16 +320,7 @@ impl SkyColumn {
             .get(&p.to_array())
             .copied()
             .or_else(|| world.chunks.get(&chunk(p)).map(|c| c[index(p)]))
-            .unwrap_or_else(|| {
-                world.natural_column(
-                    p,
-                    self.terrain.height,
-                    self.terrain.tree,
-                    self.terrain.ruin,
-                    self.terrain.cave,
-                    self.terrain.water,
-                )
-            });
+            .unwrap_or_else(|| world.natural_column(p, &self.terrain));
         // Plant support never changes whether a block is opaque.
         block.solid() && block != Block::Leaves
     }
@@ -355,14 +347,7 @@ impl BlockQueries {
                     .columns
                     .entry((p.x, p.z))
                     .or_insert_with(|| world.terrain_column(p.x, p.z));
-                world.natural_column(
-                    p,
-                    column.height,
-                    column.tree,
-                    column.ruin,
-                    column.cave,
-                    column.water,
-                )
+                world.natural_column(p, column)
             });
         let block = if block.plant() && !self.get(world, p - IVec3::Y).dirt() {
             Block::Air
@@ -481,6 +466,9 @@ impl World {
     pub fn biome(&self, x: i32, z: i32) -> Biome {
         let climate = self.climate(x, z);
         let relief = self.relief(x, z);
+        Self::biome_from_fields(climate, relief)
+    }
+    fn biome_from_fields(climate: Biome, relief: f32) -> Biome {
         match (climate, relief) {
             (Biome::Grassland, r) if r >= 0.94 => Biome::GrasslandMegaMountains,
             (Biome::Grassland, r) if r >= 0.72 => Biome::GrasslandMountains,
@@ -493,7 +481,10 @@ impl World {
     }
     pub fn height(&self, x: i32, z: i32) -> i32 {
         let relief = self.relief(x, z);
-        let snow = self.climate(x, z) == Biome::Tundra;
+        self.height_from_fields(x, z, relief, self.climate(x, z))
+    }
+    fn height_from_fields(&self, x: i32, z: i32, relief: f32, climate: Biome) -> i32 {
+        let snow = climate == Biome::Tundra;
         let x = x as f32;
         let z = z as f32;
         let blend = |lo: f32, hi: f32| smooth(((relief - lo) / (hi - lo)).clamp(0., 1.));
@@ -573,27 +564,29 @@ impl World {
                 let h = hash(self.seed ^ 834, a, 0, b);
                 let cx = a * 7 + 2 + (h % 3) as i32;
                 let cz = b * 7 + 2 + ((h >> 4) % 3) as i32;
-                let chance = if self.biome(cx, cz) == Biome::Forest {
-                    4
-                } else {
-                    19
-                };
-                if h.is_multiple_of(chance)
-                    && !self.biome(cx, cz).is_snow()
-                    && (x - cx).abs() <= 3
-                    && (z - cz).abs() <= 3
-                {
-                    let height = self.height(cx, cz);
+                // Candidates outside canopy reach cannot contribute to this column.
+                if (x - cx).abs() > 3 || (z - cz).abs() > 3 {
+                    continue;
+                }
+                let climate = self.climate(cx, cz);
+                let relief = self.relief(cx, cz);
+                let biome = Self::biome_from_fields(climate, relief);
+                let chance = if biome == Biome::Forest { 4 } else { 19 };
+                if h.is_multiple_of(chance) && !biome.is_snow() {
+                    let height = self.height_from_fields(cx, cz, relief, climate);
                     let root = IVec3::new(cx, height + 1, cz);
                     if height > SEA_LEVEL + 1
                         && self
                             .natural_column(
                                 root,
-                                height,
-                                None,
-                                self.nearby_ruin(cx, cz),
-                                self.cave_column(cx, cz),
-                                self.waterway_terrain_column(cx, cz),
+                                &TerrainColumn {
+                                    height,
+                                    biome,
+                                    tree: None,
+                                    ruin: self.nearby_ruin(cx, cz),
+                                    cave: self.cave_column(cx, cz),
+                                    water: self.waterway_terrain_column(cx, cz),
+                                },
                             )
                             .replaceable()
                         && self.waterway_column(cx, cz).is_none()
@@ -707,8 +700,7 @@ impl World {
         interval
     }
     /// Cell-contained additions and slope cutouts share all query/halo paths.
-    fn surface_rock(&self, p: IVec3, height: i32) -> Option<Block> {
-        let biome = self.biome(p.x, p.z);
+    fn surface_rock(&self, p: IVec3, height: i32, biome: Biome) -> Option<Block> {
         if p.y >= height && p.y <= height + 16 && (biome.is_grassland() || biome.is_snow()) {
             let cx = p.x.div_euclid(48);
             let cz = p.z.div_euclid(48);
@@ -768,15 +760,15 @@ impl World {
         None
     }
 
-    fn natural_column(
-        &self,
-        p: IVec3,
-        height: i32,
-        tree: Option<(i32, i32, i32)>,
-        ruin: Option<IVec3>,
-        cave: Option<(i32, i32)>,
-        water: Option<crate::hydrology::Column>,
-    ) -> Block {
+    fn natural_column(&self, p: IVec3, column: &TerrainColumn) -> Block {
+        let TerrainColumn {
+            height,
+            biome,
+            tree,
+            ruin,
+            cave,
+            water,
+        } = *column;
         if !(MIN_Y..=MAX_Y).contains(&p.y) {
             return if p.y < MIN_Y {
                 Block::Stone
@@ -853,7 +845,7 @@ impl World {
         if p.y > MIN_Y + 3 && cave.is_some_and(|(lo, hi)| (lo..=hi).contains(&p.y)) {
             return Block::Air;
         }
-        if let Some(rock) = self.surface_rock(p, height) {
+        if let Some(rock) = self.surface_rock(p, height, biome) {
             return rock;
         }
         if p.y > height {
@@ -884,7 +876,7 @@ impl World {
                     return Block::Leaves;
                 }
             }
-            if p.y == height + 1 && !self.biome(p.x, p.z).is_snow() {
+            if p.y == height + 1 && !biome.is_snow() {
                 return vegetation_block(self.seed, p - IVec3::Y);
             }
             return Block::Air;
@@ -893,7 +885,7 @@ impl World {
             return Block::Stone;
         }
         if p.y == height {
-            if self.biome(p.x, p.z).is_snow() {
+            if biome.is_snow() {
                 Block::Snow
             } else {
                 Block::Grass
@@ -927,21 +919,14 @@ impl World {
         if let Some(c) = self.chunks.get(&chunk(p)) {
             return self.supported_plant(p, c[index(p)]);
         }
-        self.supported_plant(
-            p,
-            self.natural_column(
-                p,
-                self.height(p.x, p.z),
-                self.tree(p.x, p.z),
-                self.nearby_ruin(p.x, p.z),
-                self.cave_column(p.x, p.z),
-                self.waterway_terrain_column(p.x, p.z),
-            ),
-        )
+        self.supported_plant(p, self.natural_column(p, &self.terrain_column(p.x, p.z)))
     }
     fn terrain_column(&self, x: i32, z: i32) -> TerrainColumn {
+        let climate = self.climate(x, z);
+        let relief = self.relief(x, z);
         TerrainColumn {
-            height: self.height(x, z),
+            height: self.height_from_fields(x, z, relief, climate),
+            biome: Self::biome_from_fields(climate, relief),
             tree: self.tree(x, z),
             ruin: self.nearby_ruin(x, z),
             cave: self.cave_column(x, z),
@@ -988,11 +973,7 @@ impl World {
             for z in -1..=SIZE {
                 let wx = base.x + x;
                 let wz = base.z + z;
-                let h = self.height(wx, wz);
-                let t = self.tree(wx, wz);
-                let ruin = self.nearby_ruin(wx, wz);
-                let cave = self.cave_column(wx, wz);
-                let water = self.waterway_terrain_column(wx, wz);
+                let column = self.terrain_column(wx, wz);
                 for y in -1..=SIZE {
                     let p = IVec3::new(wx, base.y + y, wz);
                     let block = self
@@ -1000,7 +981,7 @@ impl World {
                         .get(&p.to_array())
                         .copied()
                         .or_else(|| self.chunks.get(&chunk(p)).map(|c| c[index(p)]))
-                        .unwrap_or_else(|| self.natural_column(p, h, t, ruin, cave, water));
+                        .unwrap_or_else(|| self.natural_column(p, &column));
                     blocks[((x + 1) + 18 * ((z + 1) + 18 * (y + 1))) as usize] =
                         self.supported_plant(p, block);
                 }
@@ -1828,7 +1809,7 @@ mod tests {
                 let z = cz * 96 + 32 + ((h >> 24) % 32) as i32;
                 let height = w.height(x, z);
                 let p = IVec3::new(x, height - 9, z);
-                if w.surface_rock(p, height) != Some(Block::Air) {
+                if w.surface_rock(p, height, w.biome(p.x, p.z)) != Some(Block::Air) {
                     continue;
                 }
                 assert_eq!(w.get(p), Block::Air);
@@ -2683,5 +2664,42 @@ mod vegetation_physics_tests {
         }
         assert!(roots.len() > 100);
         assert_eq!(heights.len(), 5);
+    }
+}
+
+#[cfg(test)]
+mod terrain_column_regression {
+    use super::*;
+
+    #[test]
+    fn terrain_matches_before_column_reuse() {
+        // Golden fingerprints captured from 61f70c7 before column reuse. Include
+        // surface/cave halos, negative chunk boundaries and distant terrain.
+        for (seed, expected) in [
+            (42, 4398968496163188796_u64),
+            (314159, 17942618388807863753_u64),
+            (987654, 3255627759975004419_u64),
+        ] {
+            let world = World::new(seed);
+            let mut fingerprint = 0xcbf29ce484222325_u64;
+            for (x, z) in [
+                (-17, -16),
+                (0, 0),
+                (255, 256),
+                (-256, -256),
+                (1024, -1024),
+                (-4096, 8192),
+                (16384, -24576),
+            ] {
+                let height = world.height(x, z);
+                for y in [height, height - 48] {
+                    let blocks = world.halo(chunk(IVec3::new(x, y, z)));
+                    for byte in serde_json::to_vec(&blocks).unwrap() {
+                        fingerprint = (fingerprint ^ u64::from(byte)).wrapping_mul(0x100000001b3);
+                    }
+                }
+            }
+            assert_eq!(fingerprint, expected, "seed={seed}");
+        }
     }
 }
