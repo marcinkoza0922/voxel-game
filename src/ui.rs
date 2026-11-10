@@ -313,7 +313,11 @@ impl Ui {
         self.text(
             24.,
             h - 26.,
-            "WASD move  Space jump  LMB mine/attack  RMB use  E pack  R sleep  Esc menu",
+            if g.god_mode {
+                "GOD MODE  WASD fly  Space up  Shift down  LMB instant mine  F6 disable"
+            } else {
+                "WASD move  Space jump  LMB mine/attack  RMB use  E pack  R sleep  F6 god mode  Esc menu"
+            },
             1.2,
             MUTED,
         );

@@ -581,6 +581,9 @@ impl ApplicationHandler for App {
                                     self.notice = e;
                                 }
                             }
+                            KeyCode::F6 if !self.pack && !self.paused => {
+                                self.game.toggle_god_mode();
+                            }
                             KeyCode::F5 => {
                                 self.save();
                             }

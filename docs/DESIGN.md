@@ -1393,3 +1393,17 @@ check their containing rim rather than relying on a fixed five-block radius.
 A separate regression checks that a waterfall landing in a pool does not spread
 a raised sheet over the pool's surface. The complete mechanics playtest and
 controlled progression expedition also pass with the new drainage generation.
+
+## Debug god mode
+
+F6 toggles a session-only god mode during active gameplay. The HUD displays the
+mode and flight controls. WASD flies relative to the camera (including pitch),
+Space rises, Shift descends, and the existing double-W sprint increases flight
+speed from 12 to 30 blocks/second. Flight ignores collision, gravity and fluids;
+idle flight hovers. Damage, drowning, hunger/rest drain and out-of-world death
+are disabled. Toggling clears velocity and mining progress.
+
+Left-click uses normal targeting and drops but completes block mining in one
+simulation step, bypassing tool tiers, guardian locks and tool wear. World bounds
+and the requirement to empty processors before mining remain in effect. Block
+edits persist normally; god mode itself is never saved and defaults off on load.
