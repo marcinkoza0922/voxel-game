@@ -664,14 +664,20 @@ torches, automatic climbing, and diagonal edge protection.
 
 Grassland keeps open sightlines, with existing tall-grass patches supplemented by
 meadow-clustered flowers and sparse berry shrubs between meadows. Existing flower
-colors, harvesting and planting rules remain in use. Low stone outcrops use one
-seeded candidate per 48-block cell (one third qualify), with centers inset ten
-blocks to keep neighboring formations apart. Five families of elliptical lobes
-produce rounded boulders, broad slabs, ridges, split rocks and uneven clusters,
-with seeded size, rotation and reflection variations and heights of one to three
-blocks. A gentle grassland surface check keeps them grounded. They use ordinary mineable stone;
-direct queries and chunk halo generation share the same rules. As with earlier
-terrain additions, untouched generated terrain changes while saved edits win.
+colors, harvesting and planting rules remain in use. Stone outcrops occur in grassland and snowy biomes, with one seeded candidate per
+48-block cell and one ninth qualifying. Centers are inset sixteen blocks. Five
+families of elliptical lobes vary in rotation, reflection and proportions; most
+use unit scale, a quarter use double scale and one sixteenth use triple scale
+independently for height, width and depth (up to nine blocks tall and roughly
+thirty blocks wide). This permits broad low slabs, narrow tall rocks and elongated
+ridges without tying their footprint to their height. They merge into slopes within
+six blocks of their center elevation. Snowy columns have snow caps over mineable
+stone. Surface streaming reserves sixteen blocks above terrain for these features.
+Mountain and mega-mountain biomes additionally have seeded candidates in 96-block
+cells (one fifth qualify) for elliptical ridge passages or shorter overhang
+recesses, retaining at least three blocks of roof and exposing stone around the
+opening. Existing water, ruin and cave rules take precedence. Direct queries and
+chunk halos share feature evaluation; saved edits continue to win.
 
 Small groups of up to three sheep appear on clear grassland surfaces near the
 player, checked every 18 seconds after the initial four-second delay. At most six

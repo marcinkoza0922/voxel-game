@@ -694,6 +694,68 @@ impl World {
         }
         interval
     }
+    /// Cell-contained additions and slope cutouts share all query/halo paths.
+    fn surface_rock(&self, p: IVec3, height: i32) -> Option<Block> {
+        let biome = self.biome(p.x, p.z);
+        if p.y >= height && p.y <= height + 16 && (biome.is_grassland() || biome.is_snow()) {
+            let cx = p.x.div_euclid(48);
+            let cz = p.z.div_euclid(48);
+            let h = hash(self.seed ^ 0x726f636b, cx, 0, cz);
+            if h.is_multiple_of(9) {
+                let rx = cx * 48 + 16 + ((h >> 8) % 16) as i32;
+                let rz = cz * 48 + 16 + ((h >> 24) % 16) as i32;
+                let top = outcrop_top(h, p.x - rx, p.z - rz);
+                if top > 0 {
+                    let base = self.height(rx, rz);
+                    // Follow slopes without floating; taper the uphill edge into terrain.
+                    let roof = base + top;
+                    if base > SEA_LEVEL + 1
+                        && height <= roof
+                        && (height - base).abs() <= 6
+                        && p.y <= roof
+                    {
+                        return Some(if biome.is_snow() && p.y == roof {
+                            Block::Snow
+                        } else {
+                            Block::Stone
+                        });
+                    }
+                }
+            }
+        }
+        if matches!(
+            biome,
+            Biome::GrasslandMountains
+                | Biome::GrasslandMegaMountains
+                | Biome::SnowMountains
+                | Biome::SnowMegaMountains
+        ) && p.y <= height
+            && p.y >= height - 40
+            && height > SEA_LEVEL + 16
+        {
+            let cx = p.x.div_euclid(96);
+            let cz = p.z.div_euclid(96);
+            let h = hash(self.seed ^ 0x61726368, cx, 0, cz);
+            if h.is_multiple_of(5) {
+                let rx = cx * 96 + 32 + ((h >> 8) % 32) as i32;
+                let rz = cz * 96 + 32 + ((h >> 24) % 32) as i32;
+                let (along, across) = if h & 0x10000 == 0 {
+                    (p.x - rx, p.z - rz)
+                } else {
+                    (p.z - rz, p.x - rx)
+                };
+                if along.abs() <= 22 && across.abs() <= 15 {
+                    let base = self.height(rx, rz) - 12;
+                    if let Some(rock) = mountain_cutout(h, along, across, p.y - base, height - base)
+                    {
+                        return Some(rock);
+                    }
+                }
+            }
+        }
+        None
+    }
+
     fn natural_column(
         &self,
         p: IVec3,
@@ -778,22 +840,8 @@ impl World {
         if p.y > MIN_Y + 3 && cave.is_some_and(|(lo, hi)| (lo..=hi).contains(&p.y)) {
             return Block::Air;
         }
-        // Keep each formation inside its cell so neighboring outcrops stay separated.
-        if p.y >= height && p.y <= height + 4 && self.biome(p.x, p.z).is_grassland() {
-            let cx = p.x.div_euclid(48);
-            let cz = p.z.div_euclid(48);
-            let h = hash(self.seed ^ 0x726f636b, cx, 0, cz);
-            if h.is_multiple_of(3) {
-                let rx = cx * 48 + 10 + ((h >> 8) % 28) as i32;
-                let rz = cz * 48 + 10 + ((h >> 24) % 28) as i32;
-                let top = outcrop_top(h, p.x - rx, p.z - rz);
-                if top > 0 {
-                    let base = self.height(rx, rz);
-                    if (height - base).abs() <= 1 && p.y <= base + top {
-                        return Block::Stone;
-                    }
-                }
-            }
+        if let Some(rock) = self.surface_rock(p, height) {
+            return rock;
         }
         if p.y > height {
             if let Some((tx, ty, tz)) = tree {
@@ -1040,7 +1088,7 @@ impl World {
                         for dz in 0..SIZE {
                             let h = self.height(x * SIZE + dx, z * SIZE + dz);
                             low = low.min(h);
-                            high = high.max(h.max(SEA_LEVEL) + 6);
+                            high = high.max(h.max(SEA_LEVEL) + 16);
                             if let Some((bed, top)) =
                                 self.waterway_bounds(x * SIZE + dx, z * SIZE + dz, h)
                             {
@@ -1345,6 +1393,20 @@ impl World {
     }
 }
 
+// An elliptical passage opens through a ridge; a shorter blind recess makes
+// an overhang. Preserve a minimum three-block roof and expose stone inside it.
+fn mountain_cutout(h: u64, along: i32, across: i32, y: i32, surface: i32) -> Option<Block> {
+    let length = if h & 0x20000 == 0 { 22. } else { 11. };
+    let arch = (across as f32 / 10.).powi(2) + ((y - 3) as f32 / 8.).powi(2);
+    if (along as f32).abs() <= length && arch < 1. && y <= surface - 3 {
+        Some(Block::Air)
+    } else if (along as f32).abs() <= length && arch < 1.6 && y < surface {
+        Some(Block::Stone)
+    } else {
+        None
+    }
+}
+
 // Union of offset, elliptical lobes avoids the repeated diamond-and-cap silhouette.
 // Zero means outside the footprint; positive values are heights above the ground.
 fn outcrop_top(h: u64, mut x: i32, mut z: i32) -> i32 {
@@ -1354,8 +1416,20 @@ fn outcrop_top(h: u64, mut x: i32, mut z: i32) -> i32 {
     if (h >> 42) & 1 != 0 {
         x = -x;
     }
-    let size = ((h >> 44) & 1) as i32;
-    let lobes: &[(i32, i32, i32, i32, i32)] = match (h >> 48) % 5 {
+    let scale_for = |tier| match tier {
+        0 => 3,
+        1..=4 => 2,
+        _ => 1,
+    };
+    let height_scale = scale_for((h >> 44) & 15);
+    // Independent horizontal axes allow wide slabs, narrow spires and long ridges
+    // at every height tier, while keeping the footprint within its cell.
+    let width_scale = scale_for((h >> 52) & 15);
+    let depth_scale = scale_for((h >> 56) & 15);
+    let size = ((h >> 43) & 1) as i32;
+    let x = x as f32 / width_scale as f32;
+    let z = z as f32 / depth_scale as f32;
+    let lobes: &[(i32, i32, i32, i32, i32)] = match ((h >> 48) & 15) % 5 {
         0 => &[(0, 0, 2 + size, 2, 3), (1, 0, 2, 2, 2)],
         1 => &[(0, 0, 3 + size, 2 + size, 1), (-1, 0, 2, 2, 2)],
         2 => &[(-1, 0, 3 + size, 1 + size, 2), (2, 0, 2, 1, 3)],
@@ -1363,13 +1437,17 @@ fn outcrop_top(h: u64, mut x: i32, mut z: i32) -> i32 {
         _ => &[(-2, -1, 2, 2, 2), (1, 1, 2 + size, 2, 3), (2, -2, 1, 1, 1)],
     };
     lobes.iter().fold(0, |top, &(cx, cz, rx, rz, height)| {
-        let distance = (x - cx).pow(2) * rz * rz + (z - cz).pow(2) * rx * rx;
+        let distance =
+            (x - cx as f32).powi(2) * (rz * rz) as f32 + (z - cz as f32).powi(2) * (rx * rx) as f32;
         let radius = rx * rx * rz * rz;
-        if distance > radius {
+        if distance > radius as f32 {
             top
         } else {
             // Broad tops and uneven shoulders instead of a mandatory single-block peak.
-            top.max(height - i32::from(distance * 3 > radius * 2 && height > 1))
+            top.max(
+                height * height_scale
+                    - i32::from(distance * 3. > (radius * 2) as f32 && height > 1) * height_scale,
+            )
         }
     })
 }
@@ -1571,7 +1649,7 @@ mod tests {
         let mut shapes = HashSet::new();
         for family in 0..5_u64 {
             for size in 0..2_u64 {
-                let h = (family << 48) | (size << 44);
+                let h = (family << 48) | (5 << 44) | (size << 43) | (5 << 52) | (5 << 56);
                 let mut shape = Vec::new();
                 for x in -10..=10 {
                     for z in -10..=10 {
@@ -1589,6 +1667,132 @@ mod tests {
             }
         }
         assert_eq!(shapes.len(), 10);
+    }
+
+    #[test]
+    fn outcrop_width_and_depth_vary_independently_of_height() {
+        let bounds = |h| {
+            let (mut width, mut depth, mut peak) = (0, 0, 0);
+            for x in -16_i32..=16 {
+                for z in -16_i32..=16 {
+                    let top = outcrop_top(h, x, z);
+                    if top > 0 {
+                        width = width.max(x.abs());
+                        depth = depth.max(z.abs());
+                        peak = peak.max(top);
+                    }
+                }
+            }
+            (width, depth, peak)
+        };
+        for height in [0, 5] {
+            let small = bounds((height << 44) | (5 << 52) | (5 << 56));
+            let wide = bounds((height << 44) | (5 << 56));
+            let deep = bounds((height << 44) | (5 << 52));
+            assert!(wide.0 >= small.0 * 3 && wide.1 == small.1);
+            assert!(deep.1 >= small.1 * 3 && deep.0 == small.0);
+            assert_eq!(small.2, wide.2);
+            assert_eq!(small.2, deep.2);
+            assert!(wide.0 <= 15 && deep.1 <= 15);
+        }
+    }
+
+    #[test]
+    fn snow_outcrops_have_stone_beneath_snow_and_large_variants() {
+        let w = World::new(314159);
+        let mut found = false;
+        for cx in -80..80 {
+            for cz in -80..80 {
+                let h = hash(w.seed ^ 0x726f636b, cx, 0, cz);
+                if !h.is_multiple_of(9) {
+                    continue;
+                }
+                let x = cx * 48 + 16 + ((h >> 8) % 16) as i32;
+                let z = cz * 48 + 16 + ((h >> 24) % 16) as i32;
+                if !w.biome(x, z).is_snow() {
+                    continue;
+                }
+                let base = w.height(x, z);
+                let top = outcrop_top(h, 0, 0);
+                if base <= SEA_LEVEL + 1 || top < 2 {
+                    continue;
+                }
+                let p = IVec3::new(x, base + top, z);
+                if w.get(p) != Block::Snow {
+                    continue;
+                }
+                assert_eq!(w.get(p - IVec3::Y), Block::Stone);
+                let key = chunk(p);
+                let q = p - key * SIZE;
+                assert_eq!(
+                    w.halo(key)[((q.x + 1) + 18 * ((q.z + 1) + 18 * (q.y + 1))) as usize],
+                    Block::Snow
+                );
+                found = true;
+                break;
+            }
+            if found {
+                break;
+            }
+        }
+        assert!(found);
+        let mut peak = 0;
+        let mut width = 0;
+        for x in -16..=16 {
+            for z in -16..=16 {
+                let top = outcrop_top(0, x, z);
+                peak = peak.max(top);
+                if top > 0 {
+                    width = width.max(x.abs());
+                }
+            }
+        }
+        assert!(peak >= 9 && width >= 9);
+    }
+
+    #[test]
+    fn mountain_arch_has_open_passage_and_solid_roof() {
+        for along in [-22, 0, 22] {
+            assert_eq!(mountain_cutout(0, along, 0, 3, 18), Some(Block::Air));
+            assert_eq!(mountain_cutout(0, along, 0, 12, 18), Some(Block::Stone));
+        }
+        assert_eq!(mountain_cutout(0, 0, 0, 3, 5), Some(Block::Stone));
+        assert_eq!(mountain_cutout(0x20000, 18, 0, 3, 18), None);
+    }
+
+    #[test]
+    fn mountain_passages_generate_in_world_and_match_halos() {
+        let w = World::new(41);
+        let mut found = false;
+        for cx in -80..80 {
+            for cz in -80..80 {
+                let h = hash(w.seed ^ 0x61726368, cx, 0, cz);
+                if !h.is_multiple_of(5) {
+                    continue;
+                }
+                let x = cx * 96 + 32 + ((h >> 8) % 32) as i32;
+                let z = cz * 96 + 32 + ((h >> 24) % 32) as i32;
+                let height = w.height(x, z);
+                let p = IVec3::new(x, height - 9, z);
+                if w.surface_rock(p, height) != Some(Block::Air) {
+                    continue;
+                }
+                assert_eq!(w.get(p), Block::Air);
+                assert!(w.get(IVec3::new(x, height - 1, z)).solid());
+                let key = chunk(p);
+                let q = p - key * SIZE;
+                assert_eq!(
+                    w.halo(key)[((q.x + 1) + 18 * ((q.z + 1) + 18 * (q.y + 1))) as usize],
+                    Block::Air
+                );
+                found = true;
+                break;
+            }
+            if found {
+                break;
+            }
+        }
+        assert!(found);
     }
 
     #[test]
