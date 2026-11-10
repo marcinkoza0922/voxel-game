@@ -273,3 +273,12 @@ Possible spells
 
 A lightweight temperature system. Being in hot or cold biomes without having proper gear, potions, magic, or tools can be lethal.
 
+
+### Title screen and graphics options
+
+Start at a title screen with New game, Load game, Settings and Quit. New games
+preserve existing saves; the load menu browses saved worlds. Persist graphics
+options for TAA, VSync, frame cap, render resolution, render scale and borderless
+fullscreen, plus sound. Keep the UI at output resolution. Support native NVIDIA
+DLSS and AMD FSR temporal upscaling where the build, SDK/runtime and GPU support
+them, with explicit availability feedback.

@@ -26,7 +26,7 @@ Use quiet nextest tests for determinism, negative coordinate chunk mapping, heig
 
 ## Implemented decisions and limits
 
-Presentation uses strict FIFO VSync, supported by every wgpu surface. Unlike `AutoVsync`, this does not select relaxed FIFO with immediate presentation on missed refreshes. There is no software FPS cap: redraws are requested continuously while the event loop waits for events, and FIFO presentation provides GPU backpressure. Immediately before presenting, `Window::pre_present_notify` enables compositor frame callbacks on Wayland so redraws follow the display refresh rate. Simulation remains independently fixed at 60 Hz. Actual pacing depends on the display driver/compositor; VSync does not remove terrain generation, meshing or rendering costs.
+Presentation defaults to strict FIFO VSync. Settings can select VSync off (Immediate, then Mailbox if supported; FIFO fallback on surfaces exposing neither). An independent optional frame cap uses winit `WaitUntil` deadlines and skips early redraws; uncapped rendering requests the next frame continuously. `Window::pre_present_notify` supplies Wayland compositor frame callbacks. Simulation remains fixed at 60 Hz. VSync can constrain the frame rate below the requested cap; GPU workload and compositor behavior still determine actual pacing.
 
 The slice uses `winit 0.30`, `wgpu 27`, `glam` for primitive vector/matrix math, `bytemuck` for GPU byte layouts, `pollster` for startup, and `serde`/`serde_json`. Cargo.lock is checked in for reproducibility. GPU initialization explicitly selects Vulkan on Linux. The native graphics check exposed an NVIDIA EGL/Wayland teardown crash when probing all backends; Vulkan selection and releasing renderer/window resources before ending the event loop produce clean exits. GPU work is drained before destruction.
 
@@ -799,3 +799,94 @@ A captured side-by-side water/lava basin was visually inspected, including the
 transparent water, lava surface, bucket icon and held bucket. The first capture
 exposed excessive light stacking; grouping/reducing lava lights corrected it in
 a second inspected capture. Interactive swimming has not been manually played.
+
+
+## Title screen, graphics settings and temporal reconstruction
+
+Normal interactive startup opens the title screen with New game, Load game,
+Settings and Quit over a frozen terrain vista. Title/menu screens release the
+pointer and suspend simulation and autosaving. The preview is not an active save:
+leaving the title never writes or replaces a world. New game creates a fresh
+random seed in a separately reserved save file; returning from a running game
+first saves successfully. Load game browses JSON files alongside the selected
+`--save` path, excludes `settings.json`, pages six worlds at a time, and reports
+malformed/missing saves without replacing the current game. The explicit selected
+save appears first. Mouse buttons and Up/Down + Enter/Space navigate the title,
+load and settings screens; Escape goes back. The pause menu offers settings and
+Save and return to title. `--new`, `--pack`, and diagnostic `--frames` retain direct
+world startup unless `--title` is requested.
+
+`src/settings.rs` owns validated, default-compatible JSON preferences, atomically
+written to `saves/settings.json` (override with `--settings PATH`). Controls cover
+TAA, VSync, uncapped/30/60/90/120/144/165/240 FPS, native/720p/900p/1080p/1440p
+world-render resolution, 50/67/75/85/100% render scale, borderless fullscreen and
+sound. F11 also toggles and persists fullscreen. Resolution presets fit within
+the selected pixel dimensions while preserving the output aspect ratio; render
+scale multiplies that size. The settings screen displays actual world/output
+sizes. Output and UI remain at window/desktop resolution. Fullscreen uses the
+current monitor's desktop mode, not exclusive display-mode switching. `--mute`
+still disables audio initialization for diagnostics.
+
+`src/temporal.rs` and `temporal.wgsl` implement world-only TAA. The world and sky
+render to a linear RGBA16F target with a 16-phase Halton (2,3) camera jitter.
+Ping-pong output-resolution RGBA16F histories store color plus depth. Depth-based
+camera reprojection, translation-free sky reprojection, depth rejection,
+3x3 neighborhood clipping and color-dependent history weighting limit trails.
+History resets on resize, resolution/AA/upscaler changes, world replacement,
+surface loss and camera jumps over four blocks. The held item uses a separate,
+unjittered camera and full-resolution depth buffer after resolve; GUI follows at
+full output resolution. With TAA off and no SDK upscaler, presentation uses linear
+spatial resampling. Built-in TAA can also accumulate a scaled input at output
+resolution; it is not labeled DLSS or FSR.
+
+### Native DLSS and FSR 2
+
+`cargo run` remains SDK-free. `tools/run-native.sh` runs the same game with the
+`native-upscalers` Cargo feature, enabling actual NVIDIA NGX DLSS Super Resolution
+(and DLAA at 100%) and AMD FidelityFX FSR **2**, not frame generation or FSR 4.
+Selecting SDK upscalers in a build without the feature reports why unavailable
+and retains the working renderer. Unsupported GPUs/runtimes and invalid SDK
+render ranges are similarly reported instead of silently claiming SDK rendering.
+An SDK upscaler replaces the built-in TAA resolve; the AA row displays the
+selected SDK and disables the separate TAA toggle. Supersampling above output size is
+not supported by these native paths.
+
+The launcher caches official DLSS **v310.4.0** and Vulkan-Headers **v1.4.309** in
+`target/native-sdk/`, builds native SDK bindings (requires git, network on first
+run, a C/C++ compiler and libclang), and exposes the official release NGX runtime
+through an unversioned library symlink. Existing `DLSS_SDK` and `VULKAN_SDK`
+environment variables override downloads. DLSS SDK/runtime redistribution is
+subject to NVIDIA's own license; SDK files are not committed. The wrapper is
+vendored from `dlss_wgpu` 2.0.0 (wgpu 27) under its original MIT/Apache licenses,
+with one Linux safety patch: zero required-extension count produces an empty
+slice instead of calling `from_raw_parts` on a null pointer. The SDK version is
+pinned because newer NGX headers change structures the wrapper initializes.
+FSR 2 uses the `fsr`/`fsr-sys` bindings and their bundled native Vulkan backend
+and shader permutations.
+
+`src/native_upscale.rs` owns SDK contexts, validates render ranges, chooses a
+DLSS quality mode for the selected scale, dispatches SDK work inside the wgpu
+Vulkan encoder and waits for GPU completion before context replacement or
+destruction. Explicit wgpu resource transitions keep external SDK layouts
+consistent. A full-screen pass copies world device depth to R32F so SDK input
+uses an ordinary shader-readable color layout; RG16F motion vectors derive from
+camera reprojection with jitter cancellation and sky translation removed.
+SDKs receive per-frame jitter, reset flags, input/output size, and (FSR) camera
+near/far/FOV and frame time in milliseconds. Both produce linear RGBA16F output
+before the full-resolution held item and UI. Motion vectors currently represent
+camera motion; moving creatures/particles and transparent fluids do not yet have
+per-object previous transforms/reactive masks, so temporal trails can remain in
+those areas. Longer motion/quality/performance evaluation is still needed.
+
+Validation: 110 quiet nextest tests pass, including settings round-trip/index
+validation, aspect-preserving scaling, title-only actions, disabled hit regions,
+paged save access and minimum-window settings bounds. Offscreen Vulkan captures
+at 1280x800 completed for TAA/title and actual native FSR 2 and DLSS at 67% input
+scale. Both SDK screenshots were inspected; these are short functional checks,
+not a performance benchmark. A real Wayland window also completed an automatic
+exit from the title at 2560x1440 borderless fullscreen, with VSync off, a 30 FPS
+cap, 720p preset and 50% world scale; the preview save path remained absent. `--headless --title --frames 2 --capture PATH` previews
+the title without advancing or saving the preview world. Combine `--settings`
+with an isolated preferences file to exercise graphics settings without changing
+normal preferences. Native debugging required an unrestricted driver run; a
+sandboxed native attempt crashed, while unrestricted FSR and DLSS completed.

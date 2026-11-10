@@ -47,12 +47,18 @@ struct Mesh {
     opaque_count: u32,
 }
 pub struct Renderer {
+    #[cfg(feature = "native-upscalers")]
+    native: crate::native_upscale::Native,
+    last_draw: std::time::Instant,
     surface: Option<wgpu::Surface<'static>>,
     window: Option<Arc<Window>>,
     device: wgpu::Device,
     queue: wgpu::Queue,
     config: wgpu::SurfaceConfiguration,
     pipeline: wgpu::RenderPipeline,
+    held_pipeline: wgpu::RenderPipeline,
+    held_uniform: wgpu::Buffer,
+    held_bind: wgpu::BindGroup,
     shadow_pipeline: wgpu::RenderPipeline,
     fluid_pipeline: wgpu::RenderPipeline,
     sky_pipeline: wgpu::RenderPipeline,
@@ -63,6 +69,9 @@ pub struct Renderer {
     depth: wgpu::TextureView,
     shadow: wgpu::TextureView,
     meshes: HashMap<IVec3, Mesh>,
+    temporal: crate::temporal::Temporal,
+    settings: crate::settings::Settings,
+    present_modes: Vec<wgpu::PresentMode>,
     pub ui: Ui,
     pub width: u32,
     pub height: u32,
@@ -75,7 +84,7 @@ fn sky_cycle(time: f32) -> (Vec3, f32) {
     (direction, t * t * (3. - 2. * t))
 }
 
-fn depth(device: &wgpu::Device, w: u32, h: u32, label: &str) -> wgpu::TextureView {
+pub(crate) fn depth(device: &wgpu::Device, w: u32, h: u32, label: &str) -> wgpu::TextureView {
     device
         .create_texture(&wgpu::TextureDescriptor {
             label: Some(label),
@@ -106,10 +115,25 @@ impl Renderer {
         width: u32,
         height: u32,
     ) -> Result<Self, String> {
-        let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
+        let descriptor = wgpu::InstanceDescriptor {
             backends: wgpu::Backends::VULKAN,
             ..Default::default()
+        };
+        #[cfg(feature = "native-upscalers")]
+        let mut support = dlss_wgpu::FeatureSupport::default();
+        #[cfg(feature = "native-upscalers")]
+        let instance = dlss_wgpu::create_instance(
+            crate::native_upscale::PROJECT_ID,
+            &descriptor,
+            &mut support,
+        )
+        .unwrap_or_else(|e| {
+            eprintln!("DLSS initialization: {e}");
+            support.super_resolution_supported = false;
+            wgpu::Instance::new(&descriptor)
         });
+        #[cfg(not(feature = "native-upscalers"))]
+        let instance = wgpu::Instance::new(&descriptor);
         let surface = window
             .as_ref()
             .map(|w| instance.create_surface(w.clone()))
@@ -123,11 +147,32 @@ impl Renderer {
             })
             .await
             .map_err(|e| e.to_string())?;
+        let descriptor = wgpu::DeviceDescriptor {
+            label: Some("Voxel device"),
+            ..Default::default()
+        };
+        #[cfg(feature = "native-upscalers")]
+        let native_device = dlss_wgpu::request_device(
+            crate::native_upscale::PROJECT_ID,
+            &adapter,
+            &descriptor,
+            &mut support,
+        );
+        #[cfg(feature = "native-upscalers")]
+        let (device, queue) = match native_device {
+            Ok(pair) => pair,
+            Err(e) => {
+                eprintln!("DLSS device: {e}");
+                support.super_resolution_supported = false;
+                adapter
+                    .request_device(&descriptor)
+                    .await
+                    .map_err(|e| e.to_string())?
+            }
+        };
+        #[cfg(not(feature = "native-upscalers"))]
         let (device, queue) = adapter
-            .request_device(&wgpu::DeviceDescriptor {
-                label: Some("Voxel device"),
-                ..Default::default()
-            })
+            .request_device(&descriptor)
             .await
             .map_err(|e| e.to_string())?;
         let caps = surface.as_ref().map(|s| s.get_capabilities(&adapter));
@@ -293,6 +338,38 @@ impl Renderer {
                 },
             ],
         });
+        let held_uniform = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Held camera"),
+            size: std::mem::size_of::<Camera>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let held_bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("World bindings"),
+            layout: &layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: held_uniform.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::TextureView(&shadow),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::Sampler(&sampler),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: wgpu::BindingResource::TextureView(&tiles_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: wgpu::BindingResource::Sampler(&tile_sampler),
+                },
+            ],
+        });
         let shadow_bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("Shadow bindings"),
             layout: &shadow_layout,
@@ -323,6 +400,34 @@ impl Renderer {
             stencil: Default::default(),
             bias: Default::default(),
         };
+        let held_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("Held pipeline"),
+            layout: Some(&pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &shader,
+                entry_point: Some("vs"),
+                compilation_options: Default::default(),
+                buffers: &[Vertex::layout()],
+            },
+            primitive: wgpu::PrimitiveState {
+                cull_mode: None,
+                ..Default::default()
+            },
+            depth_stencil: Some(ds.clone()),
+            multisample: Default::default(),
+            fragment: Some(wgpu::FragmentState {
+                module: &shader,
+                entry_point: Some("fs"),
+                compilation_options: Default::default(),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format,
+                    blend: None,
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+            }),
+            multiview: None,
+            cache: None,
+        });
         let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("World pipeline"),
             layout: Some(&pipeline_layout),
@@ -343,7 +448,7 @@ impl Renderer {
                 entry_point: Some("fs"),
                 compilation_options: Default::default(),
                 targets: &[Some(wgpu::ColorTargetState {
-                    format,
+                    format: wgpu::TextureFormat::Rgba16Float,
                     blend: None,
                     write_mask: wgpu::ColorWrites::ALL,
                 })],
@@ -374,7 +479,7 @@ impl Renderer {
                 entry_point: Some("fluid_fs"),
                 compilation_options: Default::default(),
                 targets: &[Some(wgpu::ColorTargetState {
-                    format,
+                    format: wgpu::TextureFormat::Rgba16Float,
                     blend: Some(wgpu::BlendState::ALPHA_BLENDING),
                     write_mask: wgpu::ColorWrites::ALL,
                 })],
@@ -403,7 +508,7 @@ impl Renderer {
                 entry_point: Some("sky_fs"),
                 compilation_options: Default::default(),
                 targets: &[Some(wgpu::ColorTargetState {
-                    format,
+                    format: wgpu::TextureFormat::Rgba16Float,
                     blend: None,
                     write_mask: wgpu::ColorWrites::ALL,
                 })],
@@ -480,7 +585,32 @@ impl Renderer {
             multiview: None,
             cache: None,
         });
+        let temporal = crate::temporal::Temporal::new(
+            &device,
+            (config.width, config.height),
+            (config.width, config.height),
+            format,
+        );
+        let present_modes = surface
+            .as_ref()
+            .map(|s| s.get_capabilities(&adapter).present_modes)
+            .unwrap_or_default();
+        #[cfg(feature = "native-upscalers")]
+        let native = crate::native_upscale::Native::new(
+            &device,
+            adapter,
+            support.super_resolution_supported,
+        );
         Ok(Self {
+            #[cfg(feature = "native-upscalers")]
+            native,
+            last_draw: std::time::Instant::now(),
+            held_pipeline,
+            held_uniform,
+            held_bind,
+            temporal,
+            settings: crate::settings::Settings::default(),
+            present_modes,
             surface,
             window,
             device,
@@ -507,6 +637,7 @@ impl Renderer {
         drop(self);
     }
     pub fn reset_world(&mut self) {
+        self.temporal.valid = false;
         self.meshes.clear();
         self.ui = crate::ui::Ui::new();
     }
@@ -522,6 +653,66 @@ impl Renderer {
             surface.configure(&self.device, &self.config);
         }
         self.depth = depth(&self.device, w, h, "Main depth");
+        self.rebuild_targets();
+        if let Err(e) = self.configure_upscaler() {
+            self.ui.notice = e;
+        }
+    }
+    fn rebuild_targets(&mut self) {
+        let size = self.settings.render_size(self.width, self.height);
+        self.temporal = crate::temporal::Temporal::new(
+            &self.device,
+            size,
+            (self.width, self.height),
+            self.config.format,
+        );
+    }
+    pub fn apply_settings(&mut self, settings: &crate::settings::Settings) -> Result<(), String> {
+        let size_changed = self.settings.render_size(self.width, self.height)
+            != settings.render_size(self.width, self.height);
+        if self.settings.upscaler != settings.upscaler {
+            self.temporal.valid = false;
+        }
+        if self.settings.taa != settings.taa {
+            self.temporal.valid = false;
+        }
+        if self.settings.vsync != settings.vsync {
+            self.config.present_mode = if settings.vsync {
+                wgpu::PresentMode::Fifo
+            } else {
+                [wgpu::PresentMode::Immediate, wgpu::PresentMode::Mailbox]
+                    .into_iter()
+                    .find(|m| self.present_modes.contains(m))
+                    .unwrap_or(wgpu::PresentMode::Fifo)
+            };
+            if let Some(surface) = &self.surface {
+                surface.configure(&self.device, &self.config);
+            }
+        }
+        self.settings = settings.clone();
+        if size_changed {
+            self.rebuild_targets();
+        }
+        self.configure_upscaler()
+    }
+    fn configure_upscaler(&mut self) -> Result<(), String> {
+        #[cfg(feature = "native-upscalers")]
+        {
+            self.native.configure(
+                self.settings.upscaler,
+                self.temporal.size,
+                (self.width, self.height),
+                &self.queue,
+            )
+        }
+        #[cfg(not(feature = "native-upscalers"))]
+        {
+            if self.settings.upscaler != 0 {
+                Err("DLSS/FSR require a native-upscalers build (tools/run-native.sh)".into())
+            } else {
+                Ok(())
+            }
+        }
     }
     pub fn update_world(&mut self, w: &mut World, pos: Vec3) {
         for k in w.stream(pos, VIEW_RADIUS) {
@@ -571,12 +762,20 @@ impl Renderer {
         let strength = daylight + (1. - daylight) * 0.025 * sun.y.max(0.).sqrt();
         let sky = [daylight, g.time.fract(), 0., 1.];
         let eye = g.player.eye();
-        let camera_view = Mat4::perspective_rh(
-            75_f32.to_radians(),
-            self.width as f32 / self.height as f32,
-            0.05,
-            1024.,
-        ) * Mat4::look_at_rh(eye, eye + g.player.direction(), Vec3::Y);
+        #[cfg(feature = "native-upscalers")]
+        let native_active = self.native.active();
+        #[cfg(not(feature = "native-upscalers"))]
+        let native_active = false;
+        let jitter = self.temporal.jitter(self.settings.taa || native_active);
+        let jitter_matrix = Mat4::from_translation(Vec3::new(jitter.x, jitter.y, 0.));
+        let camera_view = jitter_matrix
+            * Mat4::perspective_rh(
+                75_f32.to_radians(),
+                self.width as f32 / self.height as f32,
+                0.05,
+                1024.,
+            )
+            * Mat4::look_at_rh(eye, eye + g.player.direction(), Vec3::Y);
         let center = eye.floor();
         let light_view = Mat4::orthographic_rh(-80., 80., -80., 80., 0.1, 250.)
             * Mat4::look_at_rh(center + sun * 120., center, Vec3::Y);
@@ -629,6 +828,12 @@ impl Renderer {
         };
         self.queue
             .write_buffer(&self.uniform, 0, bytemuck::bytes_of(&camera));
+        let mut held_camera = camera;
+        let unjittered = jitter_matrix.inverse() * camera_view;
+        held_camera.view = unjittered.to_cols_array_2d();
+        held_camera.inverse_view = unjittered.inverse().to_cols_array_2d();
+        self.queue
+            .write_buffer(&self.held_uniform, 0, bytemuck::bytes_of(&held_camera));
         let mut dynamic = vec![];
         for (_, m) in g.entities.iter() {
             let p = m.pos;
@@ -845,7 +1050,7 @@ impl Renderer {
             }
         }
         let mut held_mesh = vec![];
-        if !pack && !paused {
+        if self.ui.screen == crate::ui::Screen::Game && !pack && !paused {
             held_model(&mut held_mesh, g);
         }
         let held_buffer = (!held_mesh.is_empty()).then(|| {
@@ -878,6 +1083,7 @@ impl Renderer {
                 Ok(frame) => Some(frame),
                 Err(wgpu::SurfaceError::Lost | wgpu::SurfaceError::Outdated) => {
                     surface.configure(&self.device, &self.config);
+                    self.temporal.valid = false;
                     return Ok(());
                 }
                 Err(wgpu::SurfaceError::Timeout) => return Ok(()),
@@ -945,7 +1151,7 @@ impl Renderer {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("World pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &view,
+                    view: &self.temporal.scene,
                     resolve_target: None,
                     ops: wgpu::Operations {
                         load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
@@ -954,7 +1160,7 @@ impl Renderer {
                     depth_slice: None,
                 })],
                 depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
-                    view: &self.depth,
+                    view: &self.temporal.depth,
                     depth_ops: Some(wgpu::Operations {
                         load: wgpu::LoadOp::Clear(1.),
                         store: wgpu::StoreOp::Store,
@@ -995,6 +1201,43 @@ impl Renderer {
                 pass.draw(m.opaque_count..m.count, 0..1);
             }
         }
+        let now = std::time::Instant::now();
+        #[cfg(feature = "native-upscalers")]
+        if native_active {
+            self.temporal.native(
+                &self.device,
+                &self.queue,
+                &mut encoder,
+                &view,
+                camera_view,
+                eye,
+                &mut self.native,
+                now.duration_since(self.last_draw)
+                    .as_secs_f32()
+                    .clamp(0.001, 0.1),
+            )?;
+        } else {
+            self.temporal.draw(
+                &self.device,
+                &self.queue,
+                &mut encoder,
+                &view,
+                camera_view,
+                eye,
+                self.settings.taa,
+            );
+        }
+        #[cfg(not(feature = "native-upscalers"))]
+        self.temporal.draw(
+            &self.device,
+            &self.queue,
+            &mut encoder,
+            &view,
+            camera_view,
+            eye,
+            self.settings.taa,
+        );
+        self.last_draw = now;
         if let Some(buffer) = &held_buffer {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("Held item pass"),
@@ -1017,8 +1260,8 @@ impl Renderer {
                 }),
                 ..Default::default()
             });
-            pass.set_pipeline(&self.pipeline);
-            pass.set_bind_group(0, &self.bind, &[]);
+            pass.set_pipeline(&self.held_pipeline);
+            pass.set_bind_group(0, &self.held_bind, &[]);
             pass.set_vertex_buffer(0, buffer.slice(..));
             pass.draw(0..held_mesh.len() as u32, 0..1);
         }

@@ -9,13 +9,17 @@ mod game;
 #[path = "../tools/headless.rs"]
 mod headless;
 mod items;
+#[cfg(feature = "native-upscalers")]
+mod native_upscale;
 #[path = "../tools/performance.rs"]
 mod performance;
 #[path = "../tools/playtest.rs"]
 mod playtest;
 mod render;
 mod save;
+mod settings;
 mod streaming;
+mod temporal;
 mod ui;
 mod world;
 
@@ -31,6 +35,8 @@ use winit::{
 
 struct Options {
     headless: bool,
+    title: bool,
+    settings_path: PathBuf,
     seed: u64,
     new: bool,
     save: PathBuf,
@@ -47,6 +53,8 @@ struct Options {
 fn options() -> Result<Options, String> {
     let mut o = Options {
         headless: false,
+        title: false,
+        settings_path: PathBuf::from("saves/settings.json"),
         seed: 314159,
         new: false,
         save: PathBuf::from("saves/world.json"),
@@ -66,6 +74,10 @@ fn options() -> Result<Options, String> {
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--headless" => o.headless = true,
+            "--title" => o.title = true,
+            "--settings" => {
+                o.settings_path = PathBuf::from(args.next().ok_or("--settings needs a path")?)
+            }
             "--new" => o.new = true,
             "--mute" => o.mute = true,
             "--seed" => {
@@ -105,7 +117,7 @@ fn options() -> Result<Options, String> {
             }
             "--help" | "-h" => {
                 println!(
-                    "Voxel Adventure\n  --headless     render offscreen without display/audio (default 240 frames)\n  --new          create a separate fresh save with a random seed\n  --seed N       seed for a new world (default 314159)\n  --save PATH    world file (default saves/world.json)\n  --smoke        headless gameplay/persistence check; uses a temporary save\n  --frames N     render N frames then save and exit\n  --capture PATH save final frame as PPM (defaults to 240 frames)\n  --tour         scripted camera relocations for streaming measurements\n  --playtest     run headless mechanics course and progression expedition\n  --expedition   run controlled headless progression expedition\n  --profile PATH write frame timings and chunk backlog as CSV\n  --mute         disable sound playback\n  --pack         start with the inventory open\n\nWASD move; mouse look; Space jump; double-tap W sprint; Shift walk\nLMB mine/attack; RMB place/eat/use; wheel or 1-9 select\nE inventory/crafting/stats; R sleep near bed; F5 save; Esc menu"
+                    "Voxel Adventure\n  --headless     render offscreen without display/audio (default 240 frames)\n  --new          create a separate fresh save with a random seed\n  --seed N       seed for a new world (default 314159)\n  --save PATH    world file (default saves/world.json)\n  --smoke        headless gameplay/persistence check; uses a temporary save\n  --frames N     render N frames then save and exit\n  --capture PATH save final frame as PPM (defaults to 240 frames)\n  --tour         scripted camera relocations for streaming measurements\n  --playtest     run headless mechanics course and progression expedition\n  --expedition   run controlled headless progression expedition\n  --profile PATH write frame timings and chunk backlog as CSV\n  --mute         disable sound playback\n  --pack         start with the inventory open\n  --title        show title screen (also supports headless previews)\n  --settings PATH graphics settings JSON (default saves/settings.json)\n\nWASD move; mouse look; Space jump; double-tap W sprint; Shift walk\nLMB mine/attack; RMB place/eat/use; wheel or 1-9 select\nE inventory/crafting/stats; R sleep near bed; F5 save; Esc menu"
                 );
                 std::process::exit(0);
             }
@@ -137,6 +149,12 @@ fn fresh_seed() -> u64 {
 }
 struct App {
     game: Game,
+    active: bool,
+    screen: ui::Screen,
+    settings_back: ui::Screen,
+    settings: settings::Settings,
+    notice: String,
+    next_frame: Instant,
     options: Options,
     window: Option<Arc<Window>>,
     renderer: Option<render::Renderer>,
@@ -161,7 +179,8 @@ struct App {
 impl App {
     fn capture(&mut self) {
         if let Some(w) = &self.window {
-            let grab = !self.pack && !self.paused && self.focused;
+            let grab =
+                self.screen == ui::Screen::Game && !self.pack && !self.paused && self.focused;
             if grab {
                 if w.set_cursor_grab(CursorGrabMode::Locked).is_err() {
                     let _ = w.set_cursor_grab(CursorGrabMode::Confined);
@@ -178,6 +197,9 @@ impl App {
         self.sprinting = false;
     }
     fn save(&mut self) -> bool {
+        if !self.active {
+            return true;
+        }
         match save::write(&self.game, &self.options.save) {
             Ok(()) => {
                 self.game.say("World saved");
@@ -199,6 +221,8 @@ impl App {
             Ok(path) => {
                 game.say(format!("New world: {}", path.display()));
                 self.game = game;
+                self.active = true;
+                self.screen = ui::Screen::Game;
                 self.options.save = path;
                 if let Some(r) = &mut self.renderer {
                     r.reset_world();
@@ -216,8 +240,28 @@ impl App {
                 self.last = Instant::now();
                 self.capture();
             }
-            Err(e) => self.game.say(format!("New world failed: {e}")),
+            Err(e) => {
+                self.notice = format!("New world failed: {e}");
+                self.game.say(self.notice.clone());
+            }
         }
+    }
+    fn apply_settings(&mut self) {
+        if let Some(w) = &self.window {
+            w.set_fullscreen(
+                self.settings
+                    .fullscreen
+                    .then(|| winit::window::Fullscreen::Borderless(w.current_monitor())),
+            );
+        }
+        if let Some(r) = &mut self.renderer
+            && let Err(e) = r.apply_settings(&self.settings)
+        {
+            self.notice = e;
+            self.settings.upscaler = 0;
+            let _ = r.apply_settings(&self.settings);
+        }
+        self.next_frame = Instant::now();
     }
     fn exit(&mut self, event_loop: &ActiveEventLoop) {
         if !self.save() {
@@ -234,6 +278,89 @@ impl App {
     }
     fn action(&mut self, a: ui::Action, event_loop: &ActiveEventLoop) {
         match a {
+            ui::Action::Settings => {
+                self.settings_back = self.screen;
+                self.screen = ui::Screen::Settings;
+                self.capture();
+            }
+            ui::Action::Back => {
+                self.screen = if self.screen == ui::Screen::Settings {
+                    self.settings_back
+                } else {
+                    ui::Screen::Title
+                };
+                self.capture();
+            }
+            ui::Action::Title => {
+                if self.save() {
+                    self.active = false;
+                    self.screen = ui::Screen::Title;
+                    if let Some(w) = &self.window {
+                        w.set_title("Voxel Adventure");
+                    }
+                    self.pack = false;
+                    self.capture();
+                }
+            }
+            ui::Action::Setting(n) => {
+                self.notice.clear();
+                self.settings.change(n);
+                self.apply_settings();
+                if let Err(e) = self.settings.write(&self.options.settings_path) {
+                    self.notice = format!("Settings save failed: {e}");
+                }
+            }
+            ui::Action::Page(delta) => {
+                if let Some(r) = &mut self.renderer {
+                    r.ui.page = (r.ui.page as i32 + delta)
+                        .clamp(0, (r.ui.saves.len().saturating_sub(1) / 6) as i32)
+                        as usize;
+                    r.ui.focus = 0;
+                }
+            }
+            ui::Action::LoadMenu => {
+                self.screen = ui::Screen::Load;
+                if let Some(r) = &mut self.renderer {
+                    r.ui.saves = saved_worlds(&self.options.save, &self.options.settings_path);
+                    r.ui.page = 0;
+                    r.ui.focus = 0;
+                }
+            }
+            ui::Action::Load(i) => {
+                let path = self
+                    .renderer
+                    .as_ref()
+                    .and_then(|r| r.ui.saves.get(i))
+                    .cloned();
+                if let Some(path) = path {
+                    match save::read(&path) {
+                        Ok(Some(game)) => {
+                            self.game = game;
+                            self.options.save = path;
+                            if let Some(w) = &self.window {
+                                w.set_title(&format!(
+                                    "Voxel Adventure - {}",
+                                    self.options.save.display()
+                                ));
+                            }
+                            self.active = true;
+                            self.screen = ui::Screen::Game;
+                            self.paused = false;
+                            self.pack = false;
+                            self.accumulator = 0.;
+                            self.autosave = 0.;
+                            if let Some(r) = &mut self.renderer {
+                                r.reset_world();
+                            }
+                            self.last = Instant::now();
+                            self.notice.clear();
+                            self.capture();
+                        }
+                        Ok(None) => self.notice = "Save file no longer exists".into(),
+                        Err(e) => self.notice = format!("Load failed: {e}"),
+                    }
+                }
+            }
             ui::Action::Recipe(delta) => {
                 if let Some(r) = &mut self.renderer {
                     loop {
@@ -300,10 +427,11 @@ impl ApplicationHandler for App {
                 event_loop
                     .create_window(
                         Window::default_attributes()
-                            .with_title(format!(
-                                "Voxel Adventure - {}",
-                                self.options.save.display()
-                            ))
+                            .with_title(if self.active {
+                                format!("Voxel Adventure - {}", self.options.save.display())
+                            } else {
+                                "Voxel Adventure".into()
+                            })
                             .with_inner_size(winit::dpi::LogicalSize::new(1280., 800.))
                             .with_min_inner_size(winit::dpi::LogicalSize::new(900., 600.)),
                     )
@@ -316,6 +444,7 @@ impl ApplicationHandler for App {
             Ok((window, renderer)) => {
                 self.window = Some(window);
                 self.renderer = Some(renderer);
+                self.apply_settings();
                 self.capture();
                 self.last = Instant::now();
             }
@@ -326,7 +455,8 @@ impl ApplicationHandler for App {
         }
     }
     fn device_event(&mut self, _: &ActiveEventLoop, _: winit::event::DeviceId, event: DeviceEvent) {
-        if !self.pack
+        if self.screen == ui::Screen::Game
+            && !self.pack
             && !self.paused
             && self.focused
             && let DeviceEvent::MouseMotion { delta } = event
@@ -383,6 +513,34 @@ impl ApplicationHandler for App {
                         self.keys.remove(&code);
                     }
                     if event.state == ElementState::Pressed && !event.repeat {
+                        if self.screen != ui::Screen::Game {
+                            if code == KeyCode::Escape {
+                                self.action(ui::Action::Back, event_loop);
+                            }
+                            if let Some(r) = &mut self.renderer {
+                                let count = r.ui.hits.len();
+                                if count > 0 {
+                                    if code == KeyCode::ArrowDown {
+                                        r.ui.focus = (r.ui.focus + 1) % count;
+                                    }
+                                    if code == KeyCode::ArrowUp {
+                                        r.ui.focus = (r.ui.focus + count - 1) % count;
+                                    }
+                                    if code == KeyCode::Enter || code == KeyCode::Space {
+                                        let a = r.ui.hits[r.ui.focus.min(count - 1)].1;
+                                        self.action(a, event_loop);
+                                    }
+                                }
+                            }
+                            if code == KeyCode::F11 {
+                                self.settings.fullscreen = !self.settings.fullscreen;
+                                self.apply_settings();
+                                if let Err(e) = self.settings.write(&self.options.settings_path) {
+                                    self.notice = e;
+                                }
+                            }
+                            return;
+                        }
                         match code {
                             KeyCode::Escape => {
                                 if self.pack {
@@ -405,6 +563,13 @@ impl ApplicationHandler for App {
                                 }
                             }
                             KeyCode::KeyR if !self.pack && !self.paused => self.game.sleep(),
+                            KeyCode::F11 => {
+                                self.settings.fullscreen = !self.settings.fullscreen;
+                                self.apply_settings();
+                                if let Err(e) = self.settings.write(&self.options.settings_path) {
+                                    self.notice = e;
+                                }
+                            }
                             KeyCode::F5 => {
                                 self.save();
                             }
@@ -422,7 +587,9 @@ impl ApplicationHandler for App {
                     }
                 }
             }
-            WindowEvent::MouseWheel { delta, .. } if !self.pack && !self.paused => {
+            WindowEvent::MouseWheel { delta, .. }
+                if self.screen == ui::Screen::Game && !self.pack && !self.paused =>
+            {
                 let y = match delta {
                     MouseScrollDelta::LineDelta(_, y) => y,
                     MouseScrollDelta::PixelDelta(p) => p.y as f32,
@@ -434,7 +601,7 @@ impl ApplicationHandler for App {
                 }
             }
             WindowEvent::MouseInput { state, button, .. } => {
-                if self.pack || self.paused {
+                if self.screen != ui::Screen::Game || self.pack || self.paused {
                     if state == ElementState::Released
                         && button == MouseButton::Left
                         && let Some(origin) = self.drag_origin.take()
@@ -509,11 +676,14 @@ impl ApplicationHandler for App {
             }
             WindowEvent::RedrawRequested => {
                 let now = Instant::now();
+                if settings::CAPS[self.settings.cap] > 0 && now < self.next_frame {
+                    return;
+                }
                 let interval = now.duration_since(self.last);
                 let dt = interval.as_secs_f32().min(0.1);
                 self.last = now;
                 self.fps = self.fps * 0.95 + 0.05 / dt.max(0.001);
-                if self.focused && !self.paused {
+                if self.screen == ui::Screen::Game && self.focused && !self.paused {
                     self.accumulator += dt;
                     let pressed = |key| self.keys.contains(&key);
                     let input = Input {
@@ -565,13 +735,18 @@ impl ApplicationHandler for App {
                     self.game.player.yaw += 0.003;
                 }
                 for cue in self.game.feedback.sounds.drain(..) {
-                    if let Some(audio) = &self.audio {
+                    if self.settings.sound
+                        && let Some(audio) = &self.audio
+                    {
                         audio.play(cue);
                     }
                 }
                 let simulation_ms = now.elapsed().as_secs_f64() * 1000.;
                 let stream_start = Instant::now();
                 if let Some(r) = &mut self.renderer {
+                    r.ui.screen = self.screen;
+                    r.ui.settings = self.settings.clone();
+                    r.ui.notice = self.notice.clone();
                     r.update_world(
                         &mut self.game.world,
                         glam::Vec3::from_array(self.game.player.pos),
@@ -613,6 +788,10 @@ impl ApplicationHandler for App {
                         }
                     }
                 }
+                let cap = settings::CAPS[self.settings.cap];
+                if cap > 0 {
+                    self.next_frame = now + std::time::Duration::from_secs_f64(1. / cap as f64);
+                }
                 self.frames += 1;
                 if self.options.frames.is_some_and(|n| self.frames >= n) {
                     self.exit(event_loop);
@@ -622,12 +801,16 @@ impl ApplicationHandler for App {
         }
     }
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
-        // Presentation and compositor frame callbacks pace rendering at the
-        // display refresh rate, independently of the fixed simulation tick.
-        if let Some(w) = &self.window {
-            w.request_redraw();
+        let capped = settings::CAPS[self.settings.cap] > 0;
+        let now = Instant::now();
+        if !capped || now >= self.next_frame {
+            if let Some(w) = &self.window {
+                w.request_redraw();
+            }
+            event_loop.set_control_flow(ControlFlow::Wait);
+        } else {
+            event_loop.set_control_flow(ControlFlow::WaitUntil(self.next_frame));
         }
-        event_loop.set_control_flow(ControlFlow::Wait);
     }
 }
 fn smoke() -> Result<(), String> {
@@ -675,6 +858,30 @@ fn smoke() -> Result<(), String> {
     println!("Smoke passed: landing, mining, crafting, XP, save/load.");
     Ok(())
 }
+fn saved_worlds(current: &std::path::Path, settings: &std::path::Path) -> Vec<PathBuf> {
+    let parent = current
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new("."));
+    let mut paths: Vec<_> = std::fs::read_dir(parent)
+        .into_iter()
+        .flatten()
+        .filter_map(Result::ok)
+        .map(|e| e.path())
+        .filter(|p| {
+            p != settings
+                && p.extension().is_some_and(|e| e == "json")
+                && p.file_name().is_none_or(|n| n != "settings.json")
+                && p.is_file()
+        })
+        .collect();
+    paths.sort();
+    if current.is_file() {
+        paths.retain(|p| p != current);
+        paths.insert(0, current.into());
+    }
+    paths
+}
+
 fn run() -> Result<(), String> {
     let mut options = options()?;
     if options.playtest {
@@ -687,13 +894,17 @@ fn run() -> Result<(), String> {
     if options.smoke {
         return smoke();
     }
+    let direct = !options.title
+        && (options.new || options.headless || options.frames.is_some() || options.pack);
     let game = if options.new {
         let game = Game::new(options.seed);
         options.save = save::create(&game, &options.save)?;
         println!("Created {} (seed {})", options.save.display(), options.seed);
         game
-    } else {
+    } else if direct {
         save::read(&options.save)?.unwrap_or_else(|| Game::new(options.seed))
+    } else {
+        Game::new(options.seed)
     };
     if options.headless {
         return headless::run(game, &options);
@@ -706,7 +917,21 @@ fn run() -> Result<(), String> {
         .map(performance::Profile::new)
         .transpose()?;
     let audio = (!options.mute).then(audio::Audio::new);
+    let (settings, notice) = match settings::Settings::read(&options.settings_path) {
+        Ok(s) => (s, String::new()),
+        Err(e) => (settings::Settings::default(), e),
+    };
     let mut app = App {
+        active: direct,
+        screen: if direct {
+            ui::Screen::Game
+        } else {
+            ui::Screen::Title
+        },
+        settings_back: ui::Screen::Title,
+        settings,
+        notice,
+        next_frame: Instant::now(),
         game,
         options,
         window: None,
