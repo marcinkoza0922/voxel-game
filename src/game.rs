@@ -124,6 +124,9 @@ pub struct Game {
     attack_timer: f32,
     spawn_timer: f32,
     grass_timer: f32,
+    fluid_timer: f32,
+    fluid_pulse: u32,
+    pub breath: f32,
     pub furnaces: std::collections::BTreeMap<[i32; 3], items::Furnace>,
     pub active_furnace: Option<[i32; 3]>,
     pub torch_life: std::collections::BTreeMap<[i32; 3], f32>,
@@ -149,6 +152,9 @@ impl Game {
             attack_timer: 0.,
             spawn_timer: 4.,
             grass_timer: 5.,
+            fluid_timer: 0.2,
+            fluid_pulse: 0,
+            breath: 15.,
             furnaces: Default::default(),
             active_furnace: None,
             torch_life: Default::default(),
@@ -159,9 +165,12 @@ impl Game {
         self.message_time = 4.;
     }
     pub fn target(&mut self) {
-        self.target = self
-            .world
-            .raycast(self.player.eye(), self.player.direction(), 5.);
+        self.target = self.world.raycast_fluid(
+            self.player.eye(),
+            self.player.direction(),
+            5.,
+            self.player.inventory.selected_count() > 0 && self.player.inventory.selected().bucket(),
+        );
     }
     pub fn stations(&self) -> (bool, bool) {
         let p = Vec3::from_array(self.player.pos).floor().as_ivec3();
@@ -314,6 +323,10 @@ impl Game {
             self.say("You eat and recover some hunger");
             return;
         }
+        if i.bucket() {
+            self.use_bucket(i);
+            return;
+        }
         self.target();
         if let Some((hit, adjacent)) = self.target {
             if self.world.get(hit) == Block::Bed {
@@ -321,7 +334,7 @@ impl Game {
                 return;
             }
             if let Some(block) = i.block() {
-                if adjacent == hit || self.world.get(adjacent) != Block::Air {
+                if adjacent == hit || !self.world.get(adjacent).replaceable() {
                     return;
                 }
                 if block.plant() && !self.world.get(adjacent - IVec3::Y).dirt() {
@@ -346,6 +359,7 @@ impl Game {
                     return;
                 }
                 if self.world.set(adjacent, block) {
+                    self.torch_life.remove(&adjacent.to_array());
                     self.player.inventory.take_selected();
                     if block.processor() {
                         self.furnaces.insert(
@@ -361,6 +375,41 @@ impl Game {
                     }
                 }
             }
+        }
+    }
+    fn use_bucket(&mut self, item: Item) {
+        let Some((hit, adjacent)) =
+            self.world
+                .raycast_fluid(self.player.eye(), self.player.direction(), 5., true)
+        else {
+            return;
+        };
+        let block = self.world.get(hit);
+        let (pos, replacement, bucket) = if let Some(fluid) = item.bucket_contents() {
+            let pos = adjacent;
+            if pos == hit
+                || !self.world.get(pos).replaceable()
+                || self.world.get(pos).fluid().is_some()
+            {
+                return;
+            }
+            (pos, fluid, item.empty_bucket())
+        } else {
+            let Some(filled) = item.fill_bucket(block) else {
+                self.say(if block == Block::Lava {
+                    "Lava needs an iron or stronger bucket"
+                } else {
+                    "Scoop a water or lava source"
+                });
+                return;
+            };
+            (hit, Block::Air, filled)
+        };
+        if self.world.set(pos, replacement) {
+            self.torch_life.remove(&pos.to_array());
+            let selected = self.player.inventory.selected;
+            self.player.inventory.slots[selected] = Some(items::Stack::new(bucket, 1));
+            self.feedback.swing = 0.32;
         }
     }
     pub fn sleep(&mut self) {
@@ -497,6 +546,15 @@ impl Game {
         let previous_health = self.player.health;
         self.feedback.tick(dt);
         self.tick_furnace();
+        self.fluid_timer -= dt;
+        if self.fluid_timer <= 0. {
+            self.fluid_timer += 0.2;
+            self.fluid_pulse = self.fluid_pulse.wrapping_add(1);
+            self.world.tick_fluids(
+                Vec3::from_array(self.player.pos).floor().as_ivec3(),
+                self.fluid_pulse.is_multiple_of(3),
+            );
+        }
         self.time += dt / 900.;
         self.grass_timer -= dt;
         if self.grass_timer <= 0. {
@@ -515,7 +573,7 @@ impl Game {
                     .get(IVec3::from_array(*p) + IVec3::from_array(*n))
                     .solid()
             });
-            if *t <= 0. || unsupported {
+            if *t <= 0. || unsupported || self.world.get(IVec3::from_array(*p)) != Block::Torch {
                 expired.push(*p);
             }
         }
@@ -526,7 +584,12 @@ impl Game {
             }
         }
         let sprint = input.sprint && !input.walk && self.player.hunger > 10.;
-        let speed = 4.5
+        let body_fluid = [0.1, 0.9].into_iter().find_map(|y| {
+            self.world
+                .fluid_at(Vec3::from_array(self.player.pos) + Vec3::Y * y)
+        });
+        let swimming = body_fluid.is_some();
+        let speed = (if swimming { 2.2 } else { 4.5 })
             * (1. + (self.player.stats[5] as f32 * 0.012).min(0.24))
             * if input.walk {
                 0.45
@@ -547,14 +610,20 @@ impl Game {
             && collides(&self.world, ahead)
             && !collides(&self.world, ahead + Vec3::Y)
             && !collides(&self.world, position + Vec3::Y);
-        if (input.jump || auto_jump) && self.grounded {
+        if !swimming && (input.jump || auto_jump) && self.grounded {
             self.velocity.y = 7.2 * (1. + self.player.stats[5] as f32 * 0.008);
             self.grounded = false;
         }
-        self.velocity.y = (self.velocity.y - 22. * dt).max(-45.);
+        if swimming {
+            self.velocity.y = (self.velocity.y * (1. - 4. * dt).max(0.)
+                + if input.jump { 12. * dt } else { -3. * dt })
+            .clamp(-2., 3.);
+        } else {
+            self.velocity.y = (self.velocity.y - 22. * dt).max(-45.);
+        }
         let mut pos = Vec3::from_array(self.player.pos);
         let was_falling = self.velocity.y;
-        let edge_guard = input.walk && self.grounded;
+        let edge_guard = input.walk && self.grounded && !swimming;
         self.grounded = false;
         for axis in [0, 2, 1] {
             let delta = self.velocity[axis] * dt;
@@ -569,7 +638,7 @@ impl Game {
                     if axis == 1 {
                         if self.velocity.y < 0. {
                             self.grounded = true;
-                            if was_falling < -12. {
+                            if was_falling < -12. && !swimming {
                                 let damage = (-was_falling - 12.)
                                     * 3.
                                     * (1. - self.player.stats[5] as f32 * 0.02);
@@ -584,6 +653,21 @@ impl Game {
             }
         }
         self.player.pos = pos.to_array();
+        if body_fluid.is_some_and(|(lava, _)| lava) {
+            self.player.health -= dt * 25.;
+        }
+        if self
+            .world
+            .fluid_at(self.player.eye())
+            .is_some_and(|(lava, _)| !lava)
+        {
+            self.breath = (self.breath - dt).max(0.);
+            if self.breath == 0. {
+                self.player.health -= dt * 8.;
+            }
+        } else {
+            self.breath = (self.breath + dt * 5.).min(15.);
+        }
         self.tick_drops(dt);
         self.collect_drops();
         self.player.hunger = (self.player.hunger - dt * if sprint { 0.12 } else { 0.055 }).max(0.);
@@ -617,6 +701,7 @@ impl Game {
             self.player.health = self.player.max_health();
             self.player.hunger = 75.;
             self.player.rest = 75.;
+            self.breath = 15.;
             self.say("You awaken at your starting place. Inventory retained.");
         }
     }
@@ -709,6 +794,9 @@ impl Game {
             return;
         };
         let b = self.world.get(p);
+        if b.fluid().is_some() {
+            return;
+        }
         let tool = self.player.inventory.selected();
         let has = self.player.inventory.selected_count() > 0;
         let pick = if has { tool.pick() } else { 0 };
@@ -724,14 +812,18 @@ impl Game {
                 | Block::Smelter
                 | Block::RuinStone
                 | Block::Reliquary
+                | Block::Obsidian
         );
         if (hard && pick == 0)
             || (b == Block::Copper && pick < 2)
             || (b == Block::Iron && pick < 3)
+            || (b == Block::Obsidian && pick < 4)
             || (b == Block::Log && axe == 0)
         {
             if self.message_time < 1. {
-                self.say(if b == Block::Iron {
+                self.say(if b == Block::Obsidian {
+                    "Obsidian needs an iron pickaxe"
+                } else if b == Block::Iron {
                     "Iron ore needs a copper pickaxe"
                 } else if b == Block::Copper {
                     "Copper ore needs a stone pickaxe"
@@ -805,6 +897,7 @@ impl Game {
                     {
                         Some(Item::WheatSeeds)
                     }
+                    Block::Obsidian => Some(Item::Obsidian),
                     Block::Log => Some(Item::Log),
                     Block::Stone | Block::Cobble | Block::RuinStone => Some(Item::Cobble),
                     Block::Iron => Some(Item::IronOre),
@@ -856,6 +949,14 @@ impl Game {
             .torch_life
             .keys()
             .any(|p| torch_lit(IVec3::from_array(*p).as_vec3() + Vec3::new(0.5, 0.77, 0.5)))
+            && !self
+                .world
+                .lava_lights(sample.floor().as_ivec3())
+                .into_iter()
+                .any(|light| {
+                    let falloff = (1. - sample.distance(light) / 9.).max(0.);
+                    0.22 * falloff * falloff > 0.1
+                })
             && !(self.player.inventory.selected() == Item::Torch
                 && self.player.inventory.selected_count() > 0
                 && torch_lit(Vec3::from_array(self.player.pos) + Vec3::Y * 1.6))
@@ -1710,5 +1811,70 @@ mod expansion_tests {
                 .iter()
                 .any(|(_, m)| matches!(m.kind, MobKind::Guardian(_)))
         );
+    }
+}
+
+#[cfg(test)]
+mod fluid_tests {
+    use super::*;
+    #[test]
+    fn all_bucket_materials_scoop_and_pour_water_but_only_iron_carries_lava() {
+        for bucket in [Item::WoodBucket, Item::CopperBucket, Item::IronBucket] {
+            let mut g = Game::new(41);
+            let p = IVec3::new(0, 200, 0);
+            g.world.set(p - IVec3::Y, Block::Stone);
+            g.world.set(p, Block::Water);
+            g.player.pos = [0.5, 201., 0.5];
+            g.player.pitch = -std::f32::consts::FRAC_PI_2;
+            g.player.inventory = Inventory::empty();
+            g.player.inventory.add(bucket, 1);
+            g.use_selected();
+            assert_eq!(g.world.get(p), Block::Air);
+            assert_eq!(
+                g.player.inventory.selected().bucket_contents(),
+                Some(Block::Water)
+            );
+            g.use_selected();
+            assert_eq!(g.world.get(p), Block::Water);
+            assert_eq!(g.player.inventory.selected(), bucket);
+            g.world.set(p, Block::Lava);
+            g.use_selected();
+            if bucket == Item::IronBucket {
+                assert_eq!(g.player.inventory.selected(), Item::IronLavaBucket);
+                g.use_selected();
+                assert_eq!(g.world.get(p), Block::Lava);
+                assert_eq!(g.player.inventory.selected(), bucket);
+            } else {
+                assert_eq!(g.world.get(p), Block::Lava);
+                assert_eq!(g.player.inventory.selected(), bucket);
+            }
+            g.world.set(p, Block::FlowingWater(3));
+            g.use_selected();
+            assert_eq!(g.player.inventory.selected(), bucket);
+            assert_eq!(g.world.get(p), Block::FlowingWater(3));
+        }
+    }
+    #[test]
+    fn water_slows_falls_allows_swimming_and_consumes_air_lava_hurts() {
+        let mut g = Game::new(41);
+        g.player.pos = [0.5, 200.1, 0.5];
+        g.world.set(IVec3::new(0, 200, 0), Block::Water);
+        g.world.set(IVec3::new(0, 201, 0), Block::Water);
+        g.tick(
+            &Input {
+                jump: true,
+                ..Default::default()
+            },
+            STEP,
+        );
+        assert!(g.velocity.y > 0.);
+        assert!(g.breath < 15.);
+        g.breath = 0.;
+        g.tick(&Input::default(), STEP);
+        assert!(g.player.health < 100.);
+        g.world.set(IVec3::new(0, 200, 0), Block::Lava);
+        let health = g.player.health;
+        g.tick(&Input::default(), STEP);
+        assert!(g.player.health < health);
     }
 }

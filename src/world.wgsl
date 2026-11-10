@@ -55,7 +55,7 @@ struct Out { @builtin(position) clip: vec4<f32>, @location(0) world: vec3<f32>, 
     var o:Out; o.clip=camera.view*vec4(v.pos,1.0);o.world=v.pos;o.normal=v.normal;o.color=v.color;o.tile=v.tile;o.sky_access=v.sky_access;o.shadow=camera.light_view*vec4(v.pos,1.0);return o;
 }
 fn leaf_gap(world:vec3<f32>, normal:vec3<f32>, layer:f32)->bool {
-    if((layer<14.5 || layer>17.5) && layer > -3.5) {return false;}
+    if((layer<14.5 || layer>17.5) && (layer > -3.5 || layer < -4.5)) {return false;}
     let axis=abs(normal);
     var uv=world.xy;
     if(axis.x>0.5) {uv=world.zy;}
@@ -63,7 +63,7 @@ fn leaf_gap(world:vec3<f32>, normal:vec3<f32>, layer:f32)->bool {
     let cell=floor(uv*select(16.0,32.0,layer < -3.5));
     return fract(sin(dot(cell,vec2(127.1,311.7)))*43758.5453)<select(0.28,0.36,layer < -3.5);
 }
-@fragment fn fs(v:Out)->@location(0) vec4<f32> {
+fn shade(v:Out)->vec4<f32> {
     let p=v.shadow.xyz/v.shadow.w;
     let uv=vec2(p.x*0.5+0.5,0.5-p.y*0.5);
     // All fragments execute comparisons to satisfy uniform derivative rules.
@@ -72,7 +72,7 @@ fn leaf_gap(world:vec3<f32>, normal:vec3<f32>, layer:f32)->bool {
         shadow+=textureSampleCompare(shadow_map,shadow_sampler,uv+vec2(f32(x),f32(y))/2048.0,p.z-0.0015)/9.0;
     }}
     if(any(uv<vec2(0.0)) || any(uv>vec2(1.0)) || p.z>1.0 || p.z<0.0) {shadow=1.0;}
-    let foliage=(v.tile.z>=14.5 && v.tile.z<=17.5) || v.tile.z < -2.5;
+    let foliage=(v.tile.z>=14.5 && v.tile.z<=17.5) || (v.tile.z < -2.5 && v.tile.z > -4.5);
     let facing=dot(v.normal,camera.sun.xyz);
     let diffuse=(max(facing,0.0)+select(0.0,max(-facing,0.0)*0.55,foliage))*camera.sun.w*shadow;
     let day=camera.sky.x;
@@ -86,10 +86,25 @@ fn leaf_gap(world:vec3<f32>, normal:vec3<f32>, layer:f32)->bool {
     }
     let tile_color=textureSample(tiles,tile_sampler,v.tile.xy,i32(round(max(v.tile.z,0.0)))).rgb;
     let surface=select(vec3(1.0),tile_color,v.tile.z>=0.0);
-    let color=select(v.color*surface*light,v.color,v.tile.z < -1.5 && v.tile.z > -2.5);
+    var color=select(v.color*surface*light,v.color,v.tile.z < -1.5 && v.tile.z > -2.5);
+    if(v.tile.z < -4.5) {
+        let ripple=0.92+0.08*sin(v.world.x*7.0+v.world.z*5.0+camera.sky.y*900.0);
+        color*=ripple;
+        if(v.tile.z < -5.5) {color=v.color*ripple;}
+    }
     let fog=smoothstep(112.0,160.0,distance(v.world.xz,camera.eye.xz));
     if(leaf_gap(v.world,v.normal,v.tile.z)) {discard;}
     return vec4(mix(color,atmosphere(normalize(v.world-camera.eye.xyz))*sky_access,fog),1.0);
+}
+@fragment fn fs(v:Out)->@location(0) vec4<f32> {
+    let color=shade(v);
+    if(v.tile.z < -4.5) {discard;}
+    return color;
+}
+@fragment fn fluid_fs(v:Out)->@location(0) vec4<f32> {
+    let color=shade(v);
+    if(v.tile.z > -4.5) {discard;}
+    return vec4(color.rgb,select(0.62,1.0,v.tile.z < -5.5));
 }
 struct ShadowOut {
     @builtin(position) clip:vec4<f32>,
@@ -104,5 +119,6 @@ struct ShadowOut {
     return o;
 }
 @fragment fn shadow_fs(v:ShadowOut) {
+    if(v.layer < -4.5) {discard;}
     if(leaf_gap(v.world,v.normal,v.layer)) {discard;}
 }

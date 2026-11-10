@@ -3,7 +3,7 @@ use crate::world::Block;
 
 pub const TILE_SIZE: u32 = 32;
 
-pub const BLOCKS: [Block; 20] = [
+pub const BLOCKS: [Block; 21] = [
     Block::Air,
     Block::Grass,
     Block::Dirt,
@@ -24,6 +24,7 @@ pub const BLOCKS: [Block; 20] = [
     Block::Snow,
     Block::RuinStone,
     Block::Reliquary,
+    Block::Obsidian,
 ];
 pub fn layer(block: Block, face: usize) -> u32 {
     (BLOCKS.iter().position(|b| *b == block).unwrap_or(0) * 3 + face) as u32
@@ -254,6 +255,15 @@ pub fn texel(block: Block, face: usize, x: i32, y: i32) -> [f32; 3] {
                 tint([0.23, 0.51, 0.65], grain)
             }
         }
+        Water | FlowingWater(_) | Lava | FlowingLava(_) => block.color(),
+        Obsidian => tint(
+            block.color(),
+            if (x + y / 3).rem_euclid(11) == 0 {
+                1.8
+            } else {
+                grain
+            },
+        ),
         Torch => {
             // Charred end grain and twisted linen on the head; long split wood grain below.
             if face == 1 {

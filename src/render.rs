@@ -44,6 +44,7 @@ struct Camera {
 struct Mesh {
     buffer: wgpu::Buffer,
     count: u32,
+    opaque_count: u32,
 }
 pub struct Renderer {
     surface: Option<wgpu::Surface<'static>>,
@@ -53,6 +54,7 @@ pub struct Renderer {
     config: wgpu::SurfaceConfiguration,
     pipeline: wgpu::RenderPipeline,
     shadow_pipeline: wgpu::RenderPipeline,
+    fluid_pipeline: wgpu::RenderPipeline,
     sky_pipeline: wgpu::RenderPipeline,
     ui_pipeline: wgpu::RenderPipeline,
     uniform: wgpu::Buffer,
@@ -349,6 +351,37 @@ impl Renderer {
             multiview: None,
             cache: None,
         });
+        let fluid_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("Fluid pipeline"),
+            layout: Some(&pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &shader,
+                entry_point: Some("vs"),
+                compilation_options: Default::default(),
+                buffers: &[Vertex::layout()],
+            },
+            primitive: wgpu::PrimitiveState {
+                cull_mode: None,
+                ..Default::default()
+            },
+            depth_stencil: Some(wgpu::DepthStencilState {
+                depth_write_enabled: false,
+                ..ds.clone()
+            }),
+            multisample: Default::default(),
+            fragment: Some(wgpu::FragmentState {
+                module: &shader,
+                entry_point: Some("fluid_fs"),
+                compilation_options: Default::default(),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format,
+                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+            }),
+            multiview: None,
+            cache: None,
+        });
         let sky_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("Procedural skybox"),
             layout: Some(&pipeline_layout),
@@ -457,6 +490,7 @@ impl Renderer {
             config,
             pipeline,
             shadow_pipeline,
+            fluid_pipeline,
             sky_pipeline,
             ui_pipeline,
             uniform,
@@ -493,10 +527,12 @@ impl Renderer {
         for k in w.stream(pos, VIEW_RADIUS) {
             self.meshes.remove(&k);
         }
-        for (k, data) in std::mem::take(&mut w.meshes) {
+        for (k, mut data) in std::mem::take(&mut w.meshes) {
             if !w.loaded(k) {
                 continue;
             }
+            data.sort_by_key(|v| v.tile[2] < -4.5);
+            let opaque_count = data.partition_point(|v| v.tile[2] >= -4.5) as u32;
             if data.is_empty() {
                 self.meshes.remove(&k);
             } else {
@@ -511,6 +547,7 @@ impl Renderer {
                                 usage: wgpu::BufferUsages::VERTEX,
                             }),
                         count: data.len() as u32,
+                        opaque_count,
                     },
                 );
             }
@@ -532,7 +569,7 @@ impl Renderer {
             -celestial
         };
         let strength = daylight + (1. - daylight) * 0.025 * sun.y.max(0.).sqrt();
-        let sky = [daylight, 0., 0., 1.];
+        let sky = [daylight, g.time.fract(), 0., 1.];
         let eye = g.player.eye();
         let camera_view = Mat4::perspective_rh(
             75_f32.to_radians(),
@@ -550,13 +587,25 @@ impl Renderer {
             .map(|p| {
                 let mount = g.world.torch_mounts.get(p).copied().unwrap_or([0, -1, 0]);
                 let wall = Vec3::new(mount[0] as f32, 0., mount[2] as f32);
-                Vec3::from_array(p.map(|n| n as f32))
-                    + Vec3::new(0.5, 0.04, 0.5)
-                    + wall * 0.43
-                    + (Vec3::Y - wall * 0.42).normalize() * 0.73
+                (
+                    Vec3::from_array(p.map(|n| n as f32))
+                        + Vec3::new(0.5, 0.04, 0.5)
+                        + wall * 0.43
+                        + (Vec3::Y - wall * 0.42).normalize() * 0.73,
+                    0.8,
+                )
             })
             .collect();
-        torches.sort_by(|a, b| a.distance_squared(eye).total_cmp(&b.distance_squared(eye)));
+        torches.extend(
+            g.world
+                .lava_lights(eye.floor().as_ivec3())
+                .into_iter()
+                .map(|p| (p, 0.22)),
+        );
+        torches.sort_by(|a, b| {
+            a.0.distance_squared(eye)
+                .total_cmp(&b.0.distance_squared(eye))
+        });
         let held = g.player.inventory.selected() == crate::items::Item::Torch
             && g.player.inventory.selected_count() > 0;
         let mut n = 0;
@@ -564,8 +613,8 @@ impl Renderer {
             lights[0] = [eye.x, eye.y, eye.z, 0.8];
             n = 1;
         }
-        for p in torches.into_iter().take(16 - n) {
-            lights[n] = [p.x, p.y, p.z, 0.8];
+        for (p, strength) in torches.into_iter().take(16 - n) {
+            lights[n] = [p.x, p.y, p.z, strength];
             n += 1;
         }
         let camera = Camera {
@@ -885,7 +934,7 @@ impl Renderer {
                     continue;
                 }
                 pass.set_vertex_buffer(0, m.buffer.slice(..));
-                pass.draw(0..m.count, 0..1);
+                pass.draw(0..m.opaque_count, 0..1);
             }
             if let Some(b) = &dynamic_buffer {
                 pass.set_vertex_buffer(0, b.slice(..));
@@ -923,11 +972,27 @@ impl Renderer {
                     continue;
                 }
                 pass.set_vertex_buffer(0, m.buffer.slice(..));
-                pass.draw(0..m.count, 0..1);
+                pass.draw(0..m.opaque_count, 0..1);
             }
             if let Some(b) = &dynamic_buffer {
                 pass.set_vertex_buffer(0, b.slice(..));
                 pass.draw(0..dynamic.len() as u32, 0..1);
+            }
+            pass.set_pipeline(&self.fluid_pipeline);
+            let mut fluid_chunks: Vec<_> = self
+                .meshes
+                .iter()
+                .filter(|(k, m)| m.count > m.opaque_count && chunk_visible(camera_view, **k))
+                .collect();
+            fluid_chunks.sort_by(|(a, _), (b, _)| {
+                let distance = |k: &IVec3| {
+                    (k.as_vec3() * SIZE as f32 + Vec3::splat(8.) - eye).length_squared()
+                };
+                distance(b).total_cmp(&distance(a))
+            });
+            for (_, m) in fluid_chunks {
+                pass.set_vertex_buffer(0, m.buffer.slice(..));
+                pass.draw(m.opaque_count..m.count, 0..1);
             }
         }
         if let Some(buffer) = &held_buffer {
@@ -1212,6 +1277,19 @@ pub fn mesh_halo(
                     if neighbor.solid() && neighbor != Block::Leaves {
                         continue;
                     }
+                    let fluid = block.fluid();
+                    let same_fluid =
+                        fluid.is_some() && neighbor.fluid().map(|f| f.0) == fluid.map(|f| f.0);
+                    let height = if fluid.is_some()
+                        && get(p + IVec3::Y).fluid().map(|f| f.0) != fluid.map(|f| f.0)
+                    {
+                        block.fluid_height()
+                    } else {
+                        1.
+                    };
+                    if same_fluid && (normal.y != 0 || neighbor.fluid_height() >= height) {
+                        continue;
+                    }
                     let mut vertices = [Vertex {
                         sky_access: 1.,
                         pos: [0.; 3],
@@ -1230,11 +1308,21 @@ pub fn mesh_halo(
                             side1 + side2 + corner
                         };
                         aos[i] = ao;
-                        let pos = (base + p).as_vec3()
+                        let mut pos = (base + p).as_vec3()
                             + Vec3::splat(0.5)
                             + normal.as_vec3() * 0.5
                             + u.as_vec3() * (*a as f32 * 0.5)
                             + v.as_vec3() * (*b as f32 * 0.5);
+                        if fluid.is_some() {
+                            let local_y = pos.y - (base + p).y as f32;
+                            let bottom = if same_fluid && normal.y == 0 {
+                                neighbor.fluid_height()
+                            } else {
+                                0.
+                            };
+                            pos.y =
+                                (base + p).y as f32 + if local_y > 0.5 { height } else { bottom };
+                        }
                         vertices[i].pos = pos.to_array();
                         let face = if block == Block::Grass
                             && normal.y == 0
@@ -1259,6 +1347,10 @@ pub fn mesh_halo(
                                 as f32
                                 * 0.01;
                         vertices[i].color = [((1. - ao as f32 * 0.16) * variation); 3];
+                        if let Some((lava, _)) = fluid {
+                            vertices[i].tile[2] = if lava { -6. } else { -5. };
+                            vertices[i].color = block.color().map(|c| c * variation);
+                        }
                     }
                     let indices = if aos[0] + aos[2] > aos[1] + aos[3] {
                         [0, 1, 3, 1, 2, 3]
@@ -1756,6 +1848,56 @@ fn held_model(out: &mut Vec<Vertex>, g: &Game) {
             vertex.pos =
                 ((Vec3::from_array(vertex.pos) - Vec3::new(0.5, 0.1, 0.5)) * 0.55).to_array();
         }
+    } else if equipped && item.bucket() {
+        let material = match item.empty_bucket() {
+            Item::IronBucket => [0.72, 0.77, 0.81],
+            Item::CopperBucket => [0.77, 0.43, 0.24],
+            _ => [0.55, 0.35, 0.17],
+        };
+        box_mesh(
+            out,
+            Vec3::new(-0.1, -0.01, -0.1),
+            Vec3::new(0.2, 0.025, 0.2),
+            material,
+        );
+        for x in [-0.1, 0.075] {
+            box_mesh(
+                out,
+                Vec3::new(x, 0., -0.1),
+                Vec3::new(0.025, 0.18, 0.2),
+                material,
+            );
+        }
+        for z in [-0.1, 0.075] {
+            box_mesh(
+                out,
+                Vec3::new(-0.1, 0., z),
+                Vec3::new(0.2, 0.18, 0.025),
+                material,
+            );
+        }
+        box_mesh(
+            out,
+            Vec3::new(-0.1, 0.27, -0.012),
+            Vec3::new(0.2, 0.02, 0.025),
+            material,
+        );
+        for x in [-0.1, 0.075] {
+            box_mesh(
+                out,
+                Vec3::new(x, 0.18, -0.012),
+                Vec3::new(0.025, 0.1, 0.025),
+                material,
+            );
+        }
+        if let Some(fluid) = item.bucket_contents() {
+            box_mesh(
+                out,
+                Vec3::new(-0.074, 0.125, -0.074),
+                Vec3::new(0.148, 0.025, 0.148),
+                fluid.color(),
+            );
+        }
     } else if equipped && item.flower_index().is_some() {
         let start = out.len();
         vegetation(out, 0, IVec3::ZERO, item.block().unwrap());
@@ -1864,5 +2006,37 @@ mod sky_tests {
             exposure: HashMap::new(),
         };
         assert_eq!(sky.sample(IVec3::new(1, y, 0)), 0.);
+    }
+}
+
+#[cfg(test)]
+mod fluid_mesh_tests {
+    use super::*;
+    #[test]
+    fn fluid_faces_use_transparent_material_and_match_flow_height() {
+        let mut w = World::new(41);
+        let p = IVec3::new(0, 200, 0);
+        w.set(p, Block::FlowingWater(4));
+        let mesh = mesh_chunk(&w, crate::world::chunk(p));
+        let water: Vec<_> = mesh.iter().filter(|v| v.tile[2] == -5.).collect();
+        assert_eq!(water.len(), 36);
+        assert!(
+            (water
+                .iter()
+                .map(|v| v.pos[1])
+                .fold(f32::NEG_INFINITY, f32::max)
+                - (200. + 4. / 9.))
+                .abs()
+                < 0.001
+        );
+        w.set(p + IVec3::X, Block::FlowingWater(4));
+        let mesh = mesh_chunk(&w, crate::world::chunk(p));
+        assert_eq!(mesh.iter().filter(|v| v.tile[2] == -5.).count(), 60);
+        w.set(p + IVec3::Z, Block::Lava);
+        assert!(
+            mesh_chunk(&w, crate::world::chunk(p))
+                .iter()
+                .any(|v| v.tile[2] == -6.)
+        );
     }
 }

@@ -38,10 +38,35 @@ pub enum Block {
     PinkFlower,
     BlueFlower,
     Shrub,
+    Water,
+    FlowingWater(u8),
+    Lava,
+    FlowingLava(u8),
+    Obsidian,
 }
 impl Block {
     pub fn solid(self) -> bool {
-        !matches!(self, Self::Air | Self::Torch) && !self.plant()
+        !matches!(self, Self::Air | Self::Torch) && self.fluid().is_none() && !self.plant()
+    }
+    /// Source is level zero; falling columns use level eight.
+    pub fn fluid(self) -> Option<(bool, u8)> {
+        match self {
+            Self::Water => Some((false, 0)),
+            Self::FlowingWater(n) => Some((false, n)),
+            Self::Lava => Some((true, 0)),
+            Self::FlowingLava(n) => Some((true, n)),
+            _ => None,
+        }
+    }
+    pub fn replaceable(self) -> bool {
+        self == Self::Air || self == Self::Torch || self.plant() || self.fluid().is_some()
+    }
+    pub fn fluid_height(self) -> f32 {
+        match self.fluid() {
+            Some((_, 0 | 8)) => 0.9,
+            Some((_, n)) => (8 - n.min(7)) as f32 / 9.,
+            None => 1.,
+        }
     }
     pub fn dirt(self) -> bool {
         matches!(self, Self::Dirt | Self::Grass)
@@ -57,6 +82,9 @@ impl Block {
     }
     pub fn color(self) -> [f32; 3] {
         match self {
+            Self::Water | Self::FlowingWater(_) => [0.10, 0.37, 0.74],
+            Self::Lava | Self::FlowingLava(_) => [1., 0.24, 0.015],
+            Self::Obsidian => [0.13, 0.08, 0.20],
             Self::Shrub => [0.20, 0.39, 0.13],
             Self::TallGrass => [0.25, 0.45, 0.12],
             Self::RedFlower => FLOWER_COLORS[0],
@@ -89,6 +117,9 @@ impl Block {
     }
     pub fn name(self) -> &'static str {
         match self {
+            Self::Water | Self::FlowingWater(_) => "Water",
+            Self::Lava | Self::FlowingLava(_) => "Lava",
+            Self::Obsidian => "Obsidian",
             Self::Shrub => "Shrub",
             Self::TallGrass => "Tall grass",
             Self::RedFlower => "Red flower",
@@ -236,6 +267,7 @@ pub struct Edit {
 pub struct World {
     pub seed: u64,
     pub edits: BTreeMap<[i32; 3], Block>,
+    pub fluid_pending: std::collections::BTreeSet<[i32; 3]>,
     pub torch_mounts: BTreeMap<[i32; 3], [i32; 3]>,
     chunks: HashMap<IVec3, Box<[Block]>>,
     pending: VecDeque<IVec3>,
@@ -290,6 +322,7 @@ impl World {
             seed,
             edits: BTreeMap::new(),
             torch_mounts: BTreeMap::new(),
+            fluid_pending: Default::default(),
             chunks: HashMap::new(),
             pending: VecDeque::new(),
             dirty: vec![],
@@ -474,6 +507,9 @@ impl World {
                 return Block::Air;
             }
         }
+        if let Some(pool) = self.pool_block(p, height) {
+            return pool;
+        }
         if p.y > MIN_Y + 3 && cave.is_some_and(|(lo, hi)| (lo..=hi).contains(&p.y)) {
             return Block::Air;
         }
@@ -599,6 +635,7 @@ impl World {
         if !b.dirt() && self.get(p + IVec3::Y).plant() {
             self.set(p + IVec3::Y, Block::Air);
         }
+        self.wake_fluid(p);
         self.edits.insert(p.to_array(), b);
         if b != Block::Torch {
             self.torch_mounts.remove(&p.to_array());
@@ -648,7 +685,9 @@ impl World {
             .into_iter()
             .map(IVec3::from_array)
             .filter(|&p| {
-                if self.get(p) != Block::Dirt || self.get(p + IVec3::Y).solid() {
+                if self.get(p) != Block::Dirt
+                    || (self.get(p + IVec3::Y).solid() || self.get(p + IVec3::Y).fluid().is_some())
+                {
                     return false;
                 }
                 [IVec3::X, IVec3::NEG_X, IVec3::Z, IVec3::NEG_Z]
@@ -760,6 +799,17 @@ impl World {
                 continue;
             }
             self.pending.retain(|k| *k != result.key);
+            for (i, b) in result.blocks.iter().enumerate() {
+                if b.fluid().is_some() {
+                    let p = result.key * SIZE
+                        + IVec3::new(
+                            i as i32 % SIZE,
+                            i as i32 / (SIZE * SIZE),
+                            i as i32 / SIZE % SIZE,
+                        );
+                    self.fluid_pending.insert(p.to_array());
+                }
+            }
             self.chunks.insert(result.key, result.blocks);
             self.meshes.push((result.key, result.mesh));
         }
@@ -817,6 +867,15 @@ impl World {
         self.chunks.len()
     }
     pub fn raycast(&self, origin: Vec3, dir: Vec3, reach: f32) -> Option<(IVec3, IVec3)> {
+        self.raycast_fluid(origin, dir, reach, false)
+    }
+    pub fn raycast_fluid(
+        &self,
+        origin: Vec3,
+        dir: Vec3,
+        reach: f32,
+        sources: bool,
+    ) -> Option<(IVec3, IVec3)> {
         if dir.length_squared() < 0.0001 {
             return None;
         }
@@ -867,6 +926,8 @@ impl World {
         loop {
             let block = self.get(p);
             if block != Block::Air
+                && (block.fluid().is_none()
+                    || (sources && matches!(block, Block::Water | Block::Lava)))
                 && (!block.plant() || plant_hit(self.seed, p, block, origin, dir, reach))
             {
                 return Some((p, prev));

@@ -18,7 +18,7 @@ The player approved deterministic seeded chunk streaming and persistent player s
 
 ## Slice boundaries and evolution
 
-Advanced metallurgy, magic/gems, breeding, quests, fluid simulation, logistics, electricity, automation, extra biomes and multiplayer are future work. Existing station/recipe/item registries and separate simulation should accommodate them. The slice has finite render distance but not a finite horizontal map. Terrain generation and CPU meshing run on bounded background workers using immutable jobs. Stream planning and GPU uploads remain on the main thread. Save format versions reject unsupported data rather than silently discarding it.
+Advanced metallurgy, magic/gems, breeding, quests, logistics, electricity, automation, extra biomes and multiplayer are future work. Existing station/recipe/item registries and separate simulation should accommodate them. The slice has finite render distance but not a finite horizontal map. Terrain generation and CPU meshing run on bounded background workers using immutable jobs. Stream planning and GPU uploads remain on the main thread. Save format versions reject unsupported data rather than silently discarding it.
 
 ## Validation
 
@@ -692,3 +692,81 @@ Future biomes may have differently colored dirt blocks. These variants should
 function like ordinary dirt, including plant support, grass cover, digging and
 placement behavior. Color is a biome distinction rather than a separate soil
 mechanic. Biome-specific dirt colors are planned, not implemented yet.
+
+
+## Water, lava and buckets
+
+`fluid` adds source-driven discrete fluids. Water and lava are non-solid blocks;
+source variants and flowing variants (levels 1–7, or 8 for falling columns) are
+ordinary serialized block edits. Each 0.2 active seconds, at most 512 nearby
+frontier entries and their six neighbors are evaluated against the old world,
+then changes commit together through `World::set`. Lava advances every third
+pulse (0.6 seconds). Water loses one level per horizontal step, reaching seven
+blocks; lava loses two, reaching three blocks. Downward flow retains its strength.
+Horizontal flow needs support beneath its supplying neighbor, so waterfalls
+continue down before spreading. Removing sources or building dams wakes adjacent
+cells and disconnected flow decays away. Flow replaces plants and extinguishes
+torches; solid blocks contain it and can replace it through normal placement.
+
+Water becomes a source with at least two horizontal source neighbors and a solid
+block or water source below. This includes filling an empty supported cell and
+restoring a scooped corner of a 2×2 pool. Diagonal/vertical neighbors do not count;
+lava never renews. Contact on any face converts a lava source to Obsidian and
+flowing lava to Cobble. Obsidian is placeable and requires an iron pickaxe to
+harvest. This is an approximation of Minecraft-style behavior: no conserved
+volume, pressure, slope-search routing, fluid currents, waterlogging, fire
+spread or exact edition-specific water/lava reaction rules.
+
+The ordered frontier provides deterministic bounded work. Cells beyond 64 blocks
+on any axis sleep until approached. Changed blocks wake themselves and six
+neighbors; accepting streamed chunks seeds their fluid cells. Loading a save
+rebuilds the frontier around saved edits. Settled fluids require no ongoing full
+world scan. Streamed meshes retain ordinary edit revision checks. A growing flow
+can invalidate in-flight mesh work; a pulse is not guaranteed to process every
+active cell during large changes. Simulation timers and player breath reset on
+reload; fluid blocks and bucket contents persist. Save version stays v3, legacy
+26-entry craft histories expand, and invalid fluid levels are rejected.
+
+Deterministic 64-block cells occasionally contain small flat, stone-lined pools
+of water or lava on gentle surfaces. Pools remain outside the protected spawn
+area, share direct/halo sampling, and use ordinary fluid sources. As with other
+terrain additions, untouched terrain changes in existing worlds while edits win.
+There are no oceans, rivers or underground lava lakes yet.
+
+Crafting-table bucket recipes use three planks, copper ingots or iron ingots in
+a V. Each bucket occupies one slot and carries one source block. Right-click an
+exposed source to scoop it, or a surface to pour it next to the hit face. Flowing
+blocks cannot be scooped. Wood and copper carry water; iron carries water or lava.
+Bucket eligibility and empty/filled variants live in `items`, ready for future
+metals when their material progression is added. Craft indices are appended.
+Inventory icons and held geometry distinguish bucket material and contents.
+
+Players move more slowly in fluid; drag limits falling speed, Space swims upward,
+and landing in fluid avoids fall damage. Submersion follows the rendered fluid
+height. An underwater eye consumes a 15-second air reserve; exhaustion deals
+8 damage/second, and air recovers at five seconds per second above water. Lava
+contact deals 25 damage/second. HUD overlays tint submerged views and show air.
+Creature swimming, drowning and fluid effects on loose items remain future work.
+
+Water uses a separate alpha-blended pass with depth testing and no depth writes,
+after opaque terrain. Chunk buffers partition opaque and fluid vertex ranges;
+fluid chunks draw from far to near. Faces shared by equal-height fluid cells are
+culled; flow levels lower exposed surfaces. The shader adds ripples; lava is
+opaque/emissive in this pass and supplies nearby warm lights through the existing
+16-light budget. Exposed lava is grouped into four-block cells to avoid stacking
+a light for every voxel; each group uses strength 0.22. Lava light also suppresses
+nearby hostile spawning. Fluids transmit sky light and cast no shadow. Chunk sorting is
+an approximation: transparent faces within a chunk are not sorted individually,
+and there is no refraction or reflection simulation.
+
+Validation: 101 quiet nextest tests pass, including seven-block range across
+chunk boundaries, gravity, draining, dams, slower/shorter lava, contact reactions,
+supported source regeneration and 2×2 refilling, sleeping distant frontiers,
+height-aware submersion, natural-pool halo agreement, bucket gameplay for all
+three materials, swimming/damage, mesh surfaces, saved fluids/buckets and legacy
+craft-history migration. Short-format Clippy and the gameplay/save smoke pass.
+The offscreen Vulkan renderer also completes with the new fluid pipelines.
+A captured side-by-side water/lava basin was visually inspected, including the
+transparent water, lava surface, bucket icon and held bucket. The first capture
+exposed excessive light stacking; grouping/reducing lava lights corrected it in
+a second inspected capture. Interactive swimming has not been manually played.

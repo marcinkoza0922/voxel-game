@@ -4,6 +4,7 @@ mod ecs;
 #[path = "../tools/expedition.rs"]
 mod expedition;
 mod feedback;
+mod fluid;
 mod game;
 #[path = "../tools/headless.rs"]
 mod headless;

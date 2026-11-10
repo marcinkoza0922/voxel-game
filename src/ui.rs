@@ -164,6 +164,22 @@ impl Ui {
                 }
             }
         }
+        if let Some((lava, _)) = g.world.fluid_at(g.player.eye()) {
+            self.rect(
+                0.,
+                0.,
+                w,
+                h,
+                if lava {
+                    [0.8, 0.12, 0.01, 0.65]
+                } else {
+                    [0.04, 0.22, 0.52, 0.26]
+                },
+            );
+        }
+        if g.breath < 15. {
+            self.text(22., 112., &format!("Air {:.0}s", g.breath), 1.5, INK);
+        }
         self.rect(20., 20., 260., 86., PANEL);
         self.text(32., 31., g.biome().name(), 1.8, INK);
         self.text(
@@ -273,10 +289,11 @@ impl Ui {
             Planks | Table => [0.73, 0.51, 0.27, 1.],
             Dirt => [0.48, 0.30, 0.19, 1.],
             Cobble | CopperOre | Furnace | StoneAxe | StonePick => [0.57, 0.61, 0.62, 1.],
-            CopperIngot | CopperAxe | CopperPick | Sword => [0.84, 0.45, 0.25, 1.],
-            IronOre | IronIngot | IronAxe | IronPick | IronSword | Smelter => {
-                [0.72, 0.77, 0.81, 1.]
+            CopperBucket | CopperWaterBucket | CopperIngot | CopperAxe | CopperPick | Sword => {
+                [0.84, 0.45, 0.25, 1.]
             }
+            IronBucket | IronWaterBucket | IronLavaBucket | IronOre | IronIngot | IronAxe
+            | IronPick | IronSword | Smelter => [0.72, 0.77, 0.81, 1.],
             Coal => [0.18, 0.20, 0.24, 1.],
             Berries => [0.85, 0.22, 0.34, 1.],
             Meat => [0.84, 0.41, 0.37, 1.],
@@ -306,7 +323,14 @@ impl Ui {
                 };
                 let handle = tool && (7..9).contains(&px) && (5..15).contains(&py);
                 let stem = flower.is_some() && (7..9).contains(&px) && (7..15).contains(&py);
-                let filled = if flower.is_some() {
+                let bucket = item.bucket();
+                let filled = if bucket {
+                    ((3..13).contains(&px)
+                        && (6..14).contains(&py)
+                        && (px <= 4 || px >= 11 || py >= 12 || item.bucket_contents().is_some()))
+                        || ((4..12).contains(&px) && py == 2)
+                        || ((px == 3 || px == 12) && (3..7).contains(&py))
+                } else if flower.is_some() {
                     stem || ((4..12).contains(&px)
                         && (2..9).contains(&py)
                         && ((6..10).contains(&px) || (4..7).contains(&py)))
@@ -340,6 +364,14 @@ impl Ui {
                 } else {
                     color
                 };
+                if bucket
+                    && (5..11).contains(&px)
+                    && (6..12).contains(&py)
+                    && let Some(fluid) = item.bucket_contents()
+                {
+                    let f = fluid.color();
+                    c = [f[0], f[1], f[2], 1.];
+                }
                 if item == Torch && py < 6 {
                     c = [1., 0.73, 0.20, 1.];
                 }

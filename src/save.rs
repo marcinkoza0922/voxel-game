@@ -145,7 +145,7 @@ pub fn read(path: &Path) -> Result<Option<Game>, String> {
         _ => return Err(format!("Unsupported save version {}", value["version"])),
     }
     if let Some(crafts) = value["player"]["crafts"].as_array_mut()
-        && matches!(crafts.len(), 15 | 20)
+        && matches!(crafts.len(), 15 | 20 | 26)
     {
         crafts.resize(RECIPES.len(), 0.into());
     }
@@ -178,7 +178,14 @@ pub fn read(path: &Path) -> Result<Option<Game>, String> {
         return Err("Save contains invalid player state".into());
     }
     if save.edits.iter().any(|e| {
-        !(MIN_Y + 1..=MAX_Y).contains(&e.pos[1])
+        e.block.fluid().is_some_and(|(_, n)| {
+            n > 8
+                || (n == 0
+                    && !matches!(
+                        e.block,
+                        crate::world::Block::Water | crate::world::Block::Lava
+                    ))
+        }) || !(MIN_Y + 1..=MAX_Y).contains(&e.pos[1])
             || e.pos[0].unsigned_abs() > 10_000_000
             || e.pos[2].unsigned_abs() > 10_000_000
     }) {
@@ -205,6 +212,9 @@ pub fn read(path: &Path) -> Result<Option<Game>, String> {
     g.drops = save.drops;
     g.time = save.time;
     g.world.edits = save.edits.into_iter().map(|e| (e.pos, e.block)).collect();
+    for p in g.world.edits.keys().copied().collect::<Vec<_>>() {
+        g.world.wake_fluid(glam::IVec3::from_array(p));
+    }
     if save.version < 3 && !save.furnaces.is_empty() {
         return Err("Legacy save contains unsupported placed furnace state".into());
     }
@@ -657,6 +667,55 @@ mod vegetation_tests {
             loaded.player.inventory.cursor,
             Some(Stack::new(Item::BlueDye, 1))
         );
+        fs::remove_file(path).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod fluid_tests {
+    use super::*;
+    use crate::{
+        items::{Item, Stack},
+        world::Block,
+    };
+    use glam::IVec3;
+    #[test]
+    fn fluid_states_buckets_and_legacy_craft_history_survive_reload() {
+        let path =
+            std::env::temp_dir().join(format!("voxel-fluid-save-{}.json", std::process::id()));
+        let mut g = Game::new(41);
+        for (x, b) in [
+            Block::Water,
+            Block::FlowingWater(4),
+            Block::Lava,
+            Block::FlowingLava(8),
+            Block::Obsidian,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            g.world.set(IVec3::new(x as i32, 200, 0), b);
+        }
+        g.player.inventory.slots[0] = Some(Stack::new(Item::CopperWaterBucket, 1));
+        g.player.inventory.slots[1] = Some(Stack::new(Item::IronLavaBucket, 1));
+        write(&g, &path).unwrap();
+        let loaded = read(&path).unwrap().unwrap();
+        assert_eq!(g.world.edits, loaded.world.edits);
+        assert_eq!(g.player.inventory, loaded.player.inventory);
+        assert!(!loaded.world.fluid_pending.is_empty());
+        let mut legacy: serde_json::Value = serde_json::from_slice(&encode(&g).unwrap()).unwrap();
+        legacy["player"]["crafts"]
+            .as_array_mut()
+            .unwrap()
+            .truncate(26);
+        fs::write(&path, serde_json::to_vec(&legacy).unwrap()).unwrap();
+        assert_eq!(
+            read(&path).unwrap().unwrap().player.crafts.len(),
+            RECIPES.len()
+        );
+        legacy["edits"][0]["block"] = serde_json::json!({"FlowingWater":255});
+        fs::write(&path, serde_json::to_vec(&legacy).unwrap()).unwrap();
+        assert!(read(&path).is_err());
         fs::remove_file(path).unwrap();
     }
 }

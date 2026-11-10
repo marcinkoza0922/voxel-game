@@ -24,7 +24,7 @@ Existing files are preserved.
 | WASD / mouse | Walk / look |
 | Space / Left Shift | Jump / sprint |
 | Hold left mouse | Mine or attack |
-| Right mouse | Place selected block, eat selected food, or use bed |
+| Right mouse | Place a block, scoop/pour a bucket, eat food, or use a bed |
 | 1–9 / mouse wheel | Select hotbar slot |
 | E | Open/close pack, recipes, and attributes |
 | Left-click / drag a slot | Pick up, move, merge, or swap stacks |
@@ -37,6 +37,13 @@ Existing files are preserved.
 | Esc | Pause menu; save and quit |
 
 Losing window focus pauses the game. The pack pauses movement and survival while furnaces continue processing. Autosave runs every 30 seconds of gameplay; closing the window saves too.
+
+Water and lava form small natural pools. At a crafting table, arrange three
+planks, copper ingots or iron ingots in a V to make a bucket. Right-click a
+source to collect it and right-click a surface to pour it. All three buckets
+carry water; lava requires iron. Flowing fluid cannot be collected. A supported
+2×2 water pool refills after scooping a corner. Hold Space to swim up, watch your
+air underwater, and avoid lava.
 
 ## First expedition
 

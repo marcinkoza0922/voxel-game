@@ -45,8 +45,16 @@ pub enum Item {
     WhiteDye,
     PinkDye,
     BlueDye,
+    WoodBucket,
+    CopperBucket,
+    IronBucket,
+    WoodWaterBucket,
+    CopperWaterBucket,
+    IronWaterBucket,
+    IronLavaBucket,
+    Obsidian,
 }
-pub const ITEMS: [Item; 41] = [
+pub const ITEMS: [Item; 49] = [
     Item::Log,
     Item::Planks,
     Item::Stick,
@@ -88,6 +96,14 @@ pub const ITEMS: [Item; 41] = [
     Item::WhiteDye,
     Item::PinkDye,
     Item::BlueDye,
+    Item::WoodBucket,
+    Item::CopperBucket,
+    Item::IronBucket,
+    Item::WoodWaterBucket,
+    Item::CopperWaterBucket,
+    Item::IronWaterBucket,
+    Item::IronLavaBucket,
+    Item::Obsidian,
 ];
 pub const FLOWER_ITEMS: [Item; 6] = [
     Item::RedFlower,
@@ -106,6 +122,44 @@ pub const DYE_ITEMS: [Item; 6] = [
     Item::BlueDye,
 ];
 impl Item {
+    pub fn bucket(self) -> bool {
+        matches!(
+            self,
+            Self::WoodBucket
+                | Self::CopperBucket
+                | Self::IronBucket
+                | Self::WoodWaterBucket
+                | Self::CopperWaterBucket
+                | Self::IronWaterBucket
+                | Self::IronLavaBucket
+        )
+    }
+    pub fn bucket_contents(self) -> Option<Block> {
+        match self {
+            Self::WoodWaterBucket | Self::CopperWaterBucket | Self::IronWaterBucket => {
+                Some(Block::Water)
+            }
+            Self::IronLavaBucket => Some(Block::Lava),
+            _ => None,
+        }
+    }
+    pub fn empty_bucket(self) -> Self {
+        match self {
+            Self::WoodWaterBucket => Self::WoodBucket,
+            Self::CopperWaterBucket => Self::CopperBucket,
+            Self::IronWaterBucket | Self::IronLavaBucket => Self::IronBucket,
+            _ => self,
+        }
+    }
+    pub fn fill_bucket(self, fluid: Block) -> Option<Self> {
+        match (self, fluid) {
+            (Self::WoodBucket, Block::Water) => Some(Self::WoodWaterBucket),
+            (Self::CopperBucket, Block::Water) => Some(Self::CopperWaterBucket),
+            (Self::IronBucket, Block::Water) => Some(Self::IronWaterBucket),
+            (Self::IronBucket, Block::Lava) => Some(Self::IronLavaBucket),
+            _ => None,
+        }
+    }
     pub fn flower_index(self) -> Option<usize> {
         FLOWER_ITEMS.iter().position(|i| *i == self)
     }
@@ -114,6 +168,14 @@ impl Item {
     }
     pub fn name(self) -> &'static str {
         match self {
+            Self::WoodBucket => "Wood bucket",
+            Self::CopperBucket => "Copper bucket",
+            Self::IronBucket => "Iron bucket",
+            Self::WoodWaterBucket => "Wood water bucket",
+            Self::CopperWaterBucket => "Copper water bucket",
+            Self::IronWaterBucket => "Iron water bucket",
+            Self::IronLavaBucket => "Iron lava bucket",
+            Self::Obsidian => "Obsidian",
             Self::WheatSeeds => "Wheat seeds",
             Self::RedFlower => "Red flower",
             Self::YellowFlower => "Yellow flower",
@@ -165,6 +227,7 @@ impl Item {
             Self::WhiteFlower => Block::WhiteFlower,
             Self::PinkFlower => Block::PinkFlower,
             Self::BlueFlower => Block::BlueFlower,
+            Self::Obsidian => Block::Obsidian,
             Self::Log => Block::Log,
             Self::Planks => Block::Planks,
             Self::Dirt => Block::Dirt,
@@ -220,7 +283,11 @@ impl Stack {
         }
     }
     pub fn limit(item: Item) -> u32 {
-        if item.durability() > 0 { 1 } else { 64 }
+        if item.durability() > 0 || item.bucket() {
+            1
+        } else {
+            64
+        }
     }
 }
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -716,6 +783,27 @@ pub const RECIPES: &[Recipe] = &[
         station: Station::Hand,
         xp: 6,
     },
+    Recipe {
+        output: WoodBucket,
+        amount: 1,
+        inputs: &[(Planks, 3)],
+        station: Station::Table,
+        xp: 12,
+    },
+    Recipe {
+        output: CopperBucket,
+        amount: 1,
+        inputs: &[(CopperIngot, 3)],
+        station: Station::Table,
+        xp: 12,
+    },
+    Recipe {
+        output: IronBucket,
+        amount: 1,
+        inputs: &[(IronIngot, 3)],
+        station: Station::Table,
+        xp: 12,
+    },
 ];
 pub fn craft(
     inv: &mut Inventory,
@@ -791,6 +879,7 @@ mod tests {
 /// Compact row-major patterns; spaces are required empty cells.
 pub fn pattern(index: usize) -> (&'static str, usize) {
     match index {
+        26..=28 => ("M M M ", 3),
         20..=25 => ("F", 1),
         0 => ("L", 1),
         1 => ("PP", 1),
@@ -819,7 +908,8 @@ fn ingredient(index: usize, c: char) -> Option<Item> {
             Item::Coal
         }),
         'M' => Some(match index {
-            3 | 4 => Item::Planks,
+            3 | 4 | 26 => Item::Planks,
+            28 => Item::IronIngot,
             7..=9 | 15 => Item::Cobble,
             17..=19 => Item::IronIngot,
             _ => Item::CopperIngot,
