@@ -19,6 +19,7 @@ pub struct Native {
     pub motion: wgpu::TextureView,
     pub linear_depth: wgpu::TextureView,
     mode: u8,
+    quality: crate::settings::UpscaleQuality,
     size: (u32, u32),
     display: (u32, u32),
     pub dlss_status: String,
@@ -53,6 +54,7 @@ impl Native {
                 "Native linear depth",
             ),
             mode: 0,
+            quality: crate::settings::UpscaleQuality::Custom,
             size: (0, 0),
             display: (0, 0),
             dlss_status,
@@ -61,11 +63,16 @@ impl Native {
     pub fn configure(
         &mut self,
         mode: u8,
+        quality: crate::settings::UpscaleQuality,
         size: (u32, u32),
         display: (u32, u32),
         queue: &wgpu::Queue,
     ) -> Result<(), String> {
-        if mode == self.mode && size == self.size && display == self.display {
+        if mode == self.mode
+            && quality == self.quality
+            && size == self.size
+            && display == self.display
+        {
             return Ok(());
         }
         self.device
@@ -96,18 +103,24 @@ impl Native {
         match mode {
             1 => {
                 let sdk = self.sdk.as_ref().ok_or_else(|| self.dlss_status.clone())?;
-                let quality = if size == display {
-                    DlssPerfQualityMode::Dlaa
-                } else if size.0 as f32 / display.0 as f32 >= 0.6 {
-                    DlssPerfQualityMode::Quality
-                } else if size.0 as f32 / display.0 as f32 >= 0.55 {
-                    DlssPerfQualityMode::Balanced
-                } else {
-                    DlssPerfQualityMode::Performance
+                use crate::settings::UpscaleQuality;
+                let dlss_quality = match quality {
+                    UpscaleQuality::Quality => DlssPerfQualityMode::Quality,
+                    UpscaleQuality::Balanced => DlssPerfQualityMode::Balanced,
+                    UpscaleQuality::Performance => DlssPerfQualityMode::Performance,
+                    UpscaleQuality::Native => DlssPerfQualityMode::Dlaa,
+                    UpscaleQuality::Custom if size == display => DlssPerfQualityMode::Dlaa,
+                    UpscaleQuality::Custom if size.0 as f32 / display.0 as f32 >= 0.6 => {
+                        DlssPerfQualityMode::Quality
+                    }
+                    UpscaleQuality::Custom if size.0 as f32 / display.0 as f32 >= 0.55 => {
+                        DlssPerfQualityMode::Balanced
+                    }
+                    UpscaleQuality::Custom => DlssPerfQualityMode::Performance,
                 };
                 let context = DlssSuperResolution::new(
                     UVec2::new(display.0, display.1),
-                    quality,
+                    dlss_quality,
                     DlssFeatureFlags::HighDynamicRange
                         | DlssFeatureFlags::LowResolutionMotionVectors
                         | DlssFeatureFlags::AutoExposure,
@@ -165,6 +178,7 @@ impl Native {
         self.size = size;
         self.display = display;
         self.mode = mode;
+        self.quality = quality;
         Ok(())
     }
     fn destroy_fsr(&mut self) {

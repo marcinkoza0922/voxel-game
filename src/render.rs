@@ -670,7 +670,9 @@ impl Renderer {
     pub fn apply_settings(&mut self, settings: &crate::settings::Settings) -> Result<(), String> {
         let size_changed = self.settings.render_size(self.width, self.height)
             != settings.render_size(self.width, self.height);
-        if self.settings.upscaler != settings.upscaler {
+        if self.settings.upscaler != settings.upscaler
+            || self.settings.upscale_quality != settings.upscale_quality
+        {
             self.temporal.valid = false;
         }
         if self.settings.taa != settings.taa {
@@ -700,6 +702,7 @@ impl Renderer {
         {
             self.native.configure(
                 self.settings.upscaler,
+                self.settings.upscale_quality,
                 self.temporal.size,
                 (self.width, self.height),
                 &self.queue,

@@ -850,6 +850,17 @@ are passed to the game, for example `tools/run-native.sh --release --new`.
 Selecting SDK upscalers in a build without the feature reports why unavailable
 and retains the working renderer. Unsupported GPUs/runtimes and invalid SDK
 render ranges are similarly reported instead of silently claiming SDK rendering.
+The upscaler quality row cycles Quality (1/1.5 output dimensions), Balanced
+(1/1.7), Performance (1/2), Native AA (1/1; DLAA for DLSS), and Custom.
+Named presets derive world resolution directly from the output, rounding each
+axis to the nearest pixel. They select the corresponding DLSS SDK mode; FSR 2
+uses the resulting input dimensions. The manual resolution/scale rows are
+marked Custom while a named preset is active; editing either selects Custom
+and uses both saved manual values. Enabling an upscaler starts at Quality.
+Legacy settings without a quality field load as Custom to preserve their size.
+The quality row is disabled while upscaling is off. Changes recreate SDK
+contexts and reset temporal history, including when pixel sizes happen to match.
+
 An SDK upscaler replaces the built-in TAA resolve; the AA row displays the
 selected SDK and disables the separate TAA toggle. Supersampling above output size is
 not supported by these native paths.
@@ -868,7 +879,7 @@ FSR 2 uses the `fsr`/`fsr-sys` bindings and their bundled native Vulkan backend
 and shader permutations.
 
 `src/native_upscale.rs` owns SDK contexts, validates render ranges, chooses a
-DLSS quality mode for the selected scale, dispatches SDK work inside the wgpu
+DLSS quality mode from the selected preset (or infers it from Custom scale), dispatches SDK work inside the wgpu
 Vulkan encoder and waits for GPU completion before context replacement or
 destruction. Explicit wgpu resource transitions keep external SDK layouts
 consistent. A full-screen pass copies world device depth to R32F so SDK input

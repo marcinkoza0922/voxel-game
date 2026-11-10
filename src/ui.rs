@@ -376,10 +376,10 @@ impl Ui {
                 let settings = self.settings.clone();
                 for (n, label) in settings.labels().iter().enumerate() {
                     self.button(
-                        [x, 190. + n as f32 * 47., 440., 39.],
+                        [x, 180. + n as f32 * 42., 440., 35.],
                         label,
                         Action::Setting(n as u8),
-                        n != 0 || settings.upscaler == 0,
+                        (n != 0 || settings.upscaler == 0) && (n != 8 || settings.upscaler != 0),
                     );
                 }
                 let output = (
