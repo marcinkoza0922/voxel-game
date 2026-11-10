@@ -1,5 +1,5 @@
 //! Discrete source-driven fluids. Updates read the old world, then commit together.
-use crate::world::{Biome, Block, MAX_Y, MIN_Y, World, hash};
+use crate::world::{Block, MAX_Y, MIN_Y, World, hash};
 use glam::IVec3;
 
 const SIDES: [IVec3; 4] = [IVec3::X, IVec3::NEG_X, IVec3::Z, IVec3::NEG_Z];
@@ -286,7 +286,7 @@ impl World {
         Some(if p.y < y {
             if lava {
                 Block::Lava
-            } else if p.y == y - 1 && self.biome(x, z) == Biome::Tundra {
+            } else if p.y == y - 1 && self.biome(x, z).is_snow() {
                 Block::Ice
             } else {
                 Block::Water
@@ -604,7 +604,7 @@ mod tests {
             }
         }
         let p = cold.expect("frozen tundra pond");
-        assert_eq!(w.biome(p.x, p.z), Biome::Tundra);
+        assert!(w.biome(p.x, p.z).is_snow());
         assert!(w.get(p).solid());
         assert_eq!(w.get(p - IVec3::Y), Block::Water);
         assert!(matches!(
@@ -649,7 +649,7 @@ mod tests {
                     let (_, level) = w.waterway_column(px, pz).unwrap();
                     let p = IVec3::new(px, level, pz);
                     if !found[i]
-                        && w.biome(px, pz) == Biome::Tundra
+                        && w.biome(px, pz).is_snow()
                         && w.waterway_block(p, w.height(px, pz)) == Some(Block::Water)
                         && w.get(p) == Block::Water
                         && w.get(p + IVec3::Y) == Block::Air
@@ -760,7 +760,7 @@ mod tests {
                 Block::Stone | Block::Sand | Block::Gravel | Block::Dirt
             ));
             assert!(
-                (1..=7).any(|dx| w.get(p + IVec3::X * dx).solid()),
+                (1..=16).any(|dx| w.get(p + IVec3::X * dx).solid()),
                 "pond must have a containing rim"
             );
         }

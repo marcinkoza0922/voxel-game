@@ -255,13 +255,40 @@ pub enum Biome {
     Grassland,
     Forest,
     Tundra,
+    GrasslandHills,
+    GrasslandMountains,
+    GrasslandMegaMountains,
+    SnowHills,
+    SnowMountains,
+    SnowMegaMountains,
 }
 impl Biome {
+    pub fn is_snow(self) -> bool {
+        matches!(
+            self,
+            Self::Tundra | Self::SnowHills | Self::SnowMountains | Self::SnowMegaMountains
+        )
+    }
+    pub fn is_grassland(self) -> bool {
+        matches!(
+            self,
+            Self::Grassland
+                | Self::GrasslandHills
+                | Self::GrasslandMountains
+                | Self::GrasslandMegaMountains
+        )
+    }
     pub fn name(self) -> &'static str {
         match self {
             Self::Grassland => "Grasslands",
             Self::Forest => "Oak forest",
             Self::Tundra => "Tundra",
+            Self::GrasslandHills => "Grassland hills",
+            Self::GrasslandMountains => "Grassland mountains",
+            Self::GrasslandMegaMountains => "Grassland mega mountains",
+            Self::SnowHills => "Snow hills",
+            Self::SnowMountains => "Snow mountains",
+            Self::SnowMegaMountains => "Snow mega mountains",
         }
     }
 }
@@ -422,7 +449,7 @@ impl World {
             meshes: vec![],
         }
     }
-    pub fn biome(&self, x: i32, z: i32) -> Biome {
+    fn climate(&self, x: i32, z: i32) -> Biome {
         if (x as f64).hypot(z as f64) > 240.
             && noise(self.seed ^ 7621, x as f32 / 320., z as f32 / 320.) > 0.52
         {
@@ -434,16 +461,46 @@ impl World {
             Biome::Grassland
         }
     }
+    // One continuous regional field controls both biome names and terrain relief.
+    fn relief(&self, x: i32, z: i32) -> f32 {
+        let distance = (x as f32).hypot(z as f32);
+        noise(self.seed ^ 914, x as f32 / 650., z as f32 / 650.)
+            * smooth(((distance - 100.) / 500.).clamp(0., 1.))
+    }
+    pub fn biome(&self, x: i32, z: i32) -> Biome {
+        let climate = self.climate(x, z);
+        let relief = self.relief(x, z);
+        match (climate, relief) {
+            (Biome::Grassland, r) if r >= 0.94 => Biome::GrasslandMegaMountains,
+            (Biome::Grassland, r) if r >= 0.72 => Biome::GrasslandMountains,
+            (Biome::Grassland, r) if r >= 0.40 => Biome::GrasslandHills,
+            (Biome::Tundra, r) if r >= 0.94 => Biome::SnowMegaMountains,
+            (Biome::Tundra, r) if r >= 0.72 => Biome::SnowMountains,
+            (Biome::Tundra, r) if r >= 0.40 => Biome::SnowHills,
+            _ => climate,
+        }
+    }
     pub fn height(&self, x: i32, z: i32) -> i32 {
+        let relief = self.relief(x, z);
+        let snow = self.climate(x, z) == Biome::Tundra;
         let x = x as f32;
         let z = z as f32;
-        let hills =
-            noise(self.seed, x / 90., z / 90.) * 22. + noise(self.seed ^ 15, x / 25., z / 25.) * 5.;
-        let ridge = (noise(self.seed ^ 914, x / 650., z / 650.) - 0.52).max(0.) * 2.1;
-        // A gentle spawn region grows into mountains hundreds of blocks high.
-        let distance = (x * x + z * z).sqrt();
-        let inland =
-            24. + hills + ridge.powf(1.7) * 750. * ((distance - 100.).max(0.) / 500.).min(1.);
+        let blend = |lo: f32, hi: f32| smooth(((relief - lo) / (hi - lo)).clamp(0., 1.));
+        // Forests retain ordinary rolling relief; cold and grassland regions can
+        // grow into mountains. Fade this allowance across forest boundaries.
+        let forest = noise(self.seed ^ 456, x / 110., z / 110.);
+        let mountain_allowance = if snow {
+            1.
+        } else {
+            1. - smooth(((forest - 0.43) / 0.10).clamp(0., 1.))
+        };
+        let amplitude = 3.
+            + blend(0.40, 0.60) * 33.
+            + mountain_allowance * (blend(0.72, 0.90) * 260. + blend(0.94, 1.) * 1050.);
+        let detail = noise(self.seed, x / 90., z / 90.) * 0.8
+            + noise(self.seed ^ 15, x / 25., z / 25.) * 0.2;
+        let distance = x.hypot(z);
+        let inland = 30. + amplitude * (0.35 + detail * 0.65);
         let exposure = smooth(((distance - 192.) / 256.).clamp(0., 1.));
         let continent = noise(self.seed ^ 0x736561, x / 1200., z / 1200.);
         // Bound individual ocean basins instead of only changing their frequency.
@@ -468,14 +525,15 @@ impl World {
         // Higher terrain needs wider valley shoulders to avoid narrow wall-like banks.
         let shoulder = (0.035 + (terrain - SEA_LEVEL as f32).max(0.) * 0.0005).min(0.16);
         let river = smooth(((0.018 + shoulder - channel) / shoulder).clamp(0., 1.)) * exposure;
-        (terrain - (terrain - (SEA_LEVEL - 4) as f32).max(0.) * river) as i32
+        ((terrain - (terrain - (SEA_LEVEL - 4) as f32).max(0.) * river) as i32)
+            .clamp(MIN_Y + 1, MAX_Y - 16)
     }
     /// One stable candidate per 256-block cell; only gentle tundra sites survive.
     pub fn ruin_in_cell(&self, x: i32, z: i32) -> Option<IVec3> {
         let h = hash(self.seed ^ 91283, x, 0, z);
         let cx = x * 256 + 48 + (h % 160) as i32;
         let cz = z * 256 + 48 + ((h >> 16) % 160) as i32;
-        if self.biome(cx, cz) != Biome::Tundra {
+        if !self.biome(cx, cz).is_snow() {
             return None;
         }
         let y = self.height(cx, cz);
@@ -510,7 +568,7 @@ impl World {
                     19
                 };
                 if h.is_multiple_of(chance)
-                    && self.biome(cx, cz) != Biome::Tundra
+                    && !self.biome(cx, cz).is_snow()
                     && (x - cx).abs() <= 3
                     && (z - cz).abs() <= 3
                 {
@@ -530,9 +588,9 @@ impl World {
                         && self
                             .pool_block(IVec3::new(cx, height, cz), height)
                             .is_none()
-                        && !self
-                            .cave_column(cx, cz)
-                            .is_some_and(|(lo, hi)| (lo..=hi).contains(&height))
+                        && !self.cave_column(cx, cz).is_some_and(|(lo, hi)| {
+                            (lo..=hi).contains(&height) || (lo..=hi).contains(&(height + 1))
+                        })
                     {
                         let d = (x - cx).pow(2) + (z - cz).pow(2);
                         if d < distance {
@@ -721,7 +779,7 @@ impl World {
             return Block::Air;
         }
         // Keep each formation inside its cell so neighboring outcrops stay separated.
-        if p.y >= height && p.y <= height + 4 && self.biome(p.x, p.z) == Biome::Grassland {
+        if p.y >= height && p.y <= height + 4 && self.biome(p.x, p.z).is_grassland() {
             let cx = p.x.div_euclid(48);
             let cz = p.z.div_euclid(48);
             let h = hash(self.seed ^ 0x726f636b, cx, 0, cz);
@@ -765,7 +823,7 @@ impl World {
                     return Block::Leaves;
                 }
             }
-            if p.y == height + 1 && self.biome(p.x, p.z) != Biome::Tundra {
+            if p.y == height + 1 && !self.biome(p.x, p.z).is_snow() {
                 return vegetation_block(self.seed, p - IVec3::Y);
             }
             return Block::Air;
@@ -774,7 +832,7 @@ impl World {
             return Block::Stone;
         }
         if p.y == height {
-            if self.biome(p.x, p.z) == Biome::Tundra {
+            if self.biome(p.x, p.z).is_snow() {
                 Block::Snow
             } else {
                 Block::Grass
@@ -1541,7 +1599,7 @@ mod tests {
             for z in -64..64 {
                 let p = IVec3::new(x, w.height(x, z) + 1, z);
                 if w.get(p) == Block::Stone {
-                    assert_eq!(w.biome(x, z), Biome::Grassland);
+                    assert!(w.biome(x, z).is_grassland());
                     rocks.push(p);
                 }
             }
@@ -1742,6 +1800,50 @@ mod tests {
         assert!(w.raycast(Vec3::new(0.5, 100.5, 0.5), Vec3::X, 1.).is_none());
     }
     #[test]
+    fn terrain_variants_are_bounded_and_mega_mountains_are_rare() {
+        let w = World::new(314159);
+        let mut counts = [0; 4];
+        let mut grass = [false; 4];
+        let mut snow = [false; 4];
+        let mut peaks = [i32::MIN; 4];
+        for x in (-32000..=32000).step_by(128) {
+            for z in (-32000..=32000).step_by(128) {
+                let biome = w.biome(x, z);
+                let tier = match biome {
+                    Biome::Grassland | Biome::Tundra => 0,
+                    Biome::GrasslandHills | Biome::SnowHills => 1,
+                    Biome::GrasslandMountains | Biome::SnowMountains => 2,
+                    Biome::GrasslandMegaMountains | Biome::SnowMegaMountains => 3,
+                    Biome::Forest => continue,
+                };
+                counts[tier] += 1;
+                grass[tier] |= biome.is_grassland();
+                snow[tier] |= biome.is_snow();
+                let height = w.height(x, z);
+                peaks[tier] = peaks[tier].max(height);
+                assert!((MIN_Y + 1..=MAX_Y - 16).contains(&height));
+                if tier == 0 {
+                    assert!(height <= 33);
+                }
+                if tier == 1 {
+                    assert!(height <= 66);
+                }
+                if tier == 2 {
+                    assert!(height <= 326);
+                }
+            }
+        }
+        assert!(grass.into_iter().all(|seen| seen));
+        assert!(snow.into_iter().all(|seen| seen));
+        assert!(counts[0] + counts[1] > counts[2] * 4);
+        assert!(counts[3] * 100 < counts.iter().sum::<usize>());
+        assert!(peaks[3] > peaks[2] && peaks[2] > peaks[1]);
+        // Flat terrain has only a few blocks of relief before water carving.
+        for x in -32..32 {
+            assert!((w.height(x + 1, 0) - w.height(x, 0)).abs() <= 1);
+        }
+    }
+    #[test]
     fn distant_mountains_exceed_legacy_world_heights() {
         let w = World::new(314159);
         let peak = (-8000..=8000)
@@ -1795,12 +1897,12 @@ mod expansion_tests {
     fn tundra_ruin_is_deterministic_accessible_and_matches_chunk_halo() {
         for seed in [1, 42, 314159] {
             let world = World::new(seed);
-            assert_ne!(world.biome(2, 2), Biome::Tundra);
+            assert!(!world.biome(2, 2).is_snow());
             let home = (-8..=8)
                 .find_map(|x| (-8..=8).find_map(|z| world.ruin_in_cell(x, z)))
                 .unwrap();
             let other = World::new(seed);
-            assert_eq!(world.biome(home.x, home.z), Biome::Tundra);
+            assert!(world.biome(home.x, home.z).is_snow());
             assert_eq!(other.nearby_ruin(home.x, home.z), Some(home));
             assert_eq!(world.get(home + IVec3::Y), Block::Reliquary);
             assert_eq!(world.get(home + IVec3::new(0, 1, 5)), Block::Air);
@@ -2314,7 +2416,7 @@ mod vegetation_physics_tests {
             for z in (-400..400).step_by(3) {
                 if let Some((tx, ty, tz)) = w.tree(x, z) {
                     if roots.insert((tx, tz)) {
-                        assert_ne!(w.biome(tx, tz), Biome::Tundra);
+                        assert!(!w.biome(tx, tz).is_snow());
                         assert_eq!(w.get(IVec3::new(tx, ty + 1, tz)), Block::Log);
                         heights.insert(5 + hash(w.seed ^ 0x74726565, tx, 0, tz) % 5);
                     }

@@ -38,8 +38,8 @@ Ingenuity (boosts crafting efficiency and quality)
 
 ### Biomes
 Should be a mix of normal, exotic, fantastic, and scary
-- Grasslands (plains, hills, mountains)
-- Tundra (plains, hills, mountains)
+- Grasslands (flat plains, hills, mountains, very rare mega mountains)
+- Tundra (flat plains, hills, mountains, very rare mega mountains)
 - Forests (with occasional groves)
 - Mushroom forests
 - Enchanted forests (should be very, very rare). Purple trees and magic springs and what not.

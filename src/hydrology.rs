@@ -1,5 +1,5 @@
 //! Seeded standalone lakes and contained lake-to-lake drainage.
-use crate::world::{Biome, Block, SEA_LEVEL, World, hash};
+use crate::world::{Block, SEA_LEVEL, World, hash};
 use glam::IVec3;
 use std::{
     collections::{BTreeMap, HashMap, VecDeque},
@@ -54,7 +54,7 @@ impl Column {
             if p.y == bed - 3 {
                 Block::Stone
             } else if p.y == bed && self.edge > 3. {
-                if world.biome(p.x, p.z) == Biome::Tundra {
+                if world.biome(p.x, p.z).is_snow() {
                     Block::Snow
                 } else {
                     Block::Grass

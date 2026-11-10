@@ -1058,7 +1058,7 @@ impl Game {
                     let z = (player.z + angle.cos() * 26.) as i32;
                     let y = self.world.height(x, z) + 1;
                     let pos = Vec3::new(x as f32 + 0.5, y as f32 + 0.01, z as f32 + 0.5);
-                    if self.world.biome(x, z) == Biome::Grassland
+                    if self.world.biome(x, z).is_grassland()
                         && self.world.get(IVec3::new(x, y - 1, z)) == Block::Grass
                         && !collides(&self.world, pos)
                     {

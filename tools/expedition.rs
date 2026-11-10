@@ -277,7 +277,10 @@ pub fn run() -> Result<(), String> {
     equip(&mut g, Item::IronSword);
     g.tick(&Input::default(), STEP);
     require(
-        g.player.discoveries.contains("biome:Tundra"),
+        g.biome().is_snow()
+            && g.player
+                .discoveries
+                .contains(&format!("biome:{}", g.biome().name())),
         "Tundra discovery failed",
     )?;
     require(
