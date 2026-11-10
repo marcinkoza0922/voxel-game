@@ -778,8 +778,13 @@ impl Renderer {
             -celestial
         };
         let strength = daylight + (1. - daylight) * 0.025 * sun.y.max(0.).sqrt();
-        let sky = [daylight, g.time.fract(), 0., 1.];
         let eye = g.player.eye();
+        let sky = [
+            daylight,
+            g.time.fract(),
+            camera_sky_access(&g.world, eye),
+            1.,
+        ];
         #[cfg(feature = "native-upscalers")]
         let native_active = self.native.active();
         #[cfg(not(feature = "native-upscalers"))]
@@ -1480,14 +1485,18 @@ impl SkyAccess<'_> {
         value
     }
 }
-pub fn spawn_sky_light(world: &World, time: f32, pos: Vec3) -> f32 {
+fn camera_sky_access(world: &World, pos: Vec3) -> f32 {
     let mut sky = SkyAccess {
         world,
         columns: HashMap::new(),
         opaque: HashMap::new(),
         exposure: HashMap::new(),
     };
-    sky.sample(pos.floor().as_ivec3()) * sky_cycle(time).1
+    sky.sample(pos.floor().as_ivec3())
+}
+
+pub fn spawn_sky_light(world: &World, time: f32, pos: Vec3) -> f32 {
+    camera_sky_access(world, pos) * sky_cycle(time).1
 }
 
 pub fn apply_sky_access(w: &World, mesh: &mut [Vertex]) {

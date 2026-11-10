@@ -1511,3 +1511,19 @@ slopes, deterministic rarity, and increasing maximum elevations. The pond halo
 regression searches the full supported pond extent for its containing rim.
 Tree roots also reject cave carving at the first trunk voxel, preventing missing
 trunks on the newly common gentle terrain.
+
+### Underground streaming background
+
+The camera samples the same day-independent sky access used for voxel lighting
+from authoritative world queries, so exposure does not depend on chunk residency.
+The sky uniform carries this exposure in its third component. The entire skybox
+(including sun, moon and stars) fades to black in enclosed caves; distance fog uses
+the lesser of surface and camera exposure to avoid blue fog behind missing cave
+meshes. Entrance exposure uses the existing twelve-block skylight approximation,
+so visible outdoor sky also dims while the camera is inside a cave. This masks
+streaming gaps without changing terrain residency or torch lighting.
+
+Validation: formatting, short-format Clippy and all 145 quiet nextest tests passed.
+A three-frame native Vulkan capture completed outside the sandbox, validating
+shader initialization and rendering. Underground appearance still needs in-game
+visual confirmation; the capture used the default spawn.
