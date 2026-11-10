@@ -377,6 +377,7 @@ pub struct World {
     pending: VecDeque<IVec3>,
     pub dirty: Vec<IVec3>,
     pub revision: u64,
+    pub(crate) roof_dirty: HashSet<(i32, i32)>,
     center: IVec3,
     radius: i32,
     desired: HashSet<IVec3>,
@@ -437,6 +438,7 @@ impl World {
             pending: VecDeque::new(),
             dirty: vec![],
             revision: 0,
+            roof_dirty: HashSet::new(),
             center: IVec3::splat(i32::MAX),
             radius: -1,
             desired: HashSet::new(),
@@ -1027,6 +1029,7 @@ impl World {
                 }
             }
         }
+        self.roof_dirty.insert((p.x, p.z));
         self.revision += 1;
         true
     }

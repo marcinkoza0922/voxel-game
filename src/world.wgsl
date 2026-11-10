@@ -47,8 +47,7 @@ struct SkyOut {
     let above=smoothstep(-0.02,0.01,ray.y);
     color=mix(color,vec3(1.0,0.88,0.56),sun*above);
     color=mix(color,vec3(0.65,0.75,0.9),moon*above);
-    // Unmeshed cave space must fade to darkness, including celestial bodies.
-    return vec4(color*camera.sky.z,1.0);
+    return vec4(color,1.0);
 }
 struct In { @location(0) pos: vec3<f32>, @location(1) normal: vec3<f32>, @location(2) color: vec3<f32>, @location(3) tile: vec3<f32>, @location(4) sky_access:f32 };
 struct Out { @builtin(position) clip: vec4<f32>, @location(0) world: vec3<f32>, @location(1) normal: vec3<f32>, @location(2) color: vec3<f32>, @location(3) shadow: vec4<f32>, @location(4) tile: vec3<f32>, @location(5) sky_access:f32 };
@@ -95,7 +94,7 @@ fn shade(v:Out)->vec4<f32> {
     }
     let fog=smoothstep(112.0,160.0,distance(v.world.xz,camera.eye.xz));
     if(leaf_gap(v.world,v.normal,v.tile.z)) {discard;}
-    return vec4(mix(color,atmosphere(normalize(v.world-camera.eye.xyz))*min(sky_access,camera.sky.z),fog),1.0);
+    return vec4(mix(color,atmosphere(normalize(v.world-camera.eye.xyz))*sky_access,fog),1.0);
 }
 @fragment fn fs(v:Out)->@location(0) vec4<f32> {
     let color=shade(v);

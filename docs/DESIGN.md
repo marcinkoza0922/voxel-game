@@ -1512,18 +1512,71 @@ regression searches the full supported pond extent for its containing rim.
 Tree roots also reject cave carving at the first trunk voxel, preventing missing
 trunks on the newly common gentle terrain.
 
-### Underground streaming background
+### Underground streaming frontiers
 
-The camera samples the same day-independent sky access used for voxel lighting
-from authoritative world queries, so exposure does not depend on chunk residency.
-The sky uniform carries this exposure in its third component. The entire skybox
-(including sun, moon and stars) fades to black in enclosed caves; distance fog uses
-the lesser of surface and camera exposure to avoid blue fog behind missing cave
-meshes. Entrance exposure uses the existing twelve-block skylight approximation,
-so visible outdoor sky also dims while the camera is inside a cave. This masks
-streaming gaps without changing terrain residency or torch lighting.
+GPU-ready chunks, including chunks with empty meshes, track their six neighbors.
+Where a neighbor has not uploaded a mesh, the renderer caps underground boundary
+areas with black geometry. Vertical caps stop at the lower opaque roof of the
+columns on either side; horizontal caps cover only columns with an opaque roof
+at or above that plane. Roof queries use authoritative procedural terrain and
+edits, independent of residency. Directly exposed sky stays open. Caps use scene
+depth, have zero surface color and sky access, receive no torch brightness or
+atmospheric fog, and never enter the shadow pass. This hides absent cave geometry
+from cameras both outside and inside caves, including the finite underground
+streaming range and delayed GPU uploads.
 
-Validation: formatting, short-format Clippy and all 145 quiet nextest tests passed.
-A three-frame native Vulkan capture completed outside the sandbox, validating
-shader initialization and rendering. Underground appearance still needs in-game
-visual confirmation; the capture used the default spawn.
+Frontier masks and buffers are cached until neighbor readiness changes. Roofs
+are shared across cap builds in a coordinate cache bounded to the view radius
+plus one chunk for boundary samples. Each successful voxel edit queues its exact
+horizontal block column in `World::roof_dirty`; the renderer drains that set
+before streaming. Only referenced columns are queried again. Unchanged roofs
+preserve every cap; changed roofs invalidate only caps in that horizontal chunk
+column and its neighbors, at all elevations. This handles roofs across chunk
+boundaries without rebuilding distant buffers after mining. Eviction removes
+readiness/frontier buffers and prunes roof queries outside the view. Switching
+worlds clears all three caches. The skybox and
+surface fog use their original lighting again: camera-wide sky dimming did not
+cover outside views into caves and incorrectly dimmed visible outdoor sky. Caps
+are temporary opaque closures, so cave geometry and lights beyond an unready
+boundary remain hidden until streaming supplies their meshes. Chunk selection,
+terrain generation and saves are unchanged.
+
+Regression tests cover readiness for empty chunks, neighbor arrival/eviction,
+exposed sky, roof edits, and the outdoor camera/ray from `saves/world-36.json`
+(seed and coordinates embedded in the test, with no dependency on local saves).
+Offscreen captures of a copy of that save reproduce the blue opening before the
+change and show it sealed afterward with the outdoor sky preserved. The original
+save is never passed to a runner that writes it.
+
+Validation: formatting, Clippy with warnings denied, all 148 quiet nextest tests,
+gameplay/persistence smoke and automated playtest/expedition passed. Offscreen
+Vulkan captures of the latest save passed; the settled scene contained 1,446
+resident chunks. A three-frame profile measured settled streaming/upload calls
+at 0.17 and 0.39 ms; initial settling took 1.38 s. These are diagnostic samples,
+not a comparative performance benchmark.
+
+### Mining frontier performance review
+
+The original frontier implementation cleared all cached caps on every world
+revision. Offscreen mining updates against `saves/world-36.json` measured a
+351.98 ms median and 360.52 ms maximum across twelve edits. Limiting rebuilds
+to nearby dirty chunk columns reduced this to 20.20/20.88 ms, but still repeated
+unchanged roof queries. Shared roof caching plus exact changed-column tracking
+reduced the same workload to 0.555 ms median and 0.658 ms maximum. These debug
+build measurements cover the immediate renderer streaming/upload update after
+mining, excluding subsequent asynchronous remesh settling, drawing and simulation;
+they are not full-frame FPS measurements.
+
+`tools/frontier_review.rs`, invoked with `cargo run -- --frontier-review --save
+PATH [--profile CSV]`, loads an existing save without writing it, settles its
+view offscreen, and measures twelve stone-removal updates. Placement and remesh
+settling occur between samples. `--profile` writes each measured update in
+milliseconds. The tool bypasses window/audio initialization and does not advance
+the game simulation. Regression tests verify unchanged-roof reuse, distant cache
+retention, negative-coordinate dependencies, vertical invalidation, and exact
+cached/fresh cap geometry after roof placement and removal.
+
+Mining fix validation: formatting, Clippy with warnings denied, all 149 quiet
+nextest tests, gameplay/persistence smoke and automated playtest/expedition
+passed. Offscreen captures of the current save and the original entrance fixture
+completed; the entrance still has no blue opening. User saves were read only.
