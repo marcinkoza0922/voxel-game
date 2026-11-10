@@ -1,5 +1,5 @@
 //! Discrete source-driven fluids. Updates read the old world, then commit together.
-use crate::world::{Block, MAX_Y, MIN_Y, World, hash};
+use crate::world::{Biome, Block, MAX_Y, MIN_Y, World, hash};
 use glam::IVec3;
 
 const SIDES: [IVec3; 4] = [IVec3::X, IVec3::NEG_X, IVec3::Z, IVec3::NEG_Z];
@@ -183,6 +183,83 @@ impl World {
         }
     }
 
+    /// Inland lake pairs joined by a winding river, contained within 384-block cells.
+    /// A shared elevation keeps source water settled; beds and banks seal caves.
+    pub(crate) fn waterway_column(&self, px: i32, pz: i32) -> Option<(f32, i32)> {
+        let cx = px.div_euclid(384);
+        let cz = pz.div_euclid(384);
+        let h = hash(self.seed ^ 0x7269_7665, cx, 0, cz);
+        if !h.is_multiple_of(2) {
+            return None;
+        }
+        let x = cx * 384 + 144 + ((h >> 8) % 96) as i32;
+        let z = cz * 384 + 144 + ((h >> 24) % 96) as i32;
+        if x.abs() < 160 && z.abs() < 160 {
+            return None;
+        }
+        let (u, v) = if h & 4 == 0 {
+            (px - x, pz - z)
+        } else {
+            (pz - z, px - x)
+        };
+        if u.abs() > 106 || v.abs() > 48 {
+            return None;
+        }
+        let u = u as f32;
+        let v = v as f32;
+        let bend = if h & 8 == 0 { 20. } else { -20. };
+        let nodes = [(-70., 0.), (-25., bend), (25., -bend), (70., 0.)];
+        let mut edge = f32::INFINITY;
+        for pair in nodes.windows(2) {
+            let (a, b) = (pair[0], pair[1]);
+            let (dx, dz) = (b.0 - a.0, b.1 - a.1);
+            let t = ((u - a.0) * dx + (v - a.1) * dz) / (dx * dx + dz * dz);
+            let t = t.clamp(0., 1.);
+            edge = edge.min((u - a.0 - t * dx).hypot(v - a.1 - t * dz) - 5.);
+        }
+        // Broader, irregular lake basins at both ends of the river.
+        for (a, radius) in [(-70., 22.), (70., 30.)] {
+            let shore = 1.5 * (u * 0.19 + v * 0.13).sin();
+            edge = edge.min((u - a).hypot(v * 1.15) - radius - shore);
+        }
+        if edge > 2. {
+            return None;
+        }
+        let level = self.height(x, z) - 2;
+        for (a, b) in nodes {
+            let (dx, dz) = if h & 4 == 0 {
+                (a as i32, b as i32)
+            } else {
+                (b as i32, a as i32)
+            };
+            if (self.height(x + dx, z + dz) - level).abs() > 18 {
+                return None;
+            }
+        }
+        Some((edge, level))
+    }
+
+    pub(crate) fn waterway_block(&self, p: IVec3, height: i32) -> Option<Block> {
+        let (edge, level) = self.waterway_column(p.x, p.z)?;
+        let depth = if edge < -12. {
+            7
+        } else if edge < -3. {
+            4
+        } else {
+            2
+        };
+        if p.y < level - 8 || p.y > height.max(level) + 7 {
+            return None;
+        }
+        Some(if p.y <= level - depth || (edge >= 0. && p.y <= level) {
+            Block::Sand
+        } else if p.y <= level {
+            Block::Water
+        } else {
+            Block::Air
+        })
+    }
+
     /// Small stone-lined pools in gentle terrain, outside the protected spawn.
     pub(crate) fn pool_block(&self, p: IVec3, height: i32) -> Option<Block> {
         if p.x.abs() < 32 && p.z.abs() < 32 {
@@ -217,7 +294,13 @@ impl World {
             return (p.y <= y).then_some(Block::Stone);
         }
         Some(if p.y < y {
-            if lava { Block::Lava } else { Block::Water }
+            if lava {
+                Block::Lava
+            } else if p.y == y - 1 && self.biome(x, z) == Biome::Tundra {
+                Block::Ice
+            } else {
+                Block::Water
+            }
         } else {
             Block::Air
         })
@@ -335,6 +418,92 @@ mod tests {
         );
         assert!(w.fluid_at(p.as_vec3() + glam::Vec3::splat(0.5)).is_none());
     }
+    #[test]
+    fn tundra_ponds_have_solid_ice_over_water_and_warm_ponds_stay_liquid() {
+        let w = World::new(41);
+        let mut cold = None;
+        let mut warm = None;
+        for cx in -20..20 {
+            for cz in -20..20 {
+                let h = hash(w.seed ^ 0x706f6f6c, cx, 0, cz);
+                let x = cx * 64 + 16 + ((h >> 8) % 32) as i32;
+                let z = cz * 64 + 16 + ((h >> 24) % 32) as i32;
+                let p = IVec3::new(x, w.height(x, z) - 1, z);
+                if w.get(p) == Block::Ice {
+                    cold = Some(p);
+                }
+                if w.get(p) == Block::Water && w.pool_block(p, p.y + 1) == Some(Block::Water) {
+                    warm = Some(p);
+                }
+            }
+        }
+        let p = cold.expect("frozen tundra pond");
+        assert_eq!(w.biome(p.x, p.z), Biome::Tundra);
+        assert!(w.get(p).solid());
+        assert_eq!(w.get(p - IVec3::Y), Block::Water);
+        assert_eq!(w.get(p - IVec3::Y * 2), Block::Stone);
+        assert!(warm.is_some());
+        let mut broken = World::new(w.seed);
+        broken.set(p, Block::Air);
+        assert_eq!(broken.get(p), Block::Air);
+        assert_eq!(broken.get(p - IVec3::Y), Block::Water);
+        assert!(
+            broken
+                .fluid_at((p - IVec3::Y).as_vec3() + glam::Vec3::splat(0.5))
+                .is_some()
+        );
+        let k = crate::world::chunk(p);
+        let local = p - k * 16 + IVec3::ONE;
+        assert_eq!(
+            w.halo(k)[(local.x + 18 * (local.z + 18 * local.y)) as usize],
+            Block::Ice
+        );
+    }
+
+    #[test]
+    fn lakes_and_rivers_remain_liquid_in_tundra_and_match_halos() {
+        let w = World::new(41);
+        let mut found = [false; 2];
+        for cx in -12..12 {
+            for cz in -12..12 {
+                let h = hash(w.seed ^ 0x7269_7665, cx, 0, cz);
+                let x = cx * 384 + 144 + ((h >> 8) % 96) as i32;
+                let z = cz * 384 + 144 + ((h >> 24) % 96) as i32;
+                let level = w.height(x, z) - 2;
+                for (i, u) in [0, 70].into_iter().enumerate() {
+                    let (px, pz) = if h & 4 == 0 { (x + u, z) } else { (x, z + u) };
+                    let p = IVec3::new(px, level, pz);
+                    if !found[i]
+                        && w.biome(px, pz) == Biome::Tundra
+                        && w.waterway_block(p, w.height(px, pz)) == Some(Block::Water)
+                        && w.get(p) == Block::Water
+                    {
+                        found[i] = true;
+                        assert_eq!(w.get(p - IVec3::Y), Block::Water);
+                        assert_eq!(w.get(p + IVec3::Y), Block::Air);
+                        assert_eq!(w.get(p - IVec3::Y * 8), Block::Sand);
+                        let k = crate::world::chunk(p);
+                        let halo = w.halo(k);
+                        for y in -1..=16 {
+                            for z in -1..=16 {
+                                for x in -1..=16 {
+                                    assert_eq!(
+                                        halo[((x + 1) + 18 * ((z + 1) + 18 * (y + 1))) as usize],
+                                        w.get(k * 16 + IVec3::new(x, y, z))
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+                if found == [true; 2] {
+                    return;
+                }
+            }
+        }
+        assert_eq!(found, [true; 2], "liquid tundra river and lake");
+    }
+
     #[test]
     fn natural_pools_are_repeatable_and_match_chunk_halos() {
         let w = World::new(41);

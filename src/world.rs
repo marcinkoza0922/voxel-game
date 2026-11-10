@@ -43,6 +43,7 @@ pub enum Block {
     Lava,
     FlowingLava(u8),
     Obsidian,
+    Ice,
 }
 impl Block {
     pub fn solid(self) -> bool {
@@ -84,6 +85,7 @@ impl Block {
         match self {
             Self::Water | Self::FlowingWater(_) => [0.10, 0.37, 0.74],
             Self::Lava | Self::FlowingLava(_) => [1., 0.24, 0.015],
+            Self::Ice => [0.56, 0.79, 0.91],
             Self::Obsidian => [0.13, 0.08, 0.20],
             Self::Shrub => [0.20, 0.39, 0.13],
             Self::TallGrass => [0.25, 0.45, 0.12],
@@ -119,6 +121,7 @@ impl Block {
         match self {
             Self::Water | Self::FlowingWater(_) => "Water",
             Self::Lava | Self::FlowingLava(_) => "Lava",
+            Self::Ice => "Ice",
             Self::Obsidian => "Obsidian",
             Self::Shrub => "Shrub",
             Self::TallGrass => "Tall grass",
@@ -397,9 +400,13 @@ impl World {
                 };
                 if h.is_multiple_of(chance) && (x - cx).abs() <= 2 && (z - cz).abs() <= 2 {
                     let height = self.height(cx, cz);
-                    if !self
-                        .cave_column(cx, cz)
-                        .is_some_and(|(lo, hi)| (lo..=hi).contains(&height))
+                    if self.waterway_column(cx, cz).is_none()
+                        && self
+                            .pool_block(IVec3::new(cx, height, cz), height)
+                            .is_none()
+                        && !self
+                            .cave_column(cx, cz)
+                            .is_some_and(|(lo, hi)| (lo..=hi).contains(&height))
                     {
                         return Some((cx, height, cz));
                     }
@@ -506,6 +513,9 @@ impl World {
                 }
                 return Block::Air;
             }
+        }
+        if let Some(water) = self.waterway_block(p, height) {
+            return water;
         }
         if let Some(pool) = self.pool_block(p, height) {
             return pool;
@@ -733,6 +743,12 @@ impl World {
                                 let h = self.height(x * SIZE + dx, z * SIZE + dz);
                                 low = low.min(h);
                                 high = high.max(h + 6);
+                                if let Some((_, level)) =
+                                    self.waterway_column(x * SIZE + dx, z * SIZE + dz)
+                                {
+                                    low = low.min(level - 8);
+                                    high = high.max(level + 1);
+                                }
                             }
                         }
                         self.surface_bounds.insert((x, z), (low, high));

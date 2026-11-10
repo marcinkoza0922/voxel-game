@@ -731,7 +731,27 @@ Deterministic 64-block cells occasionally contain small flat, stone-lined pools
 of water or lava on gentle surfaces. Pools remain outside the protected spawn
 area, share direct/halo sampling, and use ordinary fluid sources. As with other
 terrain additions, untouched terrain changes in existing worlds while edits win.
-There are no oceans, rivers or underground lava lakes yet.
+Tundra water ponds have one solid, mineable layer of pale blue, textured ice at
+surface level and liquid source water underneath. The pond center's biome decides
+the entire lid, so a biome boundary cannot leave half a pond frozen. Ice drops no
+item and does not automatically regrow; breaking it exposes the water below.
+
+Seeded 384-block cells can also contain two irregular inland lakes (roughly 40–60
+blocks across) connected by a winding, roughly ten-block-wide river. Candidate
+sites reject steep endpoint/river elevations and stay outside the starting area.
+Each system shares a level water surface, has shallows and deeper lake centers,
+and uses sand banks and a sealed bed down to eight blocks below the surface.
+These larger bodies remain liquid in every biome, including tundra. Waterways
+override small pools and caves; ruins retain priority. Trees whose roots would
+intersect waterways or pools are suppressed. Streaming bounds include lake beds
+and elevated water surfaces. Direct queries and chunk halos use identical seeded
+sampling; player edits still override generated water and ice. Existing unedited
+terrain gains these features on load. Rivers currently connect local lake pairs;
+there is no global drainage network, current simulation, seasonal freeze/thaw,
+ocean generation or underground lava-lake generation.
+
+Tests cover frozen and warm ponds, breaking ice to expose liquid, liquid tundra
+rivers/lakes, basin beds, and agreement between chunk halos and direct queries.
 
 Crafting-table bucket recipes use three planks, copper ingots or iron ingots in
 a V. Each bucket occupies one slot and carries one source block. Right-click an
