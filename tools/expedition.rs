@@ -1,6 +1,6 @@
 //! Deterministic integration expedition: controlled resource arena, real game actions.
 use crate::{
-    ecs::Mob,
+    ecs::{Mob, MobKind},
     game::{Game, Input, STEP},
     items::{Item, RECIPES},
     save,
@@ -57,7 +57,10 @@ fn craft(g: &mut Game, output: Item, count: usize) -> Result<(), String> {
     for _ in 0..count {
         let before = g.player.inventory.count(output);
         let r = &RECIPES[index];
-        if r.station == crate::items::Station::Furnace {
+        if matches!(
+            r.station,
+            crate::items::Station::Furnace | crate::items::Station::Smelter
+        ) {
             for (n, &(item, count)) in r.inputs.iter().enumerate() {
                 if item == Item::Coal
                     && (g.furnace().map_or(0, |f| f.furnace_joules) >= crate::items::SMELT_JOULES
@@ -119,7 +122,11 @@ fn place(g: &mut Game, item: Item, p: IVec3) -> Result<(), String> {
     g.use_selected();
     require(
         Some(g.world.get(p)) == item.block(),
-        "Station placement failed",
+        &format!(
+            "Station placement failed: {} at {p:?}: {}",
+            item.name(),
+            g.message
+        ),
     )
 }
 pub fn run() -> Result<(), String> {
@@ -155,6 +162,7 @@ pub fn run() -> Result<(), String> {
     equip(&mut g, Item::Sword);
     let mob = Vec3::new(0.5, 100.01, -1.5);
     g.entities.spawn(Mob {
+        kind: MobKind::Husk,
         pos: mob,
         health: 30.,
         cooldown: 0.,
@@ -203,6 +211,20 @@ pub fn run() -> Result<(), String> {
     require(g.player.rest == 100., "Sleep failed after combat")?;
     craft(&mut g, Item::Torch, 1)?;
     place(&mut g, Item::Torch, IVec3::new(2, 100, 2))?;
+    // Extend the same mining/crafting transactions through iron.
+    mine(&mut g, Block::Stone, Item::CopperPick, 6)?;
+    mine(&mut g, Block::Copper, Item::CopperPick, 2)?;
+    craft(&mut g, Item::CopperIngot, 2)?;
+    craft(&mut g, Item::Smelter, 1)?;
+    place(&mut g, Item::Smelter, IVec3::new(0, 100, -3))?;
+    g.active_furnace = Some([0, 100, -3]);
+    mine(&mut g, Block::Iron, Item::CopperPick, 8)?;
+    mine(&mut g, Block::Coal, Item::CopperPick, 4)?;
+    craft(&mut g, Item::IronIngot, 8)?;
+    for item in [Item::IronPick, Item::IronAxe, Item::IronSword] {
+        craft(&mut g, item, 1)?;
+    }
+    g.active_furnace = None;
     // Sample natural forest and cave locations; relocation is diagnostic, not walked travel.
     let forest = (-300..=300)
         .step_by(10)
@@ -227,7 +249,7 @@ pub fn run() -> Result<(), String> {
         .step_by(4)
         .find_map(|x| {
             (-100..=100).step_by(4).find_map(|z| {
-                (0..g.world.height(x, z) - 5)
+                (crate::world::MIN_Y + 4..g.world.height(x, z) - 5)
                     .rev()
                     .find(|&y| {
                         let p = Vec3::new(x as f32 + 0.5, y as f32 + 0.01, z as f32 + 0.5);
@@ -244,6 +266,70 @@ pub fn run() -> Result<(), String> {
     require(
         !crate::game::collides(&g.world, Vec3::from_array(g.player.pos)),
         "Cave collision failed",
+    )?;
+    let home = (-8..=8)
+        .find_map(|x| (-8..=8).find_map(|z| g.world.ruin_in_cell(x, z)))
+        .ok_or("No tundra ruin found")?;
+    println!("Tundra ruin fixture (seed 314159): {home:?}");
+    g.time = 0.75;
+    g.player.pos = (home.as_vec3() + Vec3::new(0.5, 1.01, 4.5)).to_array();
+    g.velocity = Vec3::ZERO;
+    equip(&mut g, Item::IronSword);
+    g.tick(&Input::default(), STEP);
+    require(
+        g.player.discoveries.contains("biome:Tundra"),
+        "Tundra discovery failed",
+    )?;
+    require(
+        g.entities
+            .iter()
+            .any(|(_, m)| matches!(m.kind, MobKind::Guardian(_))),
+        "Ruin guardian missing",
+    )?;
+    for _ in 0..360 {
+        let point = g
+            .entities
+            .iter()
+            .find(|(_, m)| m.kind == MobKind::Guardian(home.to_array()))
+            .map(|(_, m)| m.pos + Vec3::Y);
+        let Some(point) = point else { break };
+        aim(&mut g, point);
+        g.tick(
+            &Input {
+                attack: true,
+                ..Default::default()
+            },
+            STEP,
+        );
+    }
+    require(
+        g.player
+            .discoveries
+            .contains(&format!("guardian:{:?}", home.to_array())),
+        "Guardian combat failed",
+    )?;
+    equip(&mut g, Item::IronPick);
+    let cache = home + IVec3::Y;
+    aim(&mut g, cache.as_vec3() + Vec3::splat(0.5));
+    for _ in 0..120 {
+        g.tick(
+            &Input {
+                attack: true,
+                ..Default::default()
+            },
+            STEP,
+        );
+        if g.world.get(cache) == Block::Air {
+            break;
+        }
+    }
+    require(g.world.get(cache) == Block::Air, "Ruin cache did not open")?;
+    let before = g.player.inventory.count(Item::IronIngot);
+    g.player.pos = (cache.as_vec3() + Vec3::new(0.5, 0., 0.5)).to_array();
+    g.collect_drops();
+    require(
+        g.player.inventory.count(Item::IronIngot) == before + 6,
+        "Ruin reward missing",
     )?;
     let path = std::env::temp_dir().join(format!("voxel-expedition-{}.json", std::process::id()));
     let result = (|| {
@@ -262,7 +348,7 @@ pub fn run() -> Result<(), String> {
     let _ = std::fs::remove_file(path);
     result?;
     println!(
-        "Expedition passed: mined wood/stone/copper/coal, placed stations, crafted copper gear, combat/loot, food, sleep, torch, forest discovery, cave collision, full player/edit/torch reload. Resource arena and forest/cave relocations are controlled fixtures."
+        "Expedition passed: mined wood/stone/copper/coal, placed stations, crafted copper and iron gear, combat/loot, food, sleep, torch, forest/tundra discovery, cave collision, natural ruin guardian and cache, full player/edit/station/torch reload. Resource arena and forest/cave relocations are controlled fixtures."
     );
     Ok(())
 }

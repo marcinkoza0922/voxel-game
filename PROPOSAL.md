@@ -195,6 +195,20 @@ Special crafting stations
 - Fletching table--for efficient arrow making 
 - Cauldron -- for brewing potions
 
+### Fluids and buckets
+
+Water and lava use Minecraft-style source blocks and discrete spreading flow.
+Water spreads up to seven blocks horizontally, falls downward, drains when its
+supply is removed, and regenerates sources when supported between at least two
+horizontal water sources. Lava spreads more slowly and less far, cannot renew,
+and solidifies on contact with water. Include natural pools, swimming, drowning
+and lava damage. Generate ponds, rivers, and lakes. Ponds in colder biomes have
+an ice cover with water beneath; larger lakes and rivers remain liquid.
+
+Buckets can be crafted from wood or any available metal. All carry one water
+source; carrying lava requires iron or a stronger metal. Wood, copper and iron
+are the currently available bucket materials.
+
 ### Energy and Automation
 
 You can burn coal and other fuels to generate power.

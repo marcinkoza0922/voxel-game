@@ -1,12 +1,18 @@
+mod art;
 mod audio;
 mod ecs;
 #[path = "../tools/expedition.rs"]
 mod expedition;
 mod feedback;
+mod fluid;
 mod game;
+#[path = "../tools/headless.rs"]
+mod headless;
 mod items;
 #[path = "../tools/performance.rs"]
 mod performance;
+#[path = "../tools/playtest.rs"]
+mod playtest;
 mod render;
 mod save;
 mod streaming;
@@ -24,11 +30,13 @@ use winit::{
 };
 
 struct Options {
+    headless: bool,
     seed: u64,
     new: bool,
     save: PathBuf,
     smoke: bool,
     expedition: bool,
+    playtest: bool,
     tour: bool,
     mute: bool,
     frames: Option<u32>,
@@ -38,11 +46,13 @@ struct Options {
 }
 fn options() -> Result<Options, String> {
     let mut o = Options {
+        headless: false,
         seed: 314159,
         new: false,
         save: PathBuf::from("saves/world.json"),
         smoke: false,
         expedition: false,
+        playtest: false,
         tour: false,
         mute: false,
         frames: None,
@@ -55,6 +65,7 @@ fn options() -> Result<Options, String> {
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
+            "--headless" => o.headless = true,
             "--new" => o.new = true,
             "--mute" => o.mute = true,
             "--seed" => {
@@ -75,6 +86,7 @@ fn options() -> Result<Options, String> {
                 ))
             }
             "--tour" => o.tour = true,
+            "--playtest" => o.playtest = true,
             "--expedition" => o.expedition = true,
             "--smoke" => o.smoke = true,
             "--capture" => {
@@ -93,14 +105,17 @@ fn options() -> Result<Options, String> {
             }
             "--help" | "-h" => {
                 println!(
-                    "Voxel Adventure\n  --new          create a separate fresh save with a random seed\n  --seed N       seed for a new world (default 314159)\n  --save PATH    world file (default saves/world.json)\n  --smoke        headless gameplay/persistence check; uses a temporary save\n  --frames N     render N frames then save and exit\n  --capture PATH save final frame as PPM (defaults to 240 frames)\n  --tour         scripted camera relocations for streaming measurements\n  --expedition   run controlled headless progression expedition\n  --profile PATH write frame timings and chunk backlog as CSV\n  --mute         disable sound playback\n  --pack         start with the inventory open\n\nWASD move; mouse look; Space jump; Shift sprint\nLMB mine/attack; RMB place/eat/use; wheel or 1-9 select\nE inventory/crafting/stats; R sleep near bed; F5 save; Esc menu"
+                    "Voxel Adventure\n  --headless     render offscreen without display/audio (default 240 frames)\n  --new          create a separate fresh save with a random seed\n  --seed N       seed for a new world (default 314159)\n  --save PATH    world file (default saves/world.json)\n  --smoke        headless gameplay/persistence check; uses a temporary save\n  --frames N     render N frames then save and exit\n  --capture PATH save final frame as PPM (defaults to 240 frames)\n  --tour         scripted camera relocations for streaming measurements\n  --playtest     run headless mechanics course and progression expedition\n  --expedition   run controlled headless progression expedition\n  --profile PATH write frame timings and chunk backlog as CSV\n  --mute         disable sound playback\n  --pack         start with the inventory open\n\nWASD move; mouse look; Space jump; double-tap W sprint; Shift walk\nLMB mine/attack; RMB place/eat/use; wheel or 1-9 select\nE inventory/crafting/stats; R sleep near bed; F5 save; Esc menu"
                 );
                 std::process::exit(0);
             }
             _ => return Err(format!("Unknown argument: {arg}")),
         }
     }
-    if o.capture.is_some() && o.frames.is_none() {
+    if o.frames == Some(0) {
+        return Err("--frames must be positive".into());
+    }
+    if (o.capture.is_some() || o.headless) && o.frames.is_none() {
         o.frames = Some(240);
     }
     if o.tour && (!explicit_save || o.frames.is_none() || o.save.exists()) {
@@ -128,6 +143,8 @@ struct App {
     audio: Option<audio::Audio>,
     keys: HashSet<KeyCode>,
     attack: bool,
+    forward_tap: Option<Instant>,
+    sprinting: bool,
     pack: bool,
     paused: bool,
     focused: bool,
@@ -157,6 +174,8 @@ impl App {
         self.drag_origin = None;
         self.attack = false;
         self.keys.clear();
+        self.forward_tap = None;
+        self.sprinting = false;
     }
     fn save(&mut self) -> bool {
         match save::write(&self.game, &self.options.save) {
@@ -221,7 +240,10 @@ impl App {
                         r.ui.recipe = (r.ui.recipe as i32 + delta)
                             .rem_euclid(items::RECIPES.len() as i32)
                             as usize;
-                        if items::RECIPES[r.ui.recipe].station != items::Station::Furnace {
+                        if !matches!(
+                            items::RECIPES[r.ui.recipe].station,
+                            items::Station::Furnace | items::Station::Smelter
+                        ) {
                             break;
                         }
                     }
@@ -338,6 +360,23 @@ impl ApplicationHandler for App {
             }
             WindowEvent::KeyboardInput { event, .. } => {
                 if let PhysicalKey::Code(code) = event.physical_key {
+                    if code == KeyCode::KeyW {
+                        if event.state == ElementState::Pressed
+                            && !event.repeat
+                            && !self.keys.contains(&code)
+                            && !self.pack
+                            && !self.paused
+                            && self.focused
+                        {
+                            let now = Instant::now();
+                            self.sprinting = self
+                                .forward_tap
+                                .is_some_and(|last| now.duration_since(last).as_secs_f32() <= 0.3);
+                            self.forward_tap = Some(now);
+                        } else if event.state == ElementState::Released {
+                            self.sprinting = false;
+                        }
+                    }
                     if event.state == ElementState::Pressed {
                         self.keys.insert(code);
                     } else {
@@ -447,7 +486,7 @@ impl ApplicationHandler for App {
                                     .target
                                     .and_then(|(p, _)| match self.game.world.get(p) {
                                         world::Block::Table => Some(1),
-                                        world::Block::Furnace => Some(2),
+                                        world::Block::Furnace | world::Block::Smelter => Some(2),
                                         _ => None,
                                     });
                             if let Some(mode) = station {
@@ -483,7 +522,8 @@ impl ApplicationHandler for App {
                         right: pressed(KeyCode::KeyD) as i32 as f32
                             - pressed(KeyCode::KeyA) as i32 as f32,
                         jump: pressed(KeyCode::Space),
-                        sprint: pressed(KeyCode::ShiftLeft),
+                        sprint: self.sprinting && pressed(KeyCode::KeyW),
+                        walk: pressed(KeyCode::ShiftLeft) || pressed(KeyCode::ShiftRight),
                         attack: self.attack,
                     };
                     while self.accumulator >= STEP {
@@ -637,6 +677,10 @@ fn smoke() -> Result<(), String> {
 }
 fn run() -> Result<(), String> {
     let mut options = options()?;
+    if options.playtest {
+        playtest::run()?;
+        return expedition::run();
+    }
     if options.expedition {
         return expedition::run();
     }
@@ -651,6 +695,9 @@ fn run() -> Result<(), String> {
     } else {
         save::read(&options.save)?.unwrap_or_else(|| Game::new(options.seed))
     };
+    if options.headless {
+        return headless::run(game, &options);
+    }
     let event_loop = EventLoop::new().map_err(|e| e.to_string())?;
     let pack = options.pack;
     let profile = options
@@ -666,6 +713,8 @@ fn run() -> Result<(), String> {
         renderer: None,
         audio,
         keys: HashSet::new(),
+        forward_tap: None,
+        sprinting: false,
         attack: false,
         pack,
         paused: false,

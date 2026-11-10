@@ -164,6 +164,22 @@ impl Ui {
                 }
             }
         }
+        if let Some((lava, _)) = g.world.fluid_at(g.player.eye()) {
+            self.rect(
+                0.,
+                0.,
+                w,
+                h,
+                if lava {
+                    [0.8, 0.12, 0.01, 0.65]
+                } else {
+                    [0.04, 0.22, 0.52, 0.26]
+                },
+            );
+        }
+        if g.breath < 15. {
+            self.text(22., 112., &format!("Air {:.0}s", g.breath), 1.5, INK);
+        }
         self.rect(20., 20., 260., 86., PANEL);
         self.text(32., 31., g.biome().name(), 1.8, INK);
         self.text(
@@ -245,7 +261,7 @@ impl Ui {
             self.text(
                 w / 2. - 90.,
                 h / 2. - 40.,
-                &format!("HUSK  LV {}  HP {:.0}", m.level, m.health),
+                &format!("{}  LV {}  HP {:.0}", m.kind.name(), m.level, m.health),
                 1.5,
                 [0.94, 0.5, 0.4, 1.],
             );
@@ -266,14 +282,18 @@ impl Ui {
         use Item::*;
         let block = matches!(
             item,
-            Log | Planks | Dirt | Cobble | CopperOre | Table | Furnace | Bed
+            Log | Planks | Dirt | Cobble | CopperOre | IronOre | Table | Furnace | Smelter | Bed
         );
         let color: [f32; 4] = match item {
             Log => [0.43, 0.27, 0.12, 1.],
             Planks | Table => [0.73, 0.51, 0.27, 1.],
             Dirt => [0.48, 0.30, 0.19, 1.],
             Cobble | CopperOre | Furnace | StoneAxe | StonePick => [0.57, 0.61, 0.62, 1.],
-            CopperIngot | CopperAxe | CopperPick | Sword => [0.84, 0.45, 0.25, 1.],
+            CopperBucket | CopperWaterBucket | CopperIngot | CopperAxe | CopperPick | Sword => {
+                [0.84, 0.45, 0.25, 1.]
+            }
+            IronBucket | IronWaterBucket | IronLavaBucket | IronOre | IronIngot | IronAxe
+            | IronPick | IronSword | Smelter => [0.72, 0.77, 0.81, 1.],
             Coal => [0.18, 0.20, 0.24, 1.],
             Berries => [0.85, 0.22, 0.34, 1.],
             Meat => [0.84, 0.41, 0.37, 1.],
@@ -281,18 +301,43 @@ impl Ui {
             Bed => [0.63, 0.29, 0.24, 1.],
             _ => [0.73, 0.53, 0.29, 1.],
         };
+        let flower = item.flower_index();
+        let dye = item.dye_index();
+        let color = if let Some(i) = flower.or(dye) {
+            let c = crate::world::FLOWER_COLORS[i];
+            [c[0], c[1], c[2], 1.]
+        } else if item == WheatSeeds {
+            [0.62, 0.72, 0.22, 1.]
+        } else {
+            color
+        };
         let tool = item.durability() > 0;
         for py in 0..16 {
             for px in 0_i32..16 {
-                let head = if matches!(item, WoodPick | StonePick | CopperPick) {
+                let head = if matches!(item, WoodPick | StonePick | CopperPick | IronPick) {
                     (2..14).contains(&px) && (2..5).contains(&py)
-                } else if item == Sword {
+                } else if matches!(item, Sword | IronSword) {
                     (7..10).contains(&px) && (1..11).contains(&py)
                 } else {
                     (3..10).contains(&px) && (2..7).contains(&py)
                 };
                 let handle = tool && (7..9).contains(&px) && (5..15).contains(&py);
-                let filled = if block {
+                let stem = flower.is_some() && (7..9).contains(&px) && (7..15).contains(&py);
+                let bucket = item.bucket();
+                let filled = if bucket {
+                    ((3..13).contains(&px)
+                        && (6..14).contains(&py)
+                        && (px <= 4 || px >= 11 || py >= 12 || item.bucket_contents().is_some()))
+                        || ((4..12).contains(&px) && py == 2)
+                        || ((px == 3 || px == 12) && (3..7).contains(&py))
+                } else if flower.is_some() {
+                    stem || ((4..12).contains(&px)
+                        && (2..9).contains(&py)
+                        && ((6..10).contains(&px) || (4..7).contains(&py)))
+                } else if item == WheatSeeds {
+                    ((4..7).contains(&px) && (4..8).contains(&py))
+                        || ((9..12).contains(&px) && (8..12).contains(&py))
+                } else if block {
                     (1..15).contains(&px)
                         && py >= 2 + (px - 8).abs() / 2
                         && py <= 14 - (px - 8).abs() / 2
@@ -300,7 +345,7 @@ impl Ui {
                     head || handle
                 } else if matches!(item, Stick | Torch) {
                     (7..10).contains(&px) && (2..15).contains(&py)
-                } else if item == CopperIngot {
+                } else if matches!(item, CopperIngot | IronIngot) {
                     (3..14).contains(&px) && (5..12).contains(&py) && px + py > 9 && px + py < 23
                 } else {
                     let dx = px - 8;
@@ -310,20 +355,38 @@ impl Ui {
                 if !filled {
                     continue;
                 }
-                let mut c = if handle {
+                let mut c = if stem {
+                    [0.22, 0.49, 0.13, 1.]
+                } else if flower.is_some() && (7..9).contains(&px) && (4..6).contains(&py) {
+                    [1., 0.72, 0.12, 1.]
+                } else if handle {
                     [0.47, 0.30, 0.15, 1.]
                 } else {
                     color
                 };
+                if bucket
+                    && (5..11).contains(&px)
+                    && (6..12).contains(&py)
+                    && let Some(fluid) = item.bucket_contents()
+                {
+                    let f = fluid.color();
+                    c = [f[0], f[1], f[2], 1.];
+                }
                 if item == Torch && py < 6 {
                     c = [1., 0.73, 0.20, 1.];
                 }
-                if matches!(item, Table | Furnace) && (5..11).contains(&px) && (6..11).contains(&py)
+                if matches!(item, Table | Furnace | Smelter)
+                    && (5..11).contains(&px)
+                    && (6..11).contains(&py)
                 {
                     c = [0.20, 0.19, 0.17, 1.];
                 }
-                if item == CopperOre && (px + py * 3) % 7 < 2 {
-                    c = [0.90, 0.49, 0.26, 1.];
+                if matches!(item, CopperOre | IronOre) && (px + py * 3) % 7 < 2 {
+                    c = if item == IronOre {
+                        [0.56, 0.38, 0.28, 1.]
+                    } else {
+                        [0.90, 0.49, 0.26, 1.]
+                    };
                 }
                 if item == Planks && py % 4 == 0 {
                     for v in &mut c[..3] {
@@ -337,6 +400,11 @@ impl Ui {
                 }
                 if item == Berries && py < 5 {
                     c = [0.25, 0.57, 0.24, 1.];
+                }
+                if block && let Some(material) = item.block() {
+                    let top = py <= 6 - (px - 8).abs() / 2;
+                    let rgb = crate::art::texel(material, usize::from(top), px * 2, py * 2);
+                    c = [rgb[0], rgb[1], rgb[2], 1.];
                 }
                 let shade = if block {
                     if py <= 6 - (px - 8).abs() / 2 {
@@ -507,7 +575,27 @@ impl Ui {
             );
             self.button([x + 425., y + 258., 60., 28.], ">", Action::Recipe(1), true);
         } else {
-            self.text(x + 24., y + 112., "FURNACE", 1.6, INK);
+            let smelter = g.furnace_position().is_some_and(|p| {
+                g.world.get(glam::IVec3::from_array(p)) == crate::world::Block::Smelter
+            });
+            self.text(
+                x + 24.,
+                y + 112.,
+                if smelter { "CRUDE SMELTER" } else { "FURNACE" },
+                1.6,
+                INK,
+            );
+            self.text(
+                x + 322.,
+                y + 257.,
+                if smelter {
+                    "Copper / iron / food"
+                } else {
+                    "Iron needs a smelter"
+                },
+                1.1,
+                MUTED,
+            );
             self.text(x + 24., y + 139., "INPUT", 1.2, MUTED);
             self.text(x + 24., y + 224., "FUEL", 1.2, MUTED);
             self.stack_slot(

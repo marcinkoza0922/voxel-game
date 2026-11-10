@@ -21,6 +21,8 @@ struct Save {
     drops: Vec<crate::game::WorldDrop>,
     torches: Vec<([i32; 3], f32)>,
     #[serde(default)]
+    torch_mounts: Vec<([i32; 3], [i32; 3])>,
+    #[serde(default)]
     furnaces: Vec<([i32; 3], crate::items::Furnace)>,
 }
 pub fn write(game: &Game, path: &Path) -> Result<(), String> {
@@ -84,6 +86,12 @@ fn encode(game: &Game) -> Result<Vec<u8>, String> {
             })
             .collect(),
         torches: game.torch_life.iter().map(|(p, t)| (*p, *t)).collect(),
+        torch_mounts: game
+            .world
+            .torch_mounts
+            .iter()
+            .map(|(p, n)| (*p, *n))
+            .collect(),
         furnaces: game.furnaces.iter().map(|(p, f)| (*p, f.clone())).collect(),
     };
     serde_json::to_vec(&save).map_err(|e| e.to_string())
@@ -112,12 +120,13 @@ pub fn read(path: &Path) -> Result<Option<Game>, String> {
                 || old.counts.iter().any(|n| *n > 9999)
                 || ITEMS
                     .iter()
+                    .take(22)
                     .any(|i| old.wear[*i as usize] >= i.durability().max(1))
             {
                 return Err("Invalid legacy inventory".into());
             }
             let mut inv = Inventory::empty();
-            for item in ITEMS {
+            for item in ITEMS.into_iter().take(22) {
                 if !inv.add(item, old.counts[item as usize]) {
                     return Err("Legacy inventory exceeds 36 slots; original save preserved".into());
                 }
@@ -134,6 +143,11 @@ pub fn read(path: &Path) -> Result<Option<Game>, String> {
         }
         Some(2 | 3) => (),
         _ => return Err(format!("Unsupported save version {}", value["version"])),
+    }
+    if let Some(crafts) = value["player"]["crafts"].as_array_mut()
+        && matches!(crafts.len(), 15 | 20 | 26)
+    {
+        crafts.resize(RECIPES.len(), 0.into());
     }
     let save: Save = serde_json::from_value(value).map_err(|e| format!("Invalid save: {e}"))?;
     let p = &save.player;
@@ -164,7 +178,14 @@ pub fn read(path: &Path) -> Result<Option<Game>, String> {
         return Err("Save contains invalid player state".into());
     }
     if save.edits.iter().any(|e| {
-        !(MIN_Y + 1..=MAX_Y).contains(&e.pos[1])
+        e.block.fluid().is_some_and(|(_, n)| {
+            n > 8
+                || (n == 0
+                    && !matches!(
+                        e.block,
+                        crate::world::Block::Water | crate::world::Block::Lava
+                    ))
+        }) || !(MIN_Y + 1..=MAX_Y).contains(&e.pos[1])
             || e.pos[0].unsigned_abs() > 10_000_000
             || e.pos[2].unsigned_abs() > 10_000_000
     }) {
@@ -191,12 +212,15 @@ pub fn read(path: &Path) -> Result<Option<Game>, String> {
     g.drops = save.drops;
     g.time = save.time;
     g.world.edits = save.edits.into_iter().map(|e| (e.pos, e.block)).collect();
+    for p in g.world.edits.keys().copied().collect::<Vec<_>>() {
+        g.world.wake_fluid(glam::IVec3::from_array(p));
+    }
     if save.version < 3 && !save.furnaces.is_empty() {
         return Err("Legacy save contains unsupported placed furnace state".into());
     }
     for (pos, state) in save.furnaces {
         if !state.valid()
-            || g.world.edits.get(&pos) != Some(&crate::world::Block::Furnace)
+            || !g.world.edits.get(&pos).is_some_and(|b| b.processor())
             || g.furnaces.insert(pos, state).is_some()
         {
             return Err("Invalid or duplicate placed furnace state".into());
@@ -208,7 +232,7 @@ pub fn read(path: &Path) -> Result<Option<Game>, String> {
             .world
             .edits
             .iter()
-            .filter(|(_, b)| **b == crate::world::Block::Furnace)
+            .filter(|(_, b)| b.processor())
             .map(|(q, _)| *q)
             .min_by(|a, b| {
                 let dist =
@@ -226,6 +250,14 @@ pub fn read(path: &Path) -> Result<Option<Game>, String> {
         .any(|p| g.world.edits.get(p) != Some(&crate::world::Block::Torch))
     {
         return Err("Torch timers do not match placed torches".into());
+    }
+    for (p, n) in save.torch_mounts {
+        if !g.torch_life.contains_key(&p)
+            || ![[1, 0, 0], [-1, 0, 0], [0, 0, 1], [0, 0, -1], [0, -1, 0]].contains(&n)
+            || g.world.torch_mounts.insert(p, n).is_some()
+        {
+            return Err("Invalid torch attachment".into());
+        }
     }
     g.say("World loaded. E opens your pack.");
     Ok(Some(g))
@@ -267,9 +299,14 @@ mod tests {
             item: crate::items::Item::Log,
             count: 1,
         });
+        let torch = glam::IVec3::new(-15, 100, 16);
+        g.world.set(torch, crate::world::Block::Torch);
+        g.torch_life.insert(torch.to_array(), 600.);
+        g.world.torch_mounts.insert(torch.to_array(), [-1, 0, 0]);
         write(&g, &path).unwrap();
         let restored = read(&path).unwrap().unwrap();
         assert_eq!(restored.world.seed, 89);
+        assert_eq!(restored.world.torch_mounts, g.world.torch_mounts);
         assert_eq!(restored.drops, g.drops);
         assert_eq!(restored.world.edits, g.world.edits);
         assert_eq!(restored.player.inventory, g.player.inventory);
@@ -507,6 +544,178 @@ mod placed_furnace_save_tests {
         assert_eq!(migrated.player.inventory.processing, Furnace::default());
         write(&migrated, &path).unwrap();
         assert_eq!(read(&path).unwrap().unwrap().furnaces, migrated.furnaces);
+        fs::remove_file(path).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod expansion_tests {
+    use super::*;
+    use crate::{
+        game::STEP,
+        items::{Item, Stack},
+        world::Block,
+    };
+    use glam::IVec3;
+
+    #[test]
+    fn old_recipe_counts_expand_and_smelter_ruin_state_roundtrips() {
+        let mut g = Game::new(314159);
+        g.player.crafts[0] = 3;
+        let path =
+            std::env::temp_dir().join(format!("voxel-expansion-save-{}.json", std::process::id()));
+        let result = (|| -> Result<(), String> {
+            let mut old: serde_json::Value = serde_json::from_slice(&encode(&g)?).unwrap();
+            old["player"]["crafts"].as_array_mut().unwrap().truncate(15);
+            fs::write(&path, serde_json::to_vec(&old).unwrap()).unwrap();
+            let loaded = read(&path)?.unwrap();
+            assert_eq!(loaded.player.crafts.len(), RECIPES.len());
+            assert_eq!(loaded.player.crafts[0], 3);
+            assert!(loaded.player.crafts[15..].iter().all(|n| *n == 0));
+            let p = IVec3::new(2, 100, 0);
+            g.world.set(p, Block::Smelter);
+            let f = g.furnaces.entry(p.to_array()).or_default();
+            f.furnace = [
+                Some(Stack::new(Item::IronOre, 2)),
+                Some(Stack::new(Item::Coal, 1)),
+            ];
+            for _ in 0..130 {
+                g.tick_furnace();
+            }
+            let home = (-8..=8)
+                .find_map(|x| (-8..=8).find_map(|z| g.world.ruin_in_cell(x, z)))
+                .unwrap();
+            g.world.set(home + IVec3::Y, Block::Air);
+            g.player
+                .discoveries
+                .insert(format!("guardian:{:?}", home.to_array()));
+            g.player.inventory.add(Item::IronPick, 1);
+            write(&g, &path)?;
+            let mut loaded = read(&path)?.unwrap();
+            assert_eq!(loaded.furnaces, g.furnaces);
+            assert_eq!(loaded.player.discoveries, g.player.discoveries);
+            assert_eq!(loaded.world.get(home + IVec3::Y), Block::Air);
+            assert_eq!(loaded.player.inventory.count(Item::IronPick), 1);
+            for _ in 130..crate::items::SMELT_TICKS {
+                loaded.tick_furnace();
+            }
+            assert_eq!(
+                loaded.furnaces[&p.to_array()].furnace_output,
+                Some(Stack::new(Item::IronIngot, 1))
+            );
+            // Returning after reload does not summon a defeated guardian.
+            loaded.player.pos = (home.as_vec3() + glam::Vec3::new(0.5, 1.01, 4.5)).to_array();
+            loaded.tick(&crate::game::Input::default(), STEP);
+            assert!(
+                !loaded
+                    .entities
+                    .iter()
+                    .any(|(_, m)| matches!(m.kind, crate::ecs::MobKind::Guardian(_)))
+            );
+            Ok(())
+        })();
+        let _ = fs::remove_file(path);
+        result.unwrap();
+    }
+}
+
+#[cfg(test)]
+mod vegetation_tests {
+    use super::*;
+    use crate::{
+        items::{Item, Stack},
+        world::Block,
+    };
+    use glam::IVec3;
+    #[test]
+    fn plants_inventory_and_harvested_positions_survive_reload_and_old_craft_counts() {
+        let mut g = Game::new(314159);
+        let p = (-100..100)
+            .map(|x| IVec3::new(x, g.world.height(x, 0) + 1, 0))
+            .find(|p| g.world.get(*p).plant())
+            .unwrap();
+        g.world.set(p, Block::Air);
+        let flower = IVec3::new(-16, 100, 16);
+        g.world.set(flower - IVec3::Y, Block::Grass);
+        g.world.set(flower, Block::BlueFlower);
+        let soil = IVec3::new(10, 100, 10);
+        g.world.set(soil, Block::Dirt);
+        g.world.set(soil + IVec3::X, Block::Grass);
+        g.world.spread_grass(soil);
+        g.player.inventory.add(Item::WheatSeeds, 4);
+        g.player.inventory.add(Item::BlueFlower, 1);
+        g.player.inventory.add(Item::BlueDye, 2);
+        let path =
+            std::env::temp_dir().join(format!("voxel-plant-save-{}.json", std::process::id()));
+        write(&g, &path).unwrap();
+        let loaded = read(&path).unwrap().unwrap();
+        assert_eq!(loaded.world.get(p), Block::Air);
+        assert_eq!(loaded.world.get(flower), Block::BlueFlower);
+        assert_eq!(loaded.world.get(soil), Block::Grass);
+        assert_eq!(loaded.player.inventory, g.player.inventory);
+        let mut old: serde_json::Value = serde_json::from_slice(&encode(&g).unwrap()).unwrap();
+        old["player"]["crafts"].as_array_mut().unwrap().truncate(20);
+        fs::write(&path, serde_json::to_vec(&old).unwrap()).unwrap();
+        let mut loaded = read(&path).unwrap().unwrap();
+        assert_eq!(loaded.player.crafts.len(), RECIPES.len());
+        loaded.player.inventory.hand[4] = Some(Stack::new(Item::BlueFlower, 1));
+        assert_eq!(
+            crate::items::take_output(&mut loaded.player.inventory, 0),
+            Some(25)
+        );
+        assert_eq!(
+            loaded.player.inventory.cursor,
+            Some(Stack::new(Item::BlueDye, 1))
+        );
+        fs::remove_file(path).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod fluid_tests {
+    use super::*;
+    use crate::{
+        items::{Item, Stack},
+        world::Block,
+    };
+    use glam::IVec3;
+    #[test]
+    fn fluid_states_buckets_and_legacy_craft_history_survive_reload() {
+        let path =
+            std::env::temp_dir().join(format!("voxel-fluid-save-{}.json", std::process::id()));
+        let mut g = Game::new(41);
+        for (x, b) in [
+            Block::Water,
+            Block::FlowingWater(4),
+            Block::Lava,
+            Block::FlowingLava(8),
+            Block::Obsidian,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            g.world.set(IVec3::new(x as i32, 200, 0), b);
+        }
+        g.player.inventory.slots[0] = Some(Stack::new(Item::CopperWaterBucket, 1));
+        g.player.inventory.slots[1] = Some(Stack::new(Item::IronLavaBucket, 1));
+        write(&g, &path).unwrap();
+        let loaded = read(&path).unwrap().unwrap();
+        assert_eq!(g.world.edits, loaded.world.edits);
+        assert_eq!(g.player.inventory, loaded.player.inventory);
+        assert!(!loaded.world.fluid_pending.is_empty());
+        let mut legacy: serde_json::Value = serde_json::from_slice(&encode(&g).unwrap()).unwrap();
+        legacy["player"]["crafts"]
+            .as_array_mut()
+            .unwrap()
+            .truncate(26);
+        fs::write(&path, serde_json::to_vec(&legacy).unwrap()).unwrap();
+        assert_eq!(
+            read(&path).unwrap().unwrap().player.crafts.len(),
+            RECIPES.len()
+        );
+        legacy["edits"][0]["block"] = serde_json::json!({"FlowingWater":255});
+        fs::write(&path, serde_json::to_vec(&legacy).unwrap()).unwrap();
+        assert!(read(&path).is_err());
         fs::remove_file(path).unwrap();
     }
 }

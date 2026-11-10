@@ -88,3 +88,41 @@ forest travel, cave entry, combat, sleep, quit and reload. Note places where the
 next action is unclear or a resource is hard to find. The automated expedition
 checks the mechanics; this session will establish whether finding and using them
 feels good. Further rendering work should follow a repeatable measured hitch.
+
+## Iron/tundra expansion validation — 2026-11-09
+
+- Formatting, short Clippy with warnings denied, 65 quiet nextest tests, gameplay
+  smoke and expanded expedition passed.
+- Expedition now mines iron with copper tools, builds a crude smelter, processes
+  iron and crafts all three iron tools/weapons. It relocates to a naturally
+  generated tundra ruin, defeats the guardian through normal combat, mines and
+  collects the six-ingot cache, then verifies player, edits and all station
+  states after reload. Seed 314159's tested ruin is at (-1951, 174, -1902).
+- A native release Vulkan run rendered 900 frames from a temporary tundra ruin
+  save and exited cleanly. The inspected capture shows ruin walls/pillars,
+  the blue-gray guardian, held iron sword, iron tool/ore/ingot hotbar icons,
+  tundra HUD and combat damage feedback. It also shows the guardian pursuing
+  the stationary player to melee range. Sound was muted for this capture.
+- After excluding 180 startup frames, this static ruin view recorded frame
+  interval median/p95/worst of 6.059/6.332/9.483 ms, streaming/upload p95/worst
+  of 0.167/1.604 ms, and peak resident/queued/active chunks of 1295/933/2.
+  This is one native check, not a comparison with the earlier streaming tour.
+- Natural ruin search, full travel, smelter mouse ergonomics, combat balance and
+  extended play remain human evaluation work. Tundra temperature/clothing are
+  outside this content pass.
+
+## Automated functional suite
+
+Run `cargo nextest run` for the mechanics course and progression expedition along
+with the unit regressions. Run `cargo run -- --playtest` for both scenarios with
+success reports, or `./tools/verify.sh` for formatting, lint, tests and CLI checks.
+No display, audio service or existing save is required. Failures name the failed
+mechanics checkpoint or expedition action and return a failing test/exit status.
+
+The mechanics course covers movement speeds, sprint hunger gating, jumping,
+landing, solid walls, falls, hunger/rest drain, starvation, death/respawn inventory
+retention and timed torch expiry. The expedition covers resource-to-iron
+progression, placed processing stations, combat/loot, food/sleep, exploration
+rewards, the tundra guardian/cache and persistence. Both use controlled fixtures;
+see DESIGN.md for their setup and limits. They establish functional correctness,
+not fun, natural resource discoverability or UI/audio/visual quality.

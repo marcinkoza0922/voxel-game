@@ -18,7 +18,7 @@ The player approved deterministic seeded chunk streaming and persistent player s
 
 ## Slice boundaries and evolution
 
-Advanced metallurgy, magic/gems, breeding, quests, fluid simulation, logistics, electricity, automation, extra biomes and multiplayer are future work. Existing station/recipe/item registries and separate simulation should accommodate them. The slice has finite render distance but not a finite horizontal map. Terrain generation and CPU meshing run on bounded background workers using immutable jobs. Stream planning and GPU uploads remain on the main thread. Save format versions reject unsupported data rather than silently discarding it.
+Advanced metallurgy, magic/gems, breeding, quests, logistics, electricity, automation, extra biomes and multiplayer are future work. Existing station/recipe/item registries and separate simulation should accommodate them. The slice has finite render distance but not a finite horizontal map. Terrain generation and CPU meshing run on bounded background workers using immutable jobs. Stream planning and GPU uploads remain on the main thread. Save format versions reject unsupported data rather than silently discarding it.
 
 ## Validation
 
@@ -307,3 +307,495 @@ Smoke and expedition helpers explicitly approach their fixture loot.
 Successful world-item collection queues a short, bright rising pickup tone through
 the existing audio worker. Multiple drops collected in one step share one cue;
 out-of-range drops and pickups blocked by a full inventory remain silent.
+
+## Iron expeditions and tundra ruins
+
+The second tier extends the existing registries without changing earlier item
+discriminants or recipe indices. Iron veins occur in every biome, below twelve
+blocks of cover, and require a copper pickaxe. A table crafts a crude smelter
+from six cobblestone and two copper ingots. It shares placed-furnace inventory,
+reach, transfer, fuel, XP, mining protection and persistence rules, but can also
+process iron. Basic furnaces cannot process iron and consume no fuel trying.
+Both processors take five seconds and 1,000 joules per item. Iron axes, picks and
+swords use the existing tool patterns; durability is 600, harvesting tier four,
+and sword damage 19 before stat bonuses (copper: 360, tier three, damage 14).
+
+Tundra uses a separate smooth climate field outside a 240-block spawn exclusion.
+It has snow-colored solid surface blocks, no oak trees, and the existing hill,
+mountain, cave and ore generation. Temperature, clothing and snow accumulation
+remain future systems; current expedition preparation consists of food, lights,
+a bed/camp and better weapons. Natural generation now includes the new biome
+and ores in existing worlds too: generated terrain is reconstructed from seed,
+so untouched terrain can change, while saved block edits remain authoritative.
+This is an intentional content-generation change, not a save reset.
+
+Each 256-block horizontal cell has one seeded ruin candidate. Only tundra sites
+with gentle corner elevations qualify. A 13-block square foundation, broken
+walls, four taller pillars and a south entrance surround a blue iron cache.
+Foundation fill and interior clearing make the ruin traversable. Column halo
+generation and direct sampling use the same structure rules; normal chunk bounds
+include the structures. Ruins use code-native colored voxels and require no assets.
+
+Approaching within 28 blocks summons one ruin guardian. It has 65 health,
+level four, 2.2-block/second pursuit and 12 melee damage, compared with the husk's
+30 health, level one, 1.7 speed and seven damage. Blue-gray body/head colors and
+the target label distinguish it. The guardian uses existing collision, line of
+sight, melee, hit feedback and loot systems. Defeat drops coal and grants a
+one-time 60-XP completion discovery in addition to normal kill XP. Initial ruin
+discovery grants 50 XP. The cache refuses mining until that ruin's guardian has
+been defeated, then drops six iron ingots. Its removed block persists, so the
+reward cannot be farmed by reloading. Guardian completion is keyed by coordinates
+in existing player discoveries. Living guardians remain transient and respawn
+when revisiting/reloading an unfinished ruin; defeated ones do not.
+
+Save v3 retains its existing structure. New items/blocks serialize by enum name,
+placed smelters use the furnace-state list, and 15-entry craft histories expand
+to twenty entries with zero counts for new recipes. Legacy v1 inventory migration
+only indexes the original 22 items. Unknown/malformed recipe-history lengths
+still fail validation. No user save is rewritten during migration alone.
+
+Validation includes all recipe patterns, basic-furnace iron rejection, saved
+half-finished iron processing, exact fuel accounting, copper-pick gating,
+deterministic tundra/ruin sampling and cross-chunk halos, sealed-cache rewards,
+single guardian spawning/completion, legacy craft history expansion, placed
+smelter persistence and reload without guardian/reward regeneration.
+The expanded tools/expedition.rs mines and crafts through iron using normal
+transactions, then relocates to a natural tundra ruin, fights its guardian and
+collects the cache. It retains controlled resources and diagnostic travel;
+natural discovery difficulty and combat balance still need human play.
+
+Native validation: a bounded 900-frame release Vulkan session using a temporary
+ruin save rendered and exited cleanly. Capture inspection confirmed ruin geometry,
+the guardian, held iron sword, new hotbar icons and damage feedback. The session
+was muted. See docs/PLAYTEST.md for measured frame times and remaining manual checks.
+
+## Automated functional playtesting
+
+`tools/playtest.rs` provides a deterministic, display-free mechanics course at
+seed 314159, with cleared headroom and a stone floor at y=299. Fixtures set up
+conditions (including low hunger, a high fall, death, and a shortened torch timer);
+normal `Game::tick` calls at 60 Hz drive each action. Bounded frame counts and
+checkpoint-specific errors make failures repeatable without real-time waits.
+The course checks walking distance, sprint speed and its hunger gate, hunger/rest
+drain, jumping and landing, wall collision, fall damage, starvation, respawn
+vitals/inventory retention, and torch presence before/after expiry.
+
+`playtest::tests::mechanics_course` and
+`playtest::tests::progression_expedition` are ordinary nextest tests, so the
+functional scenarios run with `cargo nextest run`. The latter reuses
+`tools/expedition.rs` for mining, crafting, station placement, timed processing,
+combat/loot, eating, sleep safety, biome discovery, ruin completion and save/load.
+`cargo run -- --playtest` runs both with concise success reports and a nonzero
+exit on failure; `tools/verify.sh` also checks that command-line entry point.
+The expedition uses a temporary save, cleans it up on success or failure, and
+never opens the player's save. Neither scenario starts a window or audio worker.
+
+These are mechanics contracts, not an autonomous exploration agent: controlled
+resource blocks, inventory/grid setup and diagnostic relocation bypass resource
+search, mouse/UI interactions and travel difficulty. Shortened timers avoid
+waiting for long survival cycles. Rendering, audible sound quality, input wiring,
+performance, balance and fun still require separate native/human checks. Existing
+unit tests cover detailed transaction rejection and persistence edge cases.
+Add new functional checkpoints here or extend the expedition as systems arrive;
+keep fixtures explicit and assert observable outcomes through game actions.
+
+## Pixel material art
+
+`art` owns deterministic 32×32 RGB material tiles for every current block,
+with separate side/top/underside layers. Broad pixel clusters establish bark
+ridges, cut-log rings, grass overhangs, soil pebbles, granite veins, embedded
+ore clusters, leaf clusters, staggered plank joints, masonry mortar, furnace
+openings, crafting grids, cloth, snow, sand ripples and the cache emblem.
+Full-resolution grain adds fine variation. Ruins have moss and cyan carvings.
+The textures are generated from fixed integer hashes at startup, without files,
+network access, world generation changes or save changes.
+
+The renderer uploads a 60-layer texture array with six box-filtered mip levels
+in linear color. Nearest texel filtering preserves close pixel edges; linear
+mip filtering reduces distant shimmer. World vertices carry UV/layer attributes
+and retain existing corner AO and seeded block brightness variation. Untextured
+geometry uses a negative layer sentinel. Face counts and chunk geometry are
+unchanged; vertex stride increases from 36 to 48 bytes. The shadow pass uses the
+same vertex layout. Inventory block icons sample the same materials within their
+existing 16-pixel silhouettes; held block cubes use full material UVs.
+
+Held tools gain grip wraps, collars and brighter cutting edges. Creatures gain
+recessed faces, eyes, brows, belts and buckles, with moss patches for husks and
+masonry shoulder armor/cyan chest details for guardians. Rendered creatures face
+the player; this is cosmetic and does not change AI or collision bounds.
+
+Validation: short Clippy, all 68 quiet nextest tests, and diff whitespace checks
+passed. Material regression coverage checks complete mip sizes/opaque pixels,
+face-specific textures and distinct ore layer mapping. A bounded 240-frame native Vulkan run exited cleanly; its terrain capture was
+inspected for grass, soil edges, bark, foliage, shadows and the held axe. Inspection
+caught and corrected float-to-layer truncation artifacts by rounding the tile
+layer before integer conversion. The smoke gameplay/save round trip also passed.
+Creature details and all crafted materials have not been individually inspected
+in native views.
+
+Torch appearance and mounting: placed and held torches share a procedural mesh
+with a split-grain wood handle, linen head, dark binding and stepped amber flame.
+The flame uses an unlit material marker so it stays visible at night. Wall torches
+lean outward from the clicked support face; floor torches stand upright. Torches
+require a solid wall or floor, reject other torches as supports, and disappear
+when their support is removed. Support offsets persist in an optional
+`torch_mounts` save field (older saves retain upright torches), and worker snapshots
+carry these offsets so streamed meshes preserve orientation. Torch light positions
+follow the flame head; held and placed light strength is 0.8, reduced from 1.0,
+with the existing nine-block falloff radius retained.
+
+Torch validation: all 69 quiet nextest tests, short-format Clippy, formatting and
+headless gameplay/save smoke passed. Regressions cover wall placement, rejection
+of torch supports, support removal, and saved attachment round trips. The updated
+appearance has not been checked in a live GPU window.
+
+## Ground vegetation and light-transmitting leaves
+
+Natural generation places non-solid shrubs, tall-grass and six colored flower blocks
+above grass surfaces, with the same seed/coordinate hash used by their meshes.
+Three tapered blade tufts vary in position, orientation, height and green shading.
+Grass stature varies per plant from 0.16 to 0.95 blocks, with individual
+tufts at 72–100% of that height, mixing short growth and nearly block-high blades. A smooth seeded 14-block density field gives 2% placement in open
+regions, 12% in transition areas and 38% inside denser tufts. Flower placement
+keeps its previous independent abundance. Flowers have bent two-segment stems,
+paired angled leaves, four to six irregular petals, tilted heads and golden
+centers in red, yellow, purple, white/cream, pink and blue. Petal size, rotation,
+height and shade vary deterministically. Shrubs occur at about 2% of remaining
+sites, with seven asymmetric leaf clusters and woody branches. They are
+non-solid, harvest without a drop, and share plant support/removal persistence.
+All vegetation geometry remains inside its own voxel. Snow, sand
+and ruin floors receive no plants. Existing unedited terrain gains these plants.
+
+Plants occupy their own streamed voxels, are selectable with reduced height/width
+bounds and use the regular mining, particles and world-drop systems. They break
+in 0.12 seconds by hand or tool without consuming tool durability. Tall grass
+drops one wheat seed at one in eight seeded coordinates; flowers always drop
+one item of their color. Breaking plants writes ordinary air edits so they stay
+removed across streaming and reload. Removing their dirt support or replacing it with non-dirt
+removes the plant. Bare and grass-covered dirt both support plants. Sampling
+checks the actual supporting block, including natural outcrops and saved edits.
+Flower items can be replanted on either form of dirt, and each crafts into one matching dye
+in any personal/table crafting cell. Seeds and dyes are collectible ingredients;
+wheat cultivation and dye application remain future systems. Flowers, seeds and
+dyes have distinct inventory/drop icons; held flowers use the 3D plant mesh.
+
+Item/block variants and six hand recipes are appended to preserve existing
+indices. Saves retain v3, with enum names for new items and blocks; known legacy
+craft histories of fifteen or twenty entries expand to the current recipe count.
+
+Leaf faces use a stable world-space perforation mask in both color and shadow
+passes, allowing views and sunlight through small gaps. Internal leaf faces and
+solid faces beside leaves remain visible through those gaps. Leaf and grass
+lighting includes softer reverse-side sunlight transmission. This approximates
+translucency with cutouts and backlighting; it does not use blended transparent
+voxel faces. The shadow pipeline now has a depth-only fragment stage for the
+mask and renders both sides of grass blades. Existing collision rules remain.
+
+Validation: all 79 quiet nextest tests and short-format Clippy passed. Mesh and
+world regressions cover repeatable shapes, sparse varied grass, natural/halo
+agreement, plant selection and support removal. Gameplay checks cover chance
+seed drops, all six flower drops and preserved tool wear. Craft pattern tests
+cover all dye recipes; save checks cover harvested natural plants, placed
+flowers, new items and twenty-entry craft-history migration. Native capture
+could not start because the session has no Wayland compositor; visual quality
+and GPU shader validation still need a desktop run.
+
+## Dirt and spreading grass cover
+
+Both bare and grass-covered soil are labeled Dirt and drop/place the existing
+Dirt item. The serialized `Grass` variant remains the internal covered-soil
+state to retain save compatibility; `Dirt` is bare soil. Surface cover and tall
+grass objects are independent, so gaining cover does not respawn harvested plants.
+
+Every five active simulation seconds, exposed bare dirt within 32 blocks of
+the player can gain cover from a horizontally adjacent covered dirt block,
+including a one-block height difference for slopes. Both source and destination
+require a non-solid block directly above. Exposure here means an uncovered top
+face; it does not require a sky ray. Pausing stops this timer; reloading restarts
+the five-second interval. Candidate positions come from edits and blocks directly
+below edits, including natural dirt uncovered by excavation. Unedited natural
+surfaces already have cover. Each pulse applies up to 32 simultaneous conversions
+so cover advances one step per pulse; ordinary block edits persist the result
+and invalidate streamed meshes. No scan of all resident voxels is needed.
+
+Grass-covered dirt wraps its grassy material around exposed one-block side
+faces. A cliff is detected per face when the block below continues the solid
+column but the neighboring block below that face is empty/non-solid: this is
+at least a two-block drop. Cliff sides retain the existing thin grassy lip
+and bare soil beneath. Meshing uses the chunk halo, including across boundaries;
+changing adjacent terrain updates the classification. Isolated soil cubes also
+get grassy sides, since they have no continuing cliff column.
+
+Regression checks cover sparse/clustered grass distribution and height, soil
+spread timing, covered/isolated soil rejection, slope and chunk-boundary spread,
+natural dirt exposed by digging, saved cover, and step-versus-cliff materials.
+The latest headless tests do not substitute for a native visual check.
+
+## Shrub and turf appearance refinement
+
+Shrubs now vary deterministically between four and ten leaf clusters, with
+independent overall spread, stature, rotation, cluster size and olive-to-cool-green
+color variation. Woody branches retain opaque shading. Shrub leaf geometry uses
+material marker -4 for fine world-space cutout gaps in both color and shadow
+passes, plus the existing reverse-side foliage sunlight transmission. This gives
+partial visibility and backlit leaves without sorted alpha blending. Shapes stay
+inside their plant voxel and existing selection bounds.
+
+Grass-covered soil now uses native 32px overlapping narrow blade strokes with
+varied length, bend, shade and highlighted tips, replacing broad two-pixel green
+clusters. The same blade material extends through the uneven grassy cliff lip;
+step sides continue to use the full turf texture. Other materials retain their
+existing clustered grain and all tiles retain their generated mipmaps.
+
+
+## Procedural skybox and day/night lighting
+
+The existing saved clock drives a full-screen procedural skybox rendered before
+world geometry without writing depth. Inverse camera projection reconstructs
+world-space viewing directions; translation does not move the sky. No authored
+cubemap assets are required. The sky blends horizon and zenith colors through
+day, twilight and night, with a warm glow toward the rising/setting sun, visible
+sun and moon discs, and fixed spherical star cells that fade in at night.
+Distance fog samples the same atmosphere so terrain blends into the horizon.
+
+One day remains 900 active simulation seconds. Phase zero is sunrise, 0.25 noon,
+0.5 sunset and 0.75 midnight; new games and sleep retain their existing 0.28
+phase. Saving/loading retains the clock, and pausing stops it. The sun moves
+along a tilted orbit; the opposite moon provides weaker cool light at night.
+The shadow camera follows the active celestial light, while ambient brightness
+and directional color transition with daylight. Torch lighting stays additive,
+so it becomes more prominent at night. This is raster lighting with one shadow
+map, without atmospheric scattering or moon phases.
+
+Validation: all 81 quiet nextest tests and short-format Clippy passed. The orbit
+regression checks horizon crossings, noon/midnight brightness, unit directions
+and repeatability across days. A native three-frame renderer check could not
+start because no Wayland compositor is available in this session; GPU shader
+validation and visual review require a desktop run.
+
+## Offscreen headless runner
+
+`tools/headless.rs`, included by main as a Rust module, implements `--headless`.
+Main loads/creates the selected world and branches before creating the winit
+event loop or audio. The renderer shares initialization and every world, shadow,
+sky, held-item and UI render pass between surface-backed and offscreen targets.
+The headless adapter request has no compatible surface; its framebuffer is an
+RGBA8 sRGB texture with render-attachment/copy-source usage. Existing padded
+GPU readback writes the final PPM. Both paths drain GPU work before teardown.
+No new dependencies or save-format changes are needed.
+
+Headless execution uses one fixed simulation step per frame, no player input,
+and no realtime pacing; pack mode ticks only furnaces. Existing frame, capture,
+pack, seed/save, tour and profile options apply. The default limit is 240 frames,
+and zero frames are rejected. Terrain workers are polled until their queue and
+active jobs empty at startup, tour relocations and the final frame; each wait
+has a 120-second deadline and a 1ms polling delay. This avoids incomplete final
+terrain from fast offscreen loops, though intermediate streaming is asynchronous.
+CSV fields retain their existing meaning; streaming waits are included and
+headless draw times have no compositor/VSync component. The runner flushes the
+profile and saves on successful completion; render failures propagate to a
+nonzero process exit. README.md documents usage and software Vulkan support.
+
+Headless validation: with DISPLAY and WAYLAND_DISPLAY unset, a two-frame Vulkan
+run completed, wrote a 1280×800 PPM with verified header/pixel count and varied
+color data, flushed CSV timings, and saved the world. All 81 quiet nextest tests,
+short-format Clippy, formatting, and gameplay/persistence smoke passed. Software
+Vulkan and interactive presentation were not separately exercised for this change.
+
+## Cave formations
+
+Caves now use seed-hashed 160-block cells with three shapes: low winding
+passages, tall narrow crevices, and chasms up to roughly 44 blocks wide and
+48 blocks high. Elliptical ends and sinusoidal lateral bends shape each formation.
+Their floors lie about 48 blocks below the cell's terrain anchor. Roughly a
+third of candidates also carve a six-block-high descending entrance corridor;
+entrances are omitted where the endpoint differs from the anchor by more than
+12 blocks, keeping ramp steps at most one block. Openings cut through the surface
+soil and vegetation, and trees cannot root over a carved opening. The inner
+32-block spawn region, bottom four world layers, and authored ruin foundations
+remain protected. Formations are local features; they do not guarantee a connected
+worldwide cave network or introduce underground biomes.
+
+Cave intervals are computed once per column in chunk halos, using the same rules
+as direct terrain queries. Block edits still override generation. This intentionally
+changes generated terrain in existing saves without changing the save format;
+previous player edits persist. The expedition helper searches the full underground
+range for cave collision fixtures. Regression coverage checks all formation scales,
+surface openings, bedrock, spawn safety and halo/query agreement across three seeds.
+
+## Cave darkness and moonlight
+
+Terrain workers attach a sky exposure value to vertices using the highest opaque
+voxel in each sampled vertical column, including saved edits above the chunk.
+Leaves transmit sky light. Column results are cached per mesh. Edits invalidate
+resident meshes throughout neighboring vertical columns so building or removing
+a roof updates exposure below it. Dynamic world objects use the same calculation.
+Ambient light, celestial light and atmospheric fog are multiplied by exposure;
+sealed caves therefore have no illumination without torches. Torch flames remain
+emissive and torch lighting remains additive. Midnight ambient is near zero and
+moonlight peaks at 2.5% of sunlight, fading toward the horizon.
+Nearby sky openings now contribute indirect light along sixteen horizontal or
+upward rays, blocked by opaque voxels. Light fades quadratically over twelve
+blocks into an entrance, reaching zero in deep caves or sealed rooms. Exposure,
+occupancy and roof queries are cached per mesh; worker snapshots include edits
+within that reach across chunk boundaries. This approximates entrance skylight;
+multiple light bounces and torch occlusion through walls are not simulated.
+Existing shadow maps continue to provide directional surface shadows.
+
+## Darkness-gated monsters and movement controls
+
+Husks and ruin guardians spawn only when sky exposure multiplied by the current
+daylight is at most 0.1 and nearby held/placed torch light is at most 0.1. The
+spawn check reuses the renderer's sky-access sampling, including roofs and nearby
+openings; torch falloff uses the same nine-block range. Existing monsters remain
+when light changes. Husk candidates search supported empty positions within eight
+blocks vertically of the player before trying the surface, allowing cave spawns.
+
+Double-tapping W within 300 ms starts sprinting until W is released. Key repeats
+do not count as taps; focus/menu capture resets the gesture. Either Shift key
+walks at 45% speed and overrides sprint. Sprint retains its hunger requirement.
+Grounded movement automatically jumps toward one-block obstacles with headroom;
+Shift disables this. Shift walking checks support at every horizontal collision
+substep on both axes and stops at ledges, including diagonal approaches. Space
+continues to provide manual jumping. Regression tests cover daylight, night, roofs,
+torches, automatic climbing, and diagonal edge protection.
+
+## Grassland detail
+
+Grassland keeps open sightlines, with existing tall-grass patches supplemented by
+meadow-clustered flowers and sparse berry shrubs between meadows. Existing flower
+colors, harvesting and planting rules remain in use. Low stone outcrops use one
+seeded candidate per 48-block cell (one third qualify), with centers inset ten
+blocks to keep neighboring formations apart. Five families of elliptical lobes
+produce rounded boulders, broad slabs, ridges, split rocks and uneven clusters,
+with seeded size, rotation and reflection variations and heights of one to three
+blocks. A gentle grassland surface check keeps them grounded. They use ordinary mineable stone;
+direct queries and chunk halo generation share the same rules. As with earlier
+terrain additions, untouched generated terrain changes while saved edits win.
+
+Small groups of up to three sheep appear on clear grassland surfaces near the
+player, checked every 18 seconds after the initial four-second delay. At most six
+sheep are active, independently of the hostile cap. They graze, wander slowly,
+avoid nearby players, step over terrain and never attack or block sleep. Sheep
+have 16 health and male/female names; males have small horns. Their code-native
+model has a woolly body, four animated legs and a lowered grazing head. They use
+the existing meat drop and cooking loop. Sheep, like other active creatures, are
+transient and despawn beyond 90 blocks; breeding, wool collection and persistent
+livestock are future work. No external assets or helper tools are required.
+
+
+## Plant soil support and future biome soils
+
+Plants require a dirt block directly below them, whether bare or grass-covered.
+Placement, direct sampling, chunk halos and support removal share this rule;
+stone, wood, sand and snow do not support plants. Switching between bare and
+covered dirt preserves plants.
+
+Future biomes may have differently colored dirt blocks. These variants should
+function like ordinary dirt, including plant support, grass cover, digging and
+placement behavior. Color is a biome distinction rather than a separate soil
+mechanic. Biome-specific dirt colors are planned, not implemented yet.
+
+
+## Water, lava and buckets
+
+`fluid` adds source-driven discrete fluids. Water and lava are non-solid blocks;
+source variants and flowing variants (levels 1–7, or 8 for falling columns) are
+ordinary serialized block edits. Each 0.2 active seconds, at most 512 nearby
+frontier entries and their six neighbors are evaluated against the old world,
+then changes commit together through `World::set`. Lava advances every third
+pulse (0.6 seconds). Water loses one level per horizontal step, reaching seven
+blocks; lava loses two, reaching three blocks. Downward flow retains its strength.
+Horizontal flow needs support beneath its supplying neighbor, so waterfalls
+continue down before spreading. Removing sources or building dams wakes adjacent
+cells and disconnected flow decays away. Flow replaces plants and extinguishes
+torches; solid blocks contain it and can replace it through normal placement.
+
+Water becomes a source with at least two horizontal source neighbors and a solid
+block or water source below. This includes filling an empty supported cell and
+restoring a scooped corner of a 2×2 pool. Diagonal/vertical neighbors do not count;
+lava never renews. Contact on any face converts a lava source to Obsidian and
+flowing lava to Cobble. Obsidian is placeable and requires an iron pickaxe to
+harvest. This is an approximation of Minecraft-style behavior: no conserved
+volume, pressure, slope-search routing, fluid currents, waterlogging, fire
+spread or exact edition-specific water/lava reaction rules.
+
+The ordered frontier provides deterministic bounded work. Cells beyond 64 blocks
+on any axis sleep until approached. Changed blocks wake themselves and six
+neighbors; accepting streamed chunks seeds their fluid cells. Loading a save
+rebuilds the frontier around saved edits. Settled fluids require no ongoing full
+world scan. Streamed meshes retain ordinary edit revision checks. A growing flow
+can invalidate in-flight mesh work; a pulse is not guaranteed to process every
+active cell during large changes. Simulation timers and player breath reset on
+reload; fluid blocks and bucket contents persist. Save version stays v3, legacy
+26-entry craft histories expand, and invalid fluid levels are rejected.
+
+Deterministic 64-block cells occasionally contain small flat, stone-lined pools
+of water or lava on gentle surfaces. Pools remain outside the protected spawn
+area, share direct/halo sampling, and use ordinary fluid sources. As with other
+terrain additions, untouched terrain changes in existing worlds while edits win.
+Tundra water ponds have one solid, mineable layer of pale blue, textured ice at
+surface level and liquid source water underneath. The pond center's biome decides
+the entire lid, so a biome boundary cannot leave half a pond frozen. Ice drops no
+item and does not automatically regrow; breaking it exposes the water below.
+
+Seeded 384-block cells can also contain two irregular inland lakes (roughly 40–60
+blocks across) connected by a winding, roughly ten-block-wide river. Candidate
+sites reject steep endpoint/river elevations and stay outside the starting area.
+Each system shares a level water surface, has shallows and deeper lake centers,
+and uses sand banks and a sealed bed down to eight blocks below the surface.
+These larger bodies remain liquid in every biome, including tundra. Waterways
+override small pools and caves; ruins retain priority. Trees whose roots would
+intersect waterways or pools are suppressed. Streaming bounds include lake beds
+and elevated water surfaces. Direct queries and chunk halos use identical seeded
+sampling; player edits still override generated water and ice. Existing unedited
+terrain gains these features on load. Rivers currently connect local lake pairs;
+there is no global drainage network, current simulation, seasonal freeze/thaw,
+ocean generation or underground lava-lake generation.
+
+Tests cover frozen and warm ponds, breaking ice to expose liquid, liquid tundra
+rivers/lakes, basin beds, and agreement between chunk halos and direct queries.
+
+Crafting-table bucket recipes use three planks, copper ingots or iron ingots in
+a V. Each bucket occupies one slot and carries one source block. Right-click an
+exposed source to scoop it, or a surface to pour it next to the hit face. Flowing
+blocks cannot be scooped. Wood and copper carry water; iron carries water or lava.
+Bucket eligibility and empty/filled variants live in `items`, ready for future
+metals when their material progression is added. Craft indices are appended.
+Inventory icons and held geometry distinguish bucket material and contents.
+
+Players move more slowly in fluid; drag limits falling speed, Space swims upward,
+and landing in fluid avoids fall damage. Submersion follows the rendered fluid
+height. Swimming toward a clear one-block bank applies an exit jump once the
+eye is above the fluid, using the same obstacle and headroom checks as land
+auto-jump. This lets the feet clear the shore despite swim drag.
+An underwater eye consumes a 15-second air reserve; exhaustion deals
+8 damage/second, and air recovers at five seconds per second above water. Lava
+contact deals 25 damage/second. HUD overlays tint submerged views and show air.
+Creature swimming, drowning and fluid effects on loose items remain future work.
+
+Water uses a separate alpha-blended pass with depth testing and no depth writes,
+after opaque terrain. Chunk buffers partition opaque and fluid vertex ranges;
+fluid chunks draw from far to near. Faces shared by equal-height fluid cells are
+culled using each cell's effective height: a fluid cell covered by the same
+fluid fills its whole voxel. This also applies to neighboring columns across
+chunk boundaries, preventing internal translucent strips beneath deep water.
+Flow levels lower exposed surfaces. The shader adds ripples; lava is
+opaque/emissive in this pass and supplies nearby warm lights through the existing
+16-light budget. Exposed lava is grouped into four-block cells to avoid stacking
+a light for every voxel; each group uses strength 0.22. Lava light also suppresses
+nearby hostile spawning. Fluids transmit sky light and cast no shadow. Chunk sorting is
+an approximation: transparent faces within a chunk are not sorted individually,
+and there is no refraction or reflection simulation.
+
+Validation: 101 quiet nextest tests pass, including seven-block range across
+chunk boundaries, gravity, draining, dams, slower/shorter lava, contact reactions,
+supported source regeneration and 2×2 refilling, sleeping distant frontiers,
+height-aware submersion, natural-pool halo agreement, bucket gameplay for all
+three materials, swimming/damage, mesh surfaces, saved fluids/buckets and legacy
+craft-history migration. Short-format Clippy and the gameplay/save smoke pass.
+The offscreen Vulkan renderer also completes with the new fluid pipelines.
+A captured side-by-side water/lava basin was visually inspected, including the
+transparent water, lava surface, bucket icon and held bucket. The first capture
+exposed excessive light stacking; grouping/reducing lava lights corrected it in
+a second inspected capture. Interactive swimming has not been manually played.

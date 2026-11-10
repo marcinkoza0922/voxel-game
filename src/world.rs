@@ -25,13 +25,76 @@ pub enum Block {
     Torch,
     Sand,
     Bed,
+    Iron,
+    Smelter,
+    Snow,
+    RuinStone,
+    Reliquary,
+    TallGrass,
+    RedFlower,
+    YellowFlower,
+    PurpleFlower,
+    WhiteFlower,
+    PinkFlower,
+    BlueFlower,
+    Shrub,
+    Water,
+    FlowingWater(u8),
+    Lava,
+    FlowingLava(u8),
+    Obsidian,
+    Ice,
 }
 impl Block {
     pub fn solid(self) -> bool {
-        !matches!(self, Self::Air | Self::Torch)
+        !matches!(self, Self::Air | Self::Torch) && self.fluid().is_none() && !self.plant()
+    }
+    /// Source is level zero; falling columns use level eight.
+    pub fn fluid(self) -> Option<(bool, u8)> {
+        match self {
+            Self::Water => Some((false, 0)),
+            Self::FlowingWater(n) => Some((false, n)),
+            Self::Lava => Some((true, 0)),
+            Self::FlowingLava(n) => Some((true, n)),
+            _ => None,
+        }
+    }
+    pub fn replaceable(self) -> bool {
+        self == Self::Air || self == Self::Torch || self.plant() || self.fluid().is_some()
+    }
+    pub fn fluid_height(self) -> f32 {
+        match self.fluid() {
+            Some((_, 0 | 8)) => 0.9,
+            Some((_, n)) => (8 - n.min(7)) as f32 / 9.,
+            None => 1.,
+        }
+    }
+    pub fn dirt(self) -> bool {
+        matches!(self, Self::Dirt | Self::Grass)
+    }
+    pub fn plant(self) -> bool {
+        matches!(self, Self::TallGrass | Self::Shrub) || self.flower_index().is_some()
+    }
+    pub fn flower_index(self) -> Option<usize> {
+        FLOWERS.iter().position(|b| *b == self)
+    }
+    pub fn processor(self) -> bool {
+        matches!(self, Self::Furnace | Self::Smelter)
     }
     pub fn color(self) -> [f32; 3] {
         match self {
+            Self::Water | Self::FlowingWater(_) => [0.10, 0.37, 0.74],
+            Self::Lava | Self::FlowingLava(_) => [1., 0.24, 0.015],
+            Self::Ice => [0.56, 0.79, 0.91],
+            Self::Obsidian => [0.13, 0.08, 0.20],
+            Self::Shrub => [0.20, 0.39, 0.13],
+            Self::TallGrass => [0.25, 0.45, 0.12],
+            Self::RedFlower => FLOWER_COLORS[0],
+            Self::YellowFlower => FLOWER_COLORS[1],
+            Self::PurpleFlower => FLOWER_COLORS[2],
+            Self::WhiteFlower => FLOWER_COLORS[3],
+            Self::PinkFlower => FLOWER_COLORS[4],
+            Self::BlueFlower => FLOWER_COLORS[5],
             Self::Air => [0.; 3],
             Self::Grass => [0.34, 0.52, 0.23],
             Self::Dirt => [0.38, 0.25, 0.16],
@@ -47,12 +110,29 @@ impl Block {
             Self::Torch => [1., 0.65, 0.18],
             Self::Sand => [0.76, 0.69, 0.47],
             Self::Bed => [0.63, 0.24, 0.20],
+            Self::Iron => [0.59, 0.54, 0.49],
+            Self::Smelter => [0.24, 0.27, 0.30],
+            Self::Snow => [0.85, 0.91, 0.95],
+            Self::RuinStone => [0.35, 0.43, 0.48],
+            Self::Reliquary => [0.45, 0.72, 0.86],
         }
     }
     pub fn name(self) -> &'static str {
         match self {
+            Self::Water | Self::FlowingWater(_) => "Water",
+            Self::Lava | Self::FlowingLava(_) => "Lava",
+            Self::Ice => "Ice",
+            Self::Obsidian => "Obsidian",
+            Self::Shrub => "Shrub",
+            Self::TallGrass => "Tall grass",
+            Self::RedFlower => "Red flower",
+            Self::YellowFlower => "Yellow flower",
+            Self::PurpleFlower => "Purple flower",
+            Self::WhiteFlower => "White flower",
+            Self::PinkFlower => "Pink flower",
+            Self::BlueFlower => "Blue flower",
             Self::Air => "Air",
-            Self::Grass => "Grass",
+            Self::Grass => "Dirt",
             Self::Dirt => "Dirt",
             Self::Stone => "Granite",
             Self::Log => "Oak log",
@@ -66,19 +146,117 @@ impl Block {
             Self::Torch => "Torch",
             Self::Sand => "Sand",
             Self::Bed => "Bedroll",
+            Self::Iron => "Iron ore",
+            Self::Smelter => "Crude smelter",
+            Self::Snow => "Snow",
+            Self::RuinStone => "Ancient masonry",
+            Self::Reliquary => "Sealed iron cache",
         }
+    }
+}
+pub const FLOWER_COLORS: [[f32; 3]; 6] = [
+    [0.91, 0.15, 0.19],
+    [0.98, 0.75, 0.10],
+    [0.65, 0.28, 0.86],
+    [0.95, 0.89, 0.77],
+    [0.95, 0.34, 0.59],
+    [0.24, 0.48, 0.94],
+];
+pub const FLOWERS: [Block; 6] = [
+    Block::RedFlower,
+    Block::YellowFlower,
+    Block::PurpleFlower,
+    Block::WhiteFlower,
+    Block::PinkFlower,
+    Block::BlueFlower,
+];
+pub fn vegetation_hash(seed: u64, support: IVec3) -> u64 {
+    hash(seed ^ 0x767567, support.x, support.y, support.z)
+}
+pub fn grass_height(h: u64, tuft: u32) -> f32 {
+    let bits = h.rotate_right(tuft * 17);
+    let stature = 0.16 + ((h >> 56) & 255) as f32 / 255. * 0.79;
+    stature * (0.72 + ((bits >> 16) & 255) as f32 / 255. * 0.28)
+}
+// Small selection bounds let rays pass above low grass or beside flower stems.
+fn plant_hit(seed: u64, p: IVec3, block: Block, origin: Vec3, dir: Vec3, reach: f32) -> bool {
+    let h = vegetation_hash(seed, p - IVec3::Y);
+    let (min, max) = if block == Block::TallGrass {
+        (
+            Vec3::new(0.02, 0., 0.02),
+            Vec3::new(
+                0.98,
+                (0..3).map(|i| grass_height(h, i)).fold(0., f32::max),
+                0.98,
+            ),
+        )
+    } else if block == Block::Shrub {
+        (Vec3::new(0.06, 0., 0.06), Vec3::new(0.94, 0.7, 0.94))
+    } else {
+        (Vec3::new(0.15, 0., 0.15), Vec3::new(0.85, 0.85, 0.85))
+    };
+    let mut near = 0_f32;
+    let mut far = reach;
+    for axis in 0..3 {
+        let low = p.as_vec3()[axis] + min[axis];
+        let high = p.as_vec3()[axis] + max[axis];
+        if dir[axis].abs() < 1e-6 {
+            if origin[axis] < low || origin[axis] > high {
+                return false;
+            }
+        } else {
+            let a = (low - origin[axis]) / dir[axis];
+            let b = (high - origin[axis]) / dir[axis];
+            near = near.max(a.min(b));
+            far = far.min(a.max(b));
+        }
+    }
+    near <= far
+}
+pub fn vegetation_block(seed: u64, support: IVec3) -> Block {
+    let h = vegetation_hash(seed, support);
+    let meadow = noise(
+        seed ^ 0x6d656164,
+        support.x as f32 / 24.,
+        support.z as f32 / 24.,
+    );
+    // Flowers gather in meadows, with occasional blooms between them.
+    if !h.is_multiple_of(5) && (h >> 32).is_multiple_of(if meadow > 0.55 { 8 } else { 43 }) {
+        return FLOWERS[((h >> 48) % 6) as usize];
+    }
+    if meadow < 0.48 && (h >> 20).is_multiple_of(61) {
+        return Block::Shrub;
+    }
+    let patch = noise(
+        seed ^ 0x74756674,
+        support.x as f32 / 14.,
+        support.z as f32 / 14.,
+    );
+    let density = if patch > 0.65 {
+        38
+    } else if patch > 0.5 {
+        12
+    } else {
+        2
+    };
+    if h % 100 < density {
+        Block::TallGrass
+    } else {
+        Block::Air
     }
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Biome {
     Grassland,
     Forest,
+    Tundra,
 }
 impl Biome {
     pub fn name(self) -> &'static str {
         match self {
             Self::Grassland => "Grasslands",
             Self::Forest => "Oak forest",
+            Self::Tundra => "Tundra",
         }
     }
 }
@@ -92,6 +270,8 @@ pub struct Edit {
 pub struct World {
     pub seed: u64,
     pub edits: BTreeMap<[i32; 3], Block>,
+    pub fluid_pending: std::collections::BTreeSet<[i32; 3]>,
+    pub torch_mounts: BTreeMap<[i32; 3], [i32; 3]>,
     chunks: HashMap<IVec3, Box<[Block]>>,
     pending: VecDeque<IVec3>,
     pub dirty: Vec<IVec3>,
@@ -144,6 +324,8 @@ impl World {
         Self {
             seed,
             edits: BTreeMap::new(),
+            torch_mounts: BTreeMap::new(),
+            fluid_pending: Default::default(),
             chunks: HashMap::new(),
             pending: VecDeque::new(),
             dirty: vec![],
@@ -158,6 +340,11 @@ impl World {
         }
     }
     pub fn biome(&self, x: i32, z: i32) -> Biome {
+        if (x as f64).hypot(z as f64) > 240.
+            && noise(self.seed ^ 7621, x as f32 / 320., z as f32 / 320.) > 0.52
+        {
+            return Biome::Tundra;
+        }
         if noise(self.seed ^ 456, x as f32 / 110., z as f32 / 110.) > 0.53 {
             Biome::Forest
         } else {
@@ -174,7 +361,31 @@ impl World {
         let distance = (x * x + z * z).sqrt();
         (24. + hills + ridge.powf(1.7) * 750. * ((distance - 100.).max(0.) / 500.).min(1.)) as i32
     }
+    /// One stable candidate per 256-block cell; only gentle tundra sites survive.
+    pub fn ruin_in_cell(&self, x: i32, z: i32) -> Option<IVec3> {
+        let h = hash(self.seed ^ 91283, x, 0, z);
+        let cx = x * 256 + 48 + (h % 160) as i32;
+        let cz = z * 256 + 48 + ((h >> 16) % 160) as i32;
+        if self.biome(cx, cz) != Biome::Tundra {
+            return None;
+        }
+        let y = self.height(cx, cz);
+        if [-6, 6].into_iter().any(|dx| {
+            [-6, 6]
+                .into_iter()
+                .any(|dz| (self.height(cx + dx, cz + dz) - y).abs() > 4)
+        }) {
+            return None;
+        }
+        Some(IVec3::new(cx, y, cz))
+    }
+    pub fn nearby_ruin(&self, x: i32, z: i32) -> Option<IVec3> {
+        self.ruin_in_cell(x.div_euclid(256), z.div_euclid(256))
+    }
     fn tree(&self, x: i32, z: i32) -> Option<(i32, i32, i32)> {
+        if self.biome(x, z) == Biome::Tundra {
+            return None;
+        }
         let tx = x.div_euclid(7);
         let tz = z.div_euclid(7);
         for a in tx - 1..=tx + 1 {
@@ -188,19 +399,146 @@ impl World {
                     19
                 };
                 if h.is_multiple_of(chance) && (x - cx).abs() <= 2 && (z - cz).abs() <= 2 {
-                    return Some((cx, self.height(cx, cz), cz));
+                    let height = self.height(cx, cz);
+                    if self.waterway_column(cx, cz).is_none()
+                        && self
+                            .pool_block(IVec3::new(cx, height, cz), height)
+                            .is_none()
+                        && !self
+                            .cave_column(cx, cz)
+                            .is_some_and(|(lo, hi)| (lo..=hi).contains(&height))
+                    {
+                        return Some((cx, height, cz));
+                    }
                 }
             }
         }
         None
     }
-    fn natural_column(&self, p: IVec3, height: i32, tree: Option<(i32, i32, i32)>) -> Block {
+    /// A column's cave interval, shared by direct queries and chunk generation.
+    /// Features fit inside 160-block cells, including their entrance ramps.
+    fn cave_column(&self, x: i32, z: i32) -> Option<(i32, i32)> {
+        if (x as f64).hypot(z as f64) < 32. {
+            return None;
+        }
+        let cell_x = x.div_euclid(160);
+        let cell_z = z.div_euclid(160);
+        let h = hash(self.seed ^ 0xca7e_2026, cell_x, 0, cell_z);
+        let cx = cell_x * 160 + 72 + (h % 17) as i32;
+        let cz = cell_z * 160 + 72 + ((h >> 8) % 17) as i32;
+        let (along, across) = if h & 0x10000 == 0 {
+            (x - cx, z - cz)
+        } else {
+            (z - cz, x - cx)
+        };
+        if !(-56..=66).contains(&along) || across.abs() > 24 {
+            return None;
+        }
+        let (width, ceiling) = match (h >> 20) % 3 {
+            0 => (3., 6.),   // Low, winding passages.
+            1 => (2.5, 24.), // Tall, narrow crevices.
+            _ => (22., 44.), // Vast underground chasms.
+        };
+        let bend = (along as f32 * 0.065 + (h % 31) as f32).sin() * 2.;
+        let lateral = across as f32 - bend;
+        let shape = ((along as f32 + 12.) / 44.).powi(2) + (lateral / width).powi(2);
+        let base = self.height(cx, cz) - 48;
+        let mut interval = if shape < 1. {
+            let radius = (1. - shape).sqrt();
+            Some((
+                base - (radius * 4.) as i32,
+                base + (radius * ceiling) as i32,
+            ))
+        } else {
+            None
+        };
+        // About one in three formations has a walkable descending entrance.
+        // End above the local surface so grass/dirt cannot seal the opening.
+        if (h >> 28).is_multiple_of(3) && (0..=66).contains(&along) && lateral.abs() < 3.5 {
+            let (ex, ez) = if h & 0x10000 == 0 {
+                (cx + 60, cz)
+            } else {
+                (cx, cz + 60)
+            };
+            let exit = self.height(ex, ez);
+            if (exit - (base + 48)).abs() > 12 {
+                return interval;
+            }
+            let floor = base + (((exit - base - 2) as f32 * along as f32 / 60.).floor() as i32);
+            let ramp = (floor + 1, floor + 6);
+            interval = Some(match interval {
+                Some((lo, hi)) => (lo.min(ramp.0), hi.max(ramp.1)),
+                None => ramp,
+            });
+        }
+        interval
+    }
+    fn natural_column(
+        &self,
+        p: IVec3,
+        height: i32,
+        tree: Option<(i32, i32, i32)>,
+        ruin: Option<IVec3>,
+        cave: Option<(i32, i32)>,
+    ) -> Block {
         if !(MIN_Y..=MAX_Y).contains(&p.y) {
             return if p.y < MIN_Y {
                 Block::Stone
             } else {
                 Block::Air
             };
+        }
+        if let Some(c) = ruin {
+            let d = p - c;
+            if d.x.abs() <= 6 && d.z.abs() <= 6 && p.y >= c.y - 6 && p.y <= height.max(c.y) + 6 {
+                if d.y <= 0 {
+                    return Block::RuinStone;
+                }
+                if d.x == 0 && d.z == 0 && d.y == 1 {
+                    return Block::Reliquary;
+                }
+                let wall = (d.x.abs() == 5 && d.z.abs() <= 5) || (d.z.abs() == 5 && d.x.abs() <= 5);
+                let doorway = d.z == 5 && d.x.abs() <= 1;
+                let pillar = d.x.abs() == 5 && d.z.abs() == 5;
+                if wall
+                    && !doorway
+                    && d.y
+                        <= if pillar {
+                            5
+                        } else {
+                            2 + (hash(self.seed, p.x, 0, p.z) % 2) as i32
+                        }
+                {
+                    return Block::RuinStone;
+                }
+                return Block::Air;
+            }
+        }
+        if let Some(water) = self.waterway_block(p, height) {
+            return water;
+        }
+        if let Some(pool) = self.pool_block(p, height) {
+            return pool;
+        }
+        if p.y > MIN_Y + 3 && cave.is_some_and(|(lo, hi)| (lo..=hi).contains(&p.y)) {
+            return Block::Air;
+        }
+        // Keep each formation inside its cell so neighboring outcrops stay separated.
+        if p.y >= height && p.y <= height + 4 && self.biome(p.x, p.z) == Biome::Grassland {
+            let cx = p.x.div_euclid(48);
+            let cz = p.z.div_euclid(48);
+            let h = hash(self.seed ^ 0x726f636b, cx, 0, cz);
+            if h.is_multiple_of(3) {
+                let rx = cx * 48 + 10 + ((h >> 8) % 28) as i32;
+                let rz = cz * 48 + 10 + ((h >> 24) % 28) as i32;
+                let top = outcrop_top(h, p.x - rx, p.z - rz);
+                if top > 0 {
+                    let base = self.height(rx, rz);
+                    if (height - base).abs() <= 1 && p.y <= base + top {
+                        return Block::Stone;
+                    }
+                }
+            }
         }
         if p.y > height {
             if let Some((tx, ty, tz)) = tree {
@@ -213,20 +551,20 @@ impl World {
                     return Block::Leaves;
                 }
             }
+            if p.y == height + 1 && self.biome(p.x, p.z) != Biome::Tundra {
+                return vegetation_block(self.seed, p - IVec3::Y);
+            }
             return Block::Air;
         }
         if p.y == MIN_Y {
             return Block::Stone;
         }
-        if p.y < height - 4 {
-            let a = (p.x as f32 * 0.075 + (p.y as f32 * 0.065).sin() * 2.).sin();
-            let b = (p.z as f32 * 0.085 + (p.y as f32 * 0.051).cos() * 2.).cos();
-            if a + b > 1.56 && p.y > MIN_Y + 3 {
-                return Block::Air;
-            }
-        }
         if p.y == height {
-            Block::Grass
+            if self.biome(p.x, p.z) == Biome::Tundra {
+                Block::Snow
+            } else {
+                Block::Grass
+            }
         } else if p.y > height - 4 {
             Block::Dirt
         } else {
@@ -240,6 +578,8 @@ impl World {
                 Block::Copper
             } else if vein < 10 {
                 Block::Coal
+            } else if vein < 13 && p.y < height - 12 {
+                Block::Iron
             } else {
                 Block::Stone
             }
@@ -247,12 +587,28 @@ impl World {
     }
     pub fn get(&self, p: IVec3) -> Block {
         if let Some(b) = self.edits.get(&p.to_array()) {
-            return *b;
+            return self.supported_plant(p, *b);
         }
         if let Some(c) = self.chunks.get(&chunk(p)) {
-            return c[index(p)];
+            return self.supported_plant(p, c[index(p)]);
         }
-        self.natural_column(p, self.height(p.x, p.z), self.tree(p.x, p.z))
+        self.supported_plant(
+            p,
+            self.natural_column(
+                p,
+                self.height(p.x, p.z),
+                self.tree(p.x, p.z),
+                self.nearby_ruin(p.x, p.z),
+                self.cave_column(p.x, p.z),
+            ),
+        )
+    }
+    fn supported_plant(&self, p: IVec3, b: Block) -> Block {
+        if b.plant() && !self.get(p - IVec3::Y).dirt() {
+            Block::Air
+        } else {
+            b
+        }
     }
     /// Sample a chunk and its AO halo, reusing generation data for each column.
     pub fn halo(&self, key: IVec3) -> Vec<Block> {
@@ -264,6 +620,8 @@ impl World {
                 let wz = base.z + z;
                 let h = self.height(wx, wz);
                 let t = self.tree(wx, wz);
+                let ruin = self.nearby_ruin(wx, wz);
+                let cave = self.cave_column(wx, wz);
                 for y in -1..=SIZE {
                     let p = IVec3::new(wx, base.y + y, wz);
                     let block = self
@@ -271,8 +629,9 @@ impl World {
                         .get(&p.to_array())
                         .copied()
                         .or_else(|| self.chunks.get(&chunk(p)).map(|c| c[index(p)]))
-                        .unwrap_or_else(|| self.natural_column(p, h, t));
-                    blocks[((x + 1) + 18 * ((z + 1) + 18 * (y + 1))) as usize] = block;
+                        .unwrap_or_else(|| self.natural_column(p, h, t, ruin, cave));
+                    blocks[((x + 1) + 18 * ((z + 1) + 18 * (y + 1))) as usize] =
+                        self.supported_plant(p, block);
                 }
             }
         }
@@ -282,11 +641,24 @@ impl World {
         if !(MIN_Y + 1..=MAX_Y).contains(&p.y) {
             return false;
         }
+        if !b.dirt() && self.get(p + IVec3::Y).plant() {
+            self.set(p + IVec3::Y, Block::Air);
+        }
+        self.wake_fluid(p);
         self.edits.insert(p.to_array(), b);
+        if b != Block::Torch {
+            self.torch_mounts.remove(&p.to_array());
+        }
         let key = chunk(p);
         if let Some(c) = self.chunks.get_mut(&key) {
             c[index(p)] = b;
         }
+        self.dirty.extend(
+            self.chunks
+                .keys()
+                .copied()
+                .filter(|k| (k.x - key.x).abs() <= 1 && (k.z - key.z).abs() <= 1),
+        );
         self.dirty.push(key);
         // AO samples diagonal neighbors too, including across chunk corners.
         for x in -1..=1 {
@@ -301,6 +673,49 @@ impl World {
         }
         self.revision += 1;
         true
+    }
+    /// Spread cover one step per pulse around edits, where dirt can become exposed.
+    /// Natural unedited surfaces already have grass; edits and the blocks below
+    /// them cover both placed dirt and freshly dug surfaces without a world scan.
+    pub fn spread_grass(&mut self, center: IVec3) -> usize {
+        const RADIUS: i32 = 32;
+        let mut candidates = std::collections::BTreeSet::new();
+        for (&p, _) in self.edits.range(
+            [center.x - RADIUS, i32::MIN, i32::MIN]..=[center.x + RADIUS, i32::MAX, i32::MAX],
+        ) {
+            let p = IVec3::from_array(p);
+            if (p.z - center.z).abs() > RADIUS || (p.y - center.y).abs() > RADIUS {
+                continue;
+            }
+            candidates.insert(p.to_array());
+            candidates.insert((p - IVec3::Y).to_array());
+        }
+        let changes: Vec<_> = candidates
+            .into_iter()
+            .map(IVec3::from_array)
+            .filter(|&p| {
+                if self.get(p) != Block::Dirt
+                    || (self.get(p + IVec3::Y).solid() || self.get(p + IVec3::Y).fluid().is_some())
+                {
+                    return false;
+                }
+                [IVec3::X, IVec3::NEG_X, IVec3::Z, IVec3::NEG_Z]
+                    .into_iter()
+                    .any(|side| {
+                        (-1..=1).any(|dy| {
+                            let neighbor = p + side + IVec3::Y * dy;
+                            self.get(neighbor) == Block::Grass
+                                && !self.get(neighbor + IVec3::Y).solid()
+                        })
+                    })
+            })
+            .take(32)
+            .collect();
+        let count = changes.len();
+        for p in changes {
+            self.set(p, Block::Grass);
+        }
+        count
     }
     pub fn stream(&mut self, pos: Vec3, radius: i32) -> Vec<IVec3> {
         self.meshes.clear();
@@ -327,6 +742,12 @@ impl World {
                                 let h = self.height(x * SIZE + dx, z * SIZE + dz);
                                 low = low.min(h);
                                 high = high.max(h + 6);
+                                if let Some((_, level)) =
+                                    self.waterway_column(x * SIZE + dx, z * SIZE + dz)
+                                {
+                                    low = low.min(level - 8);
+                                    high = high.max(level + 1);
+                                }
                             }
                         }
                         self.surface_bounds.insert((x, z), (low, high));
@@ -393,6 +814,17 @@ impl World {
                 continue;
             }
             self.pending.retain(|k| *k != result.key);
+            for (i, b) in result.blocks.iter().enumerate() {
+                if b.fluid().is_some() {
+                    let p = result.key * SIZE
+                        + IVec3::new(
+                            i as i32 % SIZE,
+                            i as i32 / (SIZE * SIZE),
+                            i as i32 / SIZE % SIZE,
+                        );
+                    self.fluid_pending.insert(p.to_array());
+                }
+            }
             self.chunks.insert(result.key, result.blocks);
             self.meshes.push((result.key, result.mesh));
         }
@@ -412,13 +844,22 @@ impl World {
             }
             let base = key * SIZE;
             let mut snapshot = World::new(self.seed);
-            // Copy only edits intersecting the chunk and its one-block AO halo.
+            snapshot.torch_mounts = self.torch_mounts.clone();
+            // Include the full vertical columns for sky occlusion above the AO halo.
             snapshot.edits = self
                 .edits
-                .range([base.x - 1, i32::MIN, i32::MIN]..=[base.x + SIZE, i32::MAX, i32::MAX])
+                .range(
+                    [base.x - crate::render::SKY_REACH - 1, i32::MIN, i32::MIN]
+                        ..=[
+                            base.x + SIZE + crate::render::SKY_REACH + 1,
+                            i32::MAX,
+                            i32::MAX,
+                        ],
+                )
                 .filter(|(p, _)| {
-                    (base.y - 1..=base.y + SIZE).contains(&p[1])
-                        && (base.z - 1..=base.z + SIZE).contains(&p[2])
+                    (base.z - crate::render::SKY_REACH - 1
+                        ..=base.z + SIZE + crate::render::SKY_REACH + 1)
+                        .contains(&p[2])
                 })
                 .map(|(p, b)| (*p, *b))
                 .collect();
@@ -441,6 +882,15 @@ impl World {
         self.chunks.len()
     }
     pub fn raycast(&self, origin: Vec3, dir: Vec3, reach: f32) -> Option<(IVec3, IVec3)> {
+        self.raycast_fluid(origin, dir, reach, false)
+    }
+    pub fn raycast_fluid(
+        &self,
+        origin: Vec3,
+        dir: Vec3,
+        reach: f32,
+        sources: bool,
+    ) -> Option<(IVec3, IVec3)> {
         if dir.length_squared() < 0.0001 {
             return None;
         }
@@ -489,7 +939,12 @@ impl World {
         );
         let mut prev = p;
         loop {
-            if self.get(p) != Block::Air {
+            let block = self.get(p);
+            if block != Block::Air
+                && (block.fluid().is_none()
+                    || (sources && matches!(block, Block::Water | Block::Lava)))
+                && (!block.plant() || plant_hit(self.seed, p, block, origin, dir, reach))
+            {
                 return Some((p, prev));
             }
             let axis = if t.x <= t.y && t.x <= t.z {
@@ -509,9 +964,86 @@ impl World {
     }
 }
 
+// Union of offset, elliptical lobes avoids the repeated diamond-and-cap silhouette.
+// Zero means outside the footprint; positive values are heights above the ground.
+fn outcrop_top(h: u64, mut x: i32, mut z: i32) -> i32 {
+    for _ in 0..((h >> 40) & 3) {
+        (x, z) = (-z, x);
+    }
+    if (h >> 42) & 1 != 0 {
+        x = -x;
+    }
+    let size = ((h >> 44) & 1) as i32;
+    let lobes: &[(i32, i32, i32, i32, i32)] = match (h >> 48) % 5 {
+        0 => &[(0, 0, 2 + size, 2, 3), (1, 0, 2, 2, 2)],
+        1 => &[(0, 0, 3 + size, 2 + size, 1), (-1, 0, 2, 2, 2)],
+        2 => &[(-1, 0, 3 + size, 1 + size, 2), (2, 0, 2, 1, 3)],
+        3 => &[(-2, 0, 1 + size, 2, 3), (2, 1, 1 + size, 2, 2)],
+        _ => &[(-2, -1, 2, 2, 2), (1, 1, 2 + size, 2, 3), (2, -2, 1, 1, 1)],
+    };
+    lobes.iter().fold(0, |top, &(cx, cz, rx, rz, height)| {
+        let distance = (x - cx).pow(2) * rz * rz + (z - cz).pow(2) * rx * rx;
+        let radius = rx * rx * rz * rz;
+        if distance > radius {
+            top
+        } else {
+            // Broad tops and uneven shoulders instead of a mandatory single-block peak.
+            top.max(height - i32::from(distance * 3 > radius * 2 && height > 1))
+        }
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn outcrop_shapes_have_distinct_footprints_and_broad_tops() {
+        let mut shapes = HashSet::new();
+        for family in 0..5_u64 {
+            for size in 0..2_u64 {
+                let h = (family << 48) | (size << 44);
+                let mut shape = Vec::new();
+                for x in -10..=10 {
+                    for z in -10..=10 {
+                        let top = outcrop_top(h, x, z);
+                        if top > 0 {
+                            assert!(x.abs() <= 5 && z.abs() <= 5);
+                            assert!((1..=3).contains(&top));
+                            shape.push((x, z, top));
+                        }
+                    }
+                }
+                let peak = shape.iter().map(|p| p.2).max().unwrap();
+                assert!(shape.iter().filter(|p| p.2 == peak).count() > 1);
+                shapes.insert(shape);
+            }
+        }
+        assert_eq!(shapes.len(), 10);
+    }
+
+    #[test]
+    fn grassland_outcrops_are_sparse_and_match_chunk_halos() {
+        let w = World::new(314159);
+        let mut rocks = Vec::new();
+        for x in -64..64 {
+            for z in -64..64 {
+                let p = IVec3::new(x, w.height(x, z) + 1, z);
+                if w.get(p) == Block::Stone {
+                    assert_eq!(w.biome(x, z), Biome::Grassland);
+                    rocks.push(p);
+                }
+            }
+        }
+        assert!(!rocks.is_empty() && rocks.len() < 128 * 128 / 50);
+        for p in rocks.iter().step_by(7) {
+            let key = chunk(*p);
+            let local = *p - key * SIZE;
+            assert_eq!(
+                w.halo(key)[((local.x + 1) + 18 * ((local.z + 1) + 18 * (local.y + 1))) as usize],
+                Block::Stone
+            );
+        }
+    }
     #[test]
     fn cached_surface_plans_match_fresh_worlds_and_stay_bounded() {
         let mut cached = World::new(314159);
@@ -702,5 +1234,287 @@ mod tests {
         wait_for_chunk(&mut w, Vec3::new(0., 100., 0.), chunk(p));
         assert!(w.loaded(chunk(p)));
         assert_eq!(w.get(p), Block::Planks);
+    }
+}
+
+#[cfg(test)]
+mod expansion_tests {
+    use super::*;
+    #[test]
+    fn tundra_ruin_is_deterministic_accessible_and_matches_chunk_halo() {
+        for seed in [1, 42, 314159] {
+            let world = World::new(seed);
+            assert_ne!(world.biome(2, 2), Biome::Tundra);
+            let home = (-8..=8)
+                .find_map(|x| (-8..=8).find_map(|z| world.ruin_in_cell(x, z)))
+                .unwrap();
+            let other = World::new(seed);
+            assert_eq!(world.biome(home.x, home.z), Biome::Tundra);
+            assert_eq!(other.nearby_ruin(home.x, home.z), Some(home));
+            assert_eq!(world.get(home + IVec3::Y), Block::Reliquary);
+            assert_eq!(world.get(home + IVec3::new(0, 1, 5)), Block::Air);
+            assert_eq!(world.get(home + IVec3::new(0, 0, 5)), Block::RuinStone);
+            assert_eq!(world.get(home + IVec3::new(5, 5, 5)), Block::RuinStone);
+            for dx in -7..=7 {
+                let p = home + IVec3::new(dx, 1, 0);
+                let key = chunk(p);
+                let local = p - key * SIZE + IVec3::ONE;
+                let halo = world.halo(key);
+                assert_eq!(
+                    halo[(local.x + 18 * (local.z + 18 * local.y)) as usize],
+                    world.get(p)
+                );
+            }
+            let mut iron = false;
+            for y in home.y - 45..home.y - 12 {
+                for dx in -12..=12 {
+                    iron |= world.get(IVec3::new(home.x + dx, y, home.z + 12)) == Block::Iron;
+                }
+            }
+            assert!(iron, "Iron must occur naturally below the surface");
+        }
+    }
+}
+
+#[cfg(test)]
+mod vegetation_tests {
+    use super::*;
+    #[test]
+    fn all_plants_require_dirt_in_queries_and_halos() {
+        let mut w = World::new(314159);
+        let p = IVec3::new(0, 100, 0);
+        for support in [
+            Block::Dirt,
+            Block::Grass,
+            Block::Stone,
+            Block::Sand,
+            Block::Snow,
+            Block::Log,
+            Block::Air,
+        ] {
+            for plant in [Block::TallGrass, Block::Shrub, Block::RedFlower] {
+                w.set(p - IVec3::Y, support);
+                w.set(p, plant);
+                let expected = if support.dirt() { plant } else { Block::Air };
+                assert_eq!(w.get(p), expected);
+                let local = p - chunk(p) * SIZE;
+                assert_eq!(
+                    w.halo(chunk(p))
+                        [((local.x + 1) + 18 * ((local.z + 1) + 18 * (local.y + 1))) as usize],
+                    expected
+                );
+            }
+        }
+    }
+    #[test]
+    fn plants_are_non_solid_selectable_and_lose_support() {
+        let mut w = World::new(314159);
+        let p = IVec3::new(-16, 100, 16);
+        w.set(p - IVec3::Y, Block::Grass);
+        w.set(p, Block::RedFlower);
+        assert!(!w.get(p).solid());
+        assert_eq!(
+            w.raycast(p.as_vec3() + Vec3::new(0.5, 0.2, 2.), Vec3::NEG_Z, 3.)
+                .unwrap()
+                .0,
+            p
+        );
+        assert!(
+            w.raycast(p.as_vec3() + Vec3::new(0.1, 0.9, 2.), Vec3::NEG_Z, 3.)
+                .is_none()
+        );
+        w.set(p - IVec3::Y, Block::Air);
+        assert_eq!(w.get(p), Block::Air);
+        w.set(p - IVec3::Y, Block::Grass);
+        assert_eq!(w.get(p), Block::Air);
+    }
+    #[test]
+    fn vegetation_includes_short_tall_grass_and_non_solid_shrubs() {
+        let (mut short, mut tall, mut shrubs) = (0, 0, 0);
+        for x in 0..4096 {
+            let p = IVec3::new(x, 100, 0);
+            match vegetation_block(314159, p) {
+                Block::TallGrass => {
+                    let height = grass_height(vegetation_hash(314159, p), 0);
+                    short += usize::from(height < 0.25);
+                    tall += usize::from(height > 0.8);
+                }
+                Block::Shrub => shrubs += 1,
+                _ => {}
+            }
+        }
+        assert!(short > 0 && tall > 0 && shrubs > 0);
+        assert!(Block::Shrub.plant() && !Block::Shrub.solid());
+        let mut world = World::new(314159);
+        let support = IVec3::new(0, 100, 0);
+        world.set(support, Block::Grass);
+        world.set(support + IVec3::Y, Block::Shrub);
+        world.set(support, Block::Dirt);
+        assert_eq!(world.get(support + IVec3::Y), Block::Shrub);
+        world.set(support, Block::Stone);
+        assert_eq!(world.get(support + IVec3::Y), Block::Air);
+    }
+    #[test]
+    fn tall_grass_is_sparse_with_denser_patches() {
+        let mut grass = 0;
+        let mut total = 0;
+        let mut dense = (0, 0);
+        let mut sparse = (0, 0);
+        for x in -96..96 {
+            for z in -96..96 {
+                let p = IVec3::new(x, 100, z);
+                let block = vegetation_block(314159, p);
+                let patch = noise(314159 ^ 0x74756674, x as f32 / 14., z as f32 / 14.);
+                let bucket = if patch > 0.65 {
+                    Some(&mut dense)
+                } else if patch <= 0.5 {
+                    Some(&mut sparse)
+                } else {
+                    None
+                };
+                if let Some(bucket) = bucket {
+                    bucket.1 += 1;
+                    if block == Block::TallGrass {
+                        bucket.0 += 1;
+                    }
+                }
+                if block == Block::TallGrass {
+                    grass += 1;
+                    let h = vegetation_hash(314159, p);
+                    assert!((0..3).all(|i| (0.11..=0.95).contains(&grass_height(h, i))));
+                }
+                total += 1;
+            }
+        }
+        assert!(grass > total / 30 && grass < total / 5);
+        assert!(dense.0 as f32 / dense.1 as f32 > 5. * sparse.0 as f32 / sparse.1 as f32);
+    }
+    #[test]
+    fn exposed_dirt_spreads_in_steps_across_slopes_and_chunk_boundaries() {
+        let mut w = World::new(314159);
+        let source = IVec3::new(-1, 100, 0);
+        w.set(source, Block::Grass);
+        let first = source + IVec3::X;
+        let second = first + IVec3::X;
+        let uphill = source + IVec3::Z + IVec3::Y;
+        let covered = source + IVec3::NEG_Z;
+        let isolated = source + IVec3::X * 5;
+        for p in [first, second, uphill, covered, isolated] {
+            w.set(p, Block::Dirt);
+        }
+        w.set(covered + IVec3::Y, Block::Stone);
+        assert_eq!(w.spread_grass(source), 2);
+        assert_eq!(w.get(first), Block::Grass);
+        assert_eq!(w.get(uphill), Block::Grass);
+        assert_eq!(w.get(second), Block::Dirt);
+        assert_eq!(w.get(covered), Block::Dirt);
+        assert_eq!(w.get(isolated), Block::Dirt);
+        assert_eq!(w.spread_grass(source), 1);
+        assert_eq!(w.get(second), Block::Grass);
+        w.set(covered + IVec3::Y, Block::Air);
+        assert_eq!(w.spread_grass(source), 1);
+        assert_eq!(w.get(covered), Block::Grass);
+        assert_eq!(Block::Grass.name(), Block::Dirt.name());
+    }
+    #[test]
+    fn dug_natural_dirt_can_gain_cover_without_a_dirt_edit() {
+        let mut w = World::new(314159);
+        let p = IVec3::new(0, w.height(0, 0) - 1, 0);
+        assert_eq!(w.get(p), Block::Dirt);
+        w.set(p + IVec3::Y, Block::Air);
+        w.set(p + IVec3::X, Block::Grass);
+        w.set(p + IVec3::X + IVec3::Y, Block::Air);
+        assert!(!w.edits.contains_key(&p.to_array()));
+        assert!(w.spread_grass(p) > 0);
+        assert_eq!(w.get(p), Block::Grass);
+    }
+    #[test]
+    fn natural_plants_match_chunk_halos_and_tall_grass_is_sparse() {
+        let w = World::new(314159);
+        let mut grass = 0;
+        let mut tall = 0;
+        let mut flowers = 0;
+        for x in -128..128 {
+            let y = w.height(x, 0) + 1;
+            let p = IVec3::new(x, y, 0);
+            let block = w.get(p);
+            if block.plant() {
+                assert_eq!(block, vegetation_block(w.seed, p - IVec3::Y));
+                let key = chunk(p);
+                let local = p - key * SIZE;
+                assert_eq!(
+                    w.halo(key)
+                        [((local.x + 1) + 18 * ((local.z + 1) + 18 * (local.y + 1))) as usize],
+                    block
+                );
+                if block == Block::TallGrass {
+                    grass += 1;
+                    let h = vegetation_hash(w.seed, p - IVec3::Y);
+                    if (0..3).any(|i| grass_height(h, i) > 0.4) {
+                        tall += 1;
+                    }
+                } else {
+                    flowers += 1;
+                }
+            }
+        }
+        assert!(grass > 0 && tall > 0 && tall < grass && flowers > 0);
+    }
+}
+
+#[cfg(test)]
+mod cave_tests {
+    use super::*;
+
+    #[test]
+    fn caves_have_varied_scale_surface_access_and_protected_bedrock() {
+        for seed in [1, 42, 314159] {
+            let world = World::new(seed);
+            let mut kinds = [false; 3];
+            let mut entrance = None;
+            for cx in -4..=4 {
+                for cz in -4..=4 {
+                    let h = hash(seed ^ 0xca7e_2026, cx, 0, cz);
+                    let x = cx * 160 + 72 + (h % 17) as i32;
+                    let z = cz * 160 + 72 + ((h >> 8) % 17) as i32;
+                    let (lo, hi) = world.cave_column(x, z).unwrap();
+                    let kind = ((h >> 20) % 3) as usize;
+                    kinds[kind] = true;
+                    assert!(hi - lo >= [4, 12, 36][kind]);
+                    assert_eq!(world.get(IVec3::new(x, (lo + hi) / 2, z)), Block::Air);
+                    assert_eq!(world.get(IVec3::new(x, MIN_Y, z)), Block::Stone);
+                    for d in 48..=60 {
+                        let (ex, ez) = if h & 0x10000 == 0 {
+                            (x + d, z)
+                        } else {
+                            (x, z + d)
+                        };
+                        let surface = IVec3::new(ex, world.height(ex, ez), ez);
+                        if world.get(surface) == Block::Air {
+                            entrance = Some(surface);
+                        }
+                    }
+                }
+            }
+            assert!(kinds.into_iter().all(|found| found));
+            let mouth = entrance.expect("occasional open surface entrances");
+            let key = chunk(mouth);
+            let halo = world.halo(key);
+            for y in -1..=SIZE {
+                for z in -1..=SIZE {
+                    for x in -1..=SIZE {
+                        let p = key * SIZE + IVec3::new(x, y, z);
+                        assert_eq!(
+                            halo[((x + 1) + 18 * ((z + 1) + 18 * (y + 1))) as usize],
+                            world.get(p)
+                        );
+                    }
+                }
+            }
+            assert_eq!(
+                world.get(IVec3::new(2, world.height(2, 2), 2)),
+                Block::Grass
+            );
+        }
     }
 }
