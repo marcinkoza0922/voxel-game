@@ -38,11 +38,15 @@ Ingenuity (boosts crafting efficiency and quality)
 
 ### Biomes
 Should be a mix of normal, exotic, fantastic, and scary
+
+Individual drafts and additional candidates are in the [biome design index](docs/biomes/README.md).
+
 - Grasslands (flat plains, hills, mountains, very rare mega mountains)
+- Tundra (cold terrain with partial snow cover)
 - Polar (snowy plains, hills, mountains, and mega mountains, with glaciers and polar wildlife)
 - Forests (with occasional groves)
 - Mushroom forests
-- Enchanted forests (should be very, very rare). Purple trees and magic springs and what not.
+- Enchanted forests (very rare, with blue trees, blue-tinted dirt, and sparkling ponds)
 - Volcanic lands / ashlands
 - Deserts and dunes
 - Marshes
@@ -283,7 +287,6 @@ A lightweight temperature system. Being in hot or cold biomes without having pro
 
 Start at a title screen with New game, Load game, Settings and Quit. New games
 preserve existing saves; the load menu browses saved worlds. Persist graphics
-options for TAA, VSync, frame cap, render resolution, render scale and borderless
-fullscreen, plus sound. Keep the UI at output resolution. Support native NVIDIA
-DLSS and AMD FSR temporal upscaling where the build, SDK/runtime and GPU support
-them, with explicit availability feedback.
+options for anti-aliasing (Off, FXAA, SMAA, or TAA), VSync, frame cap, render
+resolution, render scale and borderless fullscreen, plus sound. Keep the UI at
+output resolution.

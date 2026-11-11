@@ -14,8 +14,6 @@ mod gpu_profile;
 mod headless;
 mod hydrology;
 mod items;
-#[cfg(feature = "native-upscalers")]
-mod native_upscale;
 #[path = "../tools/performance.rs"]
 mod performance;
 #[path = "../tools/playtest.rs"]
@@ -23,6 +21,7 @@ mod playtest;
 mod render;
 mod save;
 mod settings;
+mod smaa;
 #[path = "../tools/still_review.rs"]
 mod still_review;
 mod streaming;
@@ -319,12 +318,8 @@ impl App {
                     .then(|| winit::window::Fullscreen::Borderless(w.current_monitor())),
             );
         }
-        if let Some(r) = &mut self.renderer
-            && let Err(e) = r.apply_settings(&self.settings)
-        {
-            self.notice = e;
-            self.settings.upscaler = 0;
-            let _ = r.apply_settings(&self.settings);
+        if let Some(r) = &mut self.renderer {
+            r.apply_settings(&self.settings);
         }
         self.next_frame = Instant::now();
     }

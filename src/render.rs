@@ -62,9 +62,6 @@ pub struct Renderer {
     pub draw_times: [f64; 5],
     #[cfg(test)]
     pub stream_times: [f64; 4],
-    #[cfg(feature = "native-upscalers")]
-    native: crate::native_upscale::Native,
-    last_draw: std::time::Instant,
     surface: Option<wgpu::Surface<'static>>,
     window: Option<Arc<Window>>,
     device: wgpu::Device,
@@ -137,20 +134,6 @@ impl Renderer {
             backends: wgpu::Backends::VULKAN,
             ..Default::default()
         };
-        #[cfg(feature = "native-upscalers")]
-        let mut support = dlss_wgpu::FeatureSupport::default();
-        #[cfg(feature = "native-upscalers")]
-        let instance = dlss_wgpu::create_instance(
-            crate::native_upscale::PROJECT_ID,
-            &descriptor,
-            &mut support,
-        )
-        .unwrap_or_else(|e| {
-            eprintln!("DLSS initialization: {e}");
-            support.super_resolution_supported = false;
-            wgpu::Instance::new(&descriptor)
-        });
-        #[cfg(not(feature = "native-upscalers"))]
         let instance = wgpu::Instance::new(&descriptor);
         let surface = window
             .as_ref()
@@ -172,26 +155,6 @@ impl Renderer {
                     | wgpu::Features::TIMESTAMP_QUERY_INSIDE_ENCODERS),
             ..Default::default()
         };
-        #[cfg(feature = "native-upscalers")]
-        let native_device = dlss_wgpu::request_device(
-            crate::native_upscale::PROJECT_ID,
-            &adapter,
-            &descriptor,
-            &mut support,
-        );
-        #[cfg(feature = "native-upscalers")]
-        let (device, queue) = match native_device {
-            Ok(pair) => pair,
-            Err(e) => {
-                eprintln!("DLSS device: {e}");
-                support.super_resolution_supported = false;
-                adapter
-                    .request_device(&descriptor)
-                    .await
-                    .map_err(|e| e.to_string())?
-            }
-        };
-        #[cfg(not(feature = "native-upscalers"))]
         let (device, queue) = adapter
             .request_device(&descriptor)
             .await
@@ -616,12 +579,6 @@ impl Renderer {
             .as_ref()
             .map(|s| s.get_capabilities(&adapter).present_modes)
             .unwrap_or_default();
-        #[cfg(feature = "native-upscalers")]
-        let native = crate::native_upscale::Native::new(
-            &device,
-            adapter,
-            support.super_resolution_supported,
-        );
         Ok(Self {
             profile_draw: false,
             gpu_profile: None,
@@ -629,9 +586,6 @@ impl Renderer {
             draw_times: [0.; 5],
             #[cfg(test)]
             stream_times: [0.; 4],
-            #[cfg(feature = "native-upscalers")]
-            native,
-            last_draw: std::time::Instant::now(),
             held_pipeline,
             held_uniform,
             held_bind,
@@ -699,9 +653,6 @@ impl Renderer {
         }
         self.depth = depth(&self.device, w, h, "Main depth");
         self.rebuild_targets();
-        if let Err(e) = self.configure_upscaler() {
-            self.ui.notice = e;
-        }
     }
     fn rebuild_targets(&mut self) {
         let size = self.settings.render_size(self.width, self.height);
@@ -712,15 +663,10 @@ impl Renderer {
             self.config.format,
         );
     }
-    pub fn apply_settings(&mut self, settings: &crate::settings::Settings) -> Result<(), String> {
+    pub fn apply_settings(&mut self, settings: &crate::settings::Settings) {
         let size_changed = self.settings.render_size(self.width, self.height)
             != settings.render_size(self.width, self.height);
-        if self.settings.upscaler != settings.upscaler
-            || self.settings.upscale_quality != settings.upscale_quality
-        {
-            self.temporal.valid = false;
-        }
-        if self.settings.taa != settings.taa {
+        if self.settings.aa != settings.aa {
             self.temporal.valid = false;
         }
         if self.settings.vsync != settings.vsync {
@@ -739,27 +685,6 @@ impl Renderer {
         self.settings = settings.clone();
         if size_changed {
             self.rebuild_targets();
-        }
-        self.configure_upscaler()
-    }
-    fn configure_upscaler(&mut self) -> Result<(), String> {
-        #[cfg(feature = "native-upscalers")]
-        {
-            self.native.configure(
-                self.settings.upscaler,
-                self.settings.upscale_quality,
-                self.temporal.size,
-                (self.width, self.height),
-                &self.queue,
-            )
-        }
-        #[cfg(not(feature = "native-upscalers"))]
-        {
-            if self.settings.upscaler != 0 {
-                Err("DLSS/FSR require a native-upscalers build (tools/run-native.sh)".into())
-            } else {
-                Ok(())
-            }
         }
     }
     pub fn update_world(&mut self, w: &mut World, pos: Vec3) {
@@ -893,17 +818,8 @@ impl Renderer {
         };
         let strength = daylight + (1. - daylight) * 0.025 * sun.y.max(0.).sqrt();
         let eye = g.player.eye();
-        let mut sky = [daylight, g.time.fract(), 0., 1.];
-        #[cfg(feature = "native-upscalers")]
-        let native_active = self.native.active();
-        #[cfg(not(feature = "native-upscalers"))]
-        let native_active = false;
-        // Preserve texture detail for temporal reconstruction at the output resolution.
-        // sky.z is unused by atmosphere and carries the world texture LOD bias.
-        if native_active {
-            sky[2] = (self.temporal.size.0 as f32 / self.width as f32).log2() - 1.;
-        }
-        let jitter = self.temporal.jitter(self.settings.taa || native_active);
+        let sky = [daylight, g.time.fract(), 0., 1.];
+        let jitter = self.temporal.jitter(self.settings.aa == crate::settings::Aa::Taa);
         let jitter_matrix = Mat4::from_translation(Vec3::new(jitter.x, jitter.y, 0.));
         let stable_camera = Mat4::perspective_rh(
             75_f32.to_radians(),
@@ -1363,33 +1279,6 @@ impl Renderer {
         if let (Some(p), Some(slot)) = (&self.gpu_profile, gpu_slot) {
             p.stamp(&mut encoder, slot, 2);
         }
-        let now = std::time::Instant::now();
-        #[cfg(feature = "native-upscalers")]
-        if native_active {
-            self.temporal.native(
-                &self.device,
-                &self.queue,
-                &mut encoder,
-                &view,
-                stable_camera,
-                eye,
-                &mut self.native,
-                now.duration_since(self.last_draw)
-                    .as_secs_f32()
-                    .clamp(0.001, 0.1),
-            )?;
-        } else {
-            self.temporal.draw(
-                &self.device,
-                &self.queue,
-                &mut encoder,
-                &view,
-                stable_camera,
-                eye,
-                self.settings.taa,
-            );
-        }
-        #[cfg(not(feature = "native-upscalers"))]
         self.temporal.draw(
             &self.device,
             &self.queue,
@@ -1397,12 +1286,11 @@ impl Renderer {
             &view,
             stable_camera,
             eye,
-            self.settings.taa,
+            self.settings.aa,
         );
         if let (Some(p), Some(slot)) = (&self.gpu_profile, gpu_slot) {
             p.stamp(&mut encoder, slot, 3);
         }
-        self.last_draw = now;
         if let Some(buffer) = &held_buffer {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("Held item pass"),

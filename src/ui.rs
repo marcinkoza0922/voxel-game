@@ -400,9 +400,7 @@ impl Ui {
                         [x, 180. + n as f32 * 42., 440., 35.],
                         label,
                         Action::Setting(n as u8),
-                        (n != 0 || settings.upscaler == 0)
-                            && (!matches!(n, 3 | 4) || settings.upscaler == 0)
-                            && (n != 8 || settings.upscaler != 0),
+                        true,
                     );
                 }
                 let output = (
@@ -412,7 +410,7 @@ impl Ui {
                 let size = settings.render_size(output.0, output.1);
                 self.text(
                     x,
-                    565.,
+                    481.,
                     &format!(
                         "World: {} x {}   Output: {} x {}",
                         size.0, size.1, output.0, output.1
@@ -420,7 +418,7 @@ impl Ui {
                     1.2,
                     MUTED,
                 );
-                self.button([x, 590., 440., 39.], "Back", Action::Back, true);
+                self.button([x, 506., 440., 39.], "Back", Action::Back, true);
             }
             Screen::Load => {
                 self.text(x, 188., "SELECT A SAVED WORLD", 1.8, INK);
@@ -1092,7 +1090,7 @@ mod menu_tests {
         assert!(!ui.hits.iter().any(|(_, a)| matches!(a, Action::Page(1))));
         ui.screen = Screen::Settings;
         ui.build(&Game::new(7), false, false, 900, 600, 60.);
-        assert_eq!(ui.hits.len(), 9);
+        assert_eq!(ui.hits.len(), 8);
         for (r, _) in &ui.hits {
             assert!(
                 r[0] >= 0. && r[1] >= 0. && r[0] + r[2] <= ui.width && r[1] + r[3] <= ui.height

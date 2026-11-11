@@ -20,6 +20,87 @@ The player approved deterministic seeded chunk streaming and persistent player s
 
 Advanced metallurgy, magic/gems, breeding, quests, logistics, electricity, automation, extra biomes and multiplayer are future work. Existing station/recipe/item registries and separate simulation should accommodate them. The slice has finite render distance but not a finite horizontal map. Terrain generation and CPU meshing run on bounded background workers using immutable jobs. Terrain column planning runs on a separate bounded background thread; result acceptance and GPU uploads have main-thread time budgets. Save format versions reject unsupported data rather than silently discarding it.
 
+## Long-term gem and realm progression
+
+This is the intended direction beyond the current vertical slice, not implemented
+gameplay. It refines the older gem list and distribution notes in PROPOSAL.md.
+The seven progression gems are diamond, ruby, sapphire, amethyst, topaz, emerald
+and pearl. Opal is outside this progression; whether to retain it or special pearl
+variants for other purposes remains open.
+
+The sandbox has an optional destination: reach a final realm and defeat its boss.
+Gem production connects that goal to the world's different activities without
+requiring every player to master every activity. Gems also retain their equipment
+enchantment and crafting uses; their role is broader than portal currency.
+
+### Biomes and abundance
+
+Each biome has at most one associated gem type, although multiple biomes can share
+the same gem. Natural gems are extremely rare. Wild finds introduce gems and
+their uses; gathering the quantities needed for progression should primarily
+reward developing the following production methods rather than extensive manual
+prospecting. Exact biome assignments, rates and recipes remain to be designed.
+
+| Gem | Intended route to abundance |
+| --- | --- |
+| Diamond | Construct automatic miners to extract coal and an industrial compressor to turn it into diamonds. |
+| Ruby | Fight difficult Ruby-heart enemies in particular biomes; harder enemies drop more rubies. |
+| Sapphire | Develop resource-yield spells, which are unusually effective on sapphire deposits. |
+| Amethyst | Build attractive, well-kept homes and gardens that attract special fairies, which leave amethysts in gratitude. |
+| Topaz | Cultivate a special wheat variety with a very small topaz drop chance. Increase yields and automate enough harvesting to accumulate topaz reliably at scale, while finding uses or disposal routes for excess crops. |
+| Emerald | Trade with NPCs, supplying goods to earn emeralds. Develop production and fulfill demand rather than mine emeralds in bulk. |
+| Pearl | Reach the deepest ocean areas, where pearls are abundant, and solve the problem of harvesting them without drowning. |
+
+Topaz remains a low-probability harvest drop: volume and yield improvements are
+the intended solution, rather than replacing randomness with guaranteed crop
+concentration. Sapphire renewal, fairy attraction criteria, underwater hazards
+and the interaction between yield bonuses and gem drops remain open.
+
+### Emeralds and trade
+
+Trade is the chosen direction for emerald production. It introduces NPCs and an
+economy, but does not initially require a fully simulated society or market.
+Wandering merchants or trading posts, a barter interface and requests for goods
+are a possible starting scope. Merchant types, settlement behavior and pricing
+are not yet settled.
+
+The aim is to reward producing and supplying useful goods. Commissions for food,
+building materials or ingredients could encourage several production chains and
+exploration. Limited order quantities, varied requests and merchant specialties
+are candidate ways to prevent unlimited sales of one cheap item from solving
+the entire branch. Stable accepted orders would let players prepare production
+without arbitrary expiry; these are design options, not finalized mechanics.
+
+How emerald-paying merchants relate to emerald-associated biomes, and whether
+players can establish trade near home, still needs resolution. Trade should
+preserve the reason to discover those biomes while avoiding repetitive travel.
+Corrupted biomes and ecological restoration are not required for this route.
+
+### Ancient vessels and realms
+
+There are seven vessel types, one for each gem, not seven vessels per gem.
+Vessels cannot be crafted; they must be found in ruin complexes scattered
+throughout the world. A vessel is filled with its matching gem, provisionally
+100 gems, to awaken access to that gem's magical realm. This is a one-time
+payment while the vessel remains intact, not a recurring travel cost. Destroying
+a vessel requires finding a replacement and filling it again. The world must
+therefore support replacement finds rather than only seven physical vessels.
+Relocation, damage rules, realm persistence after replacement and safe return
+when a vessel is destroyed while the player is inside remain open questions.
+
+Each realm is an explorable world centered on one overarching biome, with
+sub-biomes providing variation, comparable in scope and structure to the old
+Minecraft Nether. It offers unique resources, monsters and equipment, plus an
+arch-gem to discover. These are worlds to explore, not merely small challenge
+rooms; the means of obtaining each arch-gem is not yet specified.
+
+Completing a single vessel/realm route should be sufficient to unlock access to
+the final realm. Additional gem realms are optional preparation: their equipment
+makes the endgame easier and provides further sandbox goals. The exact arch-gem
+portal mechanism and any benefits from additional arch-gems remain open. The
+finale should be realistically achievable through one route, so optional branches
+do not become an implicit requirement to complete all seven.
+
 ## Validation
 
 Use quiet nextest tests for determinism, negative coordinate chunk mapping, height limits, cross-chunk edits, voxel ray casting/collision, generation-safe entity reuse, recipe transactions, XP decay, save round trips and malformed saves. Run clippy with short diagnostics. A headless deterministic simulation smoke command exercises gameplay and persistence without a display. GPU validation requires a real window or supported offscreen adapter; record actual checks and limitations here. Helpers belong in `tools/`.
@@ -825,7 +906,8 @@ world startup unless `--title` is requested.
 
 `src/settings.rs` owns validated, default-compatible JSON preferences, atomically
 written to `saves/settings.json` (override with `--settings PATH`). Controls cover
-TAA, VSync, uncapped/30/60/90/120/144/165/240 FPS, native/720p/900p/1080p/1440p
+anti-aliasing (Off, FXAA, SMAA, or TAA), VSync,
+uncapped/30/60/90/120/144/165/240 FPS, native/720p/900p/1080p/1440p
 world-render resolution, 50/67/75/85/100% render scale, borderless fullscreen and
 sound. F11 also toggles and persists fullscreen. Resolution presets fit within
 the selected pixel dimensions while preserving the output aspect ratio; render
@@ -839,79 +921,31 @@ render to a linear RGBA16F target with a 16-phase Halton (2,3) camera jitter.
 Ping-pong output-resolution RGBA16F histories store color plus depth. Depth-based
 camera reprojection, translation-free sky reprojection, depth rejection,
 3x3 neighborhood clipping and color-dependent history weighting limit trails.
-History resets on resize, resolution/AA/upscaler changes, world replacement,
+History resets on resize, resolution or anti-aliasing changes, world replacement,
 surface loss and camera jumps over four blocks. The held item uses a separate,
 unjittered camera and full-resolution depth buffer after resolve; GUI follows at
-full output resolution. With TAA off and no SDK upscaler, presentation uses linear
-spatial resampling. Built-in TAA can also accumulate a scaled input at output
-resolution; it is not labeled DLSS or FSR.
+full output resolution. TAA is the default and can accumulate scaled world
+rendering at output resolution. Off uses a single linear presentation pass.
 
-### Native DLSS and FSR 2
+FXAA uses a single pass to detect luma contrast, search along the edge and
+filter subpixel detail. Its sample offsets follow the world render size, and it
+writes directly to the output. SMAA 1x uses the High preset of the
+[Bevy 0.18.1 WGSL port](https://github.com/bevyengine/bevy/blob/v0.18.1/crates/bevy_anti_alias/src/smaa/smaa.wgsl)
+and the [original SMAA area and search textures](https://github.com/iryoku/smaa/tree/master/Textures),
+stored as raw RG8 (160×560) and R8 (64×16) in `vendor/smaa`. SMAA detects luma
+edges, calculates weights using both lookup textures, then blends neighbors.
+Its three passes run at world render resolution, with linear resampling when
+the output size differs. Both spatial modes use display-gamma luma for edge
+detection and blend linear scene color. Only TAA uses jitter and frame history.
 
-`cargo run` remains SDK-free. `tools/run-native.sh` runs the same game with the
-`native-upscalers` Cargo feature, enabling actual NVIDIA NGX DLSS Super Resolution
-(and DLAA at 100%) and AMD FidelityFX FSR **2**, not frame generation or FSR 4.
-Use `tools/run-native.sh --release` for a release-optimized build; without that
-leading option the launcher uses the development profile. Remaining arguments
-are passed to the game, for example `tools/run-native.sh --release --new`.
-Selecting SDK upscalers in a build without the feature reports why unavailable
-and retains the working renderer. Unsupported GPUs/runtimes and invalid SDK
-render ranges are similarly reported instead of silently claiming SDK rendering.
-The upscaler quality row cycles Quality (1/1.5 output dimensions), Balanced
-(1/1.7), Performance (1/2), and Native AA (1/1; DLAA for DLSS).
-Presets derive world resolution directly from the output, rounding each axis to
-the nearest pixel. They select the corresponding DLSS SDK mode; FSR 2 uses the
-resulting input dimensions. Both manual resolution controls are disabled and
-labeled Upscaler controlled while either SDK upscaler is active. Saved manual
-values resume when upscaling is disabled. Enabling an upscaler starts at Quality.
-Legacy settings without a quality field or with the former Custom value load
-as Quality; there is no Custom mode.
-The quality row is disabled while upscaling is off. Changes recreate SDK
-contexts and reset temporal history, including when pixel sizes happen to match.
+Existing settings files map `taa: true` to TAA and `taa: false` to Off. The
+renderer uses the saved manual resolution and scale and ignores the retired
+upscaler fields. New settings files store the selected mode in `aa`.
 
-An SDK upscaler replaces the built-in TAA resolve; the AA row displays the
-selected SDK and disables the separate TAA toggle. Supersampling above output size is
-not supported by these native paths.
-
-The launcher caches official DLSS **v310.4.0** and Vulkan-Headers **v1.4.309** in
-`target/native-sdk/`, builds native SDK bindings (requires git, network on first
-run, a C/C++ compiler and libclang), and exposes the official release NGX runtime
-through an unversioned library symlink. Existing `DLSS_SDK` and `VULKAN_SDK`
-environment variables override downloads. DLSS SDK/runtime redistribution is
-subject to NVIDIA's own license; SDK files are not committed. The wrapper is
-vendored from `dlss_wgpu` 2.0.0 (wgpu 27) under its original MIT/Apache licenses,
-with one Linux safety patch: zero required-extension count produces an empty
-slice instead of calling `from_raw_parts` on a null pointer. The SDK version is
-pinned because newer NGX headers change structures the wrapper initializes.
-FSR 2 uses the `fsr`/`fsr-sys` bindings and their bundled native Vulkan backend
-and shader permutations.
-
-`src/native_upscale.rs` owns SDK contexts, validates render ranges, chooses a
-DLSS quality mode from the selected preset, dispatches SDK work inside the wgpu
-Vulkan encoder and waits for GPU completion before context replacement or
-destruction. Explicit wgpu resource transitions keep external SDK layouts
-consistent. A full-screen pass copies world device depth to R32F so SDK input
-uses an ordinary shader-readable color layout; RG16F motion vectors derive from
-camera reprojection with jitter cancellation and sky translation removed.
-SDKs receive per-frame jitter, reset flags, input/output size, and (FSR) camera
-near/far/FOV and frame time in milliseconds. Both produce linear RGBA16F output
-before the full-resolution held item and UI. Motion vectors currently represent
-camera motion; moving creatures/particles and transparent fluids do not yet have
-per-object previous transforms/reactive masks, so temporal trails can remain in
-those areas. Longer motion/quality/performance evaluation is still needed.
-
-Validation: 110 quiet nextest tests pass, including settings round-trip/index
-validation, aspect-preserving scaling, title-only actions, disabled hit regions,
-paged save access and minimum-window settings bounds. Offscreen Vulkan captures
-at 1280x800 completed for TAA/title and actual native FSR 2 and DLSS at 67% input
-scale. Both SDK screenshots were inspected; these are short functional checks,
-not a performance benchmark. A real Wayland window also completed an automatic
-exit from the title at 2560x1440 borderless fullscreen, with VSync off, a 30 FPS
-cap, 720p preset and 50% world scale; the preview save path remained absent. `--headless --title --frames 2 --capture PATH` previews
-the title without advancing or saving the preview world. Combine `--settings`
-with an isolated preferences file to exercise graphics settings without changing
-normal preferences. Native debugging required an unrestricted driver run; a
-sandboxed native attempt crashed, while unrestricted FSR and DLSS completed.
+`--headless --title --frames 2 --capture PATH` previews the title without
+advancing or saving the preview world. Combine `--settings` with an isolated
+preferences file to exercise graphics settings without changing normal
+preferences.
 
 ## Performance tools and measurements
 
@@ -1271,6 +1305,9 @@ existing water/shore continuity checks.
 
 ## Regional terrain variants
 
+Future biome drafts are tracked in the
+[biome design index](biomes/README.md).
+
 Grassland and snow climates each expose flat, hills, mountains and mega mountains
 through biome names and discovery. The snowy family displays as Polar. Its
 legacy discovery keys are retained so old saves keep their discovery progress.
@@ -1381,8 +1418,7 @@ output pixels reuse their exact history UV and bypass reprojection depth rejecti
 jitter samples on different sides of a silhouette must not repeatedly invalidate
 that pixel. Neighborhood color clipping still rejects stale colors. Any camera
 translation, rotation, projection change or invalid history restores depth-tested
-reprojection and the tighter, difference-dependent clipping/weight. Native
-upscaler motion/reprojection is unchanged.
+reprojection and the tighter, difference-dependent clipping/weight.
 
 `tools/still_review.rs`, invoked with `cargo run -- --still-review --save PATH
 --capture DIRECTORY`, loads the save read only, settles streaming offscreen,
@@ -1412,104 +1448,6 @@ explicitly enabled. Exact-view regression coverage checks history invalidation,
 small translations, rotations and projection changes. Clippy, all 150 nextest
 tests and a 64-frame headless moving-camera tour passed. User saves/settings
 were read only.
-
-### Native upscaler texture detail
-
-World tile sampling applies `log2(render_width / output_width) - 1` LOD
-bias while a native temporal upscaler is active, including Native AA. This
-matches the DLSS adapter's suggested mip bias (about -1.585 in Quality),
-keeping fine texture information in the input for temporal reconstruction.
-Without it, lower-resolution rendering selected coarser mips before DLSS could
-recover detail. The bias travels in the otherwise unused camera `sky.z` field;
-ordinary rendering uses zero bias. This affects both opaque and cutout tiles.
-
-### AA and DLSS visual comparison (2026-11-10)
-
-Frozen captures of `saves/world.json` used the same camera, simulation state,
-settled terrain and 1280×800 output for all eight modes. Each run rendered 240
-frames and retained frames 224–239; comparison images use frame 239. The native
-upscaler mip-bias change above was active. Saves and user settings were read
-only; each mode used a separate temporary settings file.
-
-| Mode | World input | Observed appearance |
-| --- | --- | --- |
-| All AA off | 1280×800 | Crispest texture contrast; jagged foliage holes and silhouettes |
-| TAA | 1280×800 | Smoother edges, softer texture detail |
-| 67% scale, AA off | 858×536 | Fine detail lost, visible pixelation |
-| 67% scale, TAA | 858×536 | Further texture softening |
-| DLSS Quality | 853×533 | Visibly smeared foliage, softer than native TAA |
-| DLSS Balanced | 753×471 | Similar smearing with less fine detail |
-| DLSS Performance | 640×400 | Greatest fine-detail loss |
-| DLAA (Native AA) | 1280×800 | Clearly sharper than DLSS Quality, softer than AA off |
-
-The reported excessive blur in DLSS Quality remains reproducible. Adding the
-recommended mip bias alone did **not** resolve it. These observations identify
-an unresolved image-quality issue, not its cause. Investigate SDK jitter
-conventions, motion-vector reprojection and temporal reconstruction next.
-Static captures do not establish moving-view quality, ghosting or shimmer.
-
-Local artifacts are in `target/aa-comparison/` (generated, not versioned):
-`overview.png` contains half-size full views; `detail.png` contains matching
-unscaled 320×240 crops starting at pixel (400,390). Each mode directory contains
-`settings.json`, sixteen PPM frames and a full-resolution `final.png`.
-`README.md` records the setup and reproduction command. These artifacts depend
-on the current local save and are not a permanent visual regression fixture.
-
-Build with `tools/run-native.sh` to prepare the native SDKs, then reproduce a
-mode with the existing frozen-capture helper:
-
-```sh
-DLSS_SDK="$PWD/target/native-sdk/DLSS" \
-LD_LIBRARY_PATH="$PWD/target/native-sdk/runtime" \
-target/debug/voxel-game --still-review --save saves/world.json \
-  --frames 240 --settings target/aa-comparison/dlss-quality/settings.json \
-  --capture target/aa-comparison/dlss-quality
-```
-
-The DLSS runs used an RTX 3060 Ti with NVIDIA driver 595.112.07, with
-`VK_DRIVER_FILES=/usr/share/vulkan/icd.d/nvidia_icd.x86_64.json` set explicitly.
-GPU captures required execution outside the sandbox. Direct execution also
-requires `DLSS_SDK` at runtime for SDK library discovery, as provided by the
-native launcher; setting only `LD_LIBRARY_PATH` produced an NGX unsupported
-error on this setup. All eight capture runs completed after configuring this.
-
-### Native motion-vector blur correction
-
-Follow-up isolation replaced the frozen view's motion vectors with exact zero,
-which visibly restored foliage detail in DLSS Quality. Although the old path
-cancelled projection jitter algebraically, reconstructing a stationary point
-through depth, inverse projection and the previous jittered projection produced
-nonzero numerical motion. DLSS should receive exactly zero camera motion for
-an unchanged view.
-
-Native resolve now receives and retains the unjittered camera matrix. It uses
-the jittered inverse only to reconstruct the current depth sample and removes
-the current UV jitter when comparing it with the previous unjittered projection.
-An identical camera/eye with valid history bypasses reconstruction and writes
-exact zero motion. Any translation, rotation, projection change or invalid
-history uses normal reprojection. SDK jitter signs, SDK presets, exposure and
-the existing history reset conditions remain unchanged. This motion generation
-is shared by DLSS and FSR 2. It still describes camera motion only; moving
-creatures do not yet have per-object motion vectors.
-
-Repeated 240-frame frozen captures at the original camera show clearer leaf
-texture and less smearing in Quality and Balanced; DLAA also gains texture
-clarity, while Performance still loses fine detail. Local before/after crops are in
-`target/aa-comparison/motion-fix-comparison.png`, with original captures in
-`dlss-{quality,balanced,performance}` and corrected captures in
-`fixed-{quality,balanced,performance}`, plus `dlaa` and `fixed-dlaa`.
-This supersedes the unresolved static
-blur finding above, but does not claim native/no-AA sharpness or eliminate
-every temporal artifact. The historical baseline artifacts were retained.
-
-A projection regression checks that translated-camera motion maps to the
-previous unjittered pixel independently of current jitter. Existing identity
-tests cover valid history and camera/eye changes. All 151 quiet nextest tests,
-native-feature short-format Clippy, and native DLSS frozen captures passed.
-A 64-frame native DLSS Quality moving-camera tour rendered and exited using a
-temporary world. That is a functional check; moving-view ghosting and shimmer
-have not received equivalent comparative visual validation. FSR 2 visual
-quality has not been re-evaluated for this correction.
 
 ### Waterway column lookup reuse
 
