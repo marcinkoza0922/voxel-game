@@ -12,7 +12,7 @@ pub fn run(mut game: Game, options: &Options) -> Result<(), String> {
     let mut renderer = pollster::block_on(Renderer::headless(1280, 800))?;
     let result = (|| {
         let settings = crate::settings::Settings::read(&options.settings_path)?;
-        renderer.apply_settings(&settings)?;
+        renderer.apply_settings(&settings);
         if options.title {
             renderer.ui.screen = crate::ui::Screen::Title;
         }

@@ -14,7 +14,7 @@ fn movement_render_review() {
         let mut game = Game::new(314159);
         let mut renderer = pollster::block_on(Renderer::headless(1280, 800)).unwrap();
         let result = (|| -> Result<(), String> {
-            renderer.apply_settings(&crate::settings::Settings::default())?;
+            renderer.apply_settings(&crate::settings::Settings::default());
             let start = Instant::now();
             loop {
                 renderer.update_world(&mut game.world, Vec3::from_array(game.player.pos));

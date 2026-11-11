@@ -167,6 +167,8 @@ pub fn run() -> Result<(), String> {
         health: 30.,
         cooldown: 0.,
         level: 1,
+        heading: 0.,
+        stride: 0.,
     });
     g.player.rest = 20.;
     g.sleep();
@@ -269,8 +271,8 @@ pub fn run() -> Result<(), String> {
     )?;
     let home = (-8..=8)
         .find_map(|x| (-8..=8).find_map(|z| g.world.ruin_in_cell(x, z)))
-        .ok_or("No tundra ruin found")?;
-    println!("Tundra ruin fixture (seed 314159): {home:?}");
+        .ok_or("No polar ruin found")?;
+    println!("Polar ruin fixture (seed 314159): {home:?}");
     g.time = 0.75;
     g.player.pos = (home.as_vec3() + Vec3::new(0.5, 1.01, 4.5)).to_array();
     g.velocity = Vec3::ZERO;
@@ -280,8 +282,8 @@ pub fn run() -> Result<(), String> {
         g.biome().is_snow()
             && g.player
                 .discoveries
-                .contains(&format!("biome:{}", g.biome().name())),
-        "Tundra discovery failed",
+                .contains(&format!("biome:{}", g.biome().discovery_name())),
+        "Polar discovery failed",
     )?;
     require(
         g.entities

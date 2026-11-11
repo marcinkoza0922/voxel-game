@@ -1,4 +1,5 @@
 use crate::{
+    ecs::{Mob, MobKind},
     game::Game,
     ui::{Ui, UiVertex},
     world::{Block, SIZE, VIEW_RADIUS, World},
@@ -61,9 +62,6 @@ pub struct Renderer {
     pub draw_times: [f64; 5],
     #[cfg(test)]
     pub stream_times: [f64; 4],
-    #[cfg(feature = "native-upscalers")]
-    native: crate::native_upscale::Native,
-    last_draw: std::time::Instant,
     surface: Option<wgpu::Surface<'static>>,
     window: Option<Arc<Window>>,
     device: wgpu::Device,
@@ -136,20 +134,6 @@ impl Renderer {
             backends: wgpu::Backends::VULKAN,
             ..Default::default()
         };
-        #[cfg(feature = "native-upscalers")]
-        let mut support = dlss_wgpu::FeatureSupport::default();
-        #[cfg(feature = "native-upscalers")]
-        let instance = dlss_wgpu::create_instance(
-            crate::native_upscale::PROJECT_ID,
-            &descriptor,
-            &mut support,
-        )
-        .unwrap_or_else(|e| {
-            eprintln!("DLSS initialization: {e}");
-            support.super_resolution_supported = false;
-            wgpu::Instance::new(&descriptor)
-        });
-        #[cfg(not(feature = "native-upscalers"))]
         let instance = wgpu::Instance::new(&descriptor);
         let surface = window
             .as_ref()
@@ -171,26 +155,6 @@ impl Renderer {
                     | wgpu::Features::TIMESTAMP_QUERY_INSIDE_ENCODERS),
             ..Default::default()
         };
-        #[cfg(feature = "native-upscalers")]
-        let native_device = dlss_wgpu::request_device(
-            crate::native_upscale::PROJECT_ID,
-            &adapter,
-            &descriptor,
-            &mut support,
-        );
-        #[cfg(feature = "native-upscalers")]
-        let (device, queue) = match native_device {
-            Ok(pair) => pair,
-            Err(e) => {
-                eprintln!("DLSS device: {e}");
-                support.super_resolution_supported = false;
-                adapter
-                    .request_device(&descriptor)
-                    .await
-                    .map_err(|e| e.to_string())?
-            }
-        };
-        #[cfg(not(feature = "native-upscalers"))]
         let (device, queue) = adapter
             .request_device(&descriptor)
             .await
@@ -615,12 +579,6 @@ impl Renderer {
             .as_ref()
             .map(|s| s.get_capabilities(&adapter).present_modes)
             .unwrap_or_default();
-        #[cfg(feature = "native-upscalers")]
-        let native = crate::native_upscale::Native::new(
-            &device,
-            adapter,
-            support.super_resolution_supported,
-        );
         Ok(Self {
             profile_draw: false,
             gpu_profile: None,
@@ -628,9 +586,6 @@ impl Renderer {
             draw_times: [0.; 5],
             #[cfg(test)]
             stream_times: [0.; 4],
-            #[cfg(feature = "native-upscalers")]
-            native,
-            last_draw: std::time::Instant::now(),
             held_pipeline,
             held_uniform,
             held_bind,
@@ -698,9 +653,6 @@ impl Renderer {
         }
         self.depth = depth(&self.device, w, h, "Main depth");
         self.rebuild_targets();
-        if let Err(e) = self.configure_upscaler() {
-            self.ui.notice = e;
-        }
     }
     fn rebuild_targets(&mut self) {
         let size = self.settings.render_size(self.width, self.height);
@@ -711,15 +663,10 @@ impl Renderer {
             self.config.format,
         );
     }
-    pub fn apply_settings(&mut self, settings: &crate::settings::Settings) -> Result<(), String> {
+    pub fn apply_settings(&mut self, settings: &crate::settings::Settings) {
         let size_changed = self.settings.render_size(self.width, self.height)
             != settings.render_size(self.width, self.height);
-        if self.settings.upscaler != settings.upscaler
-            || self.settings.upscale_quality != settings.upscale_quality
-        {
-            self.temporal.valid = false;
-        }
-        if self.settings.taa != settings.taa {
+        if self.settings.aa != settings.aa {
             self.temporal.valid = false;
         }
         if self.settings.vsync != settings.vsync {
@@ -738,27 +685,6 @@ impl Renderer {
         self.settings = settings.clone();
         if size_changed {
             self.rebuild_targets();
-        }
-        self.configure_upscaler()
-    }
-    fn configure_upscaler(&mut self) -> Result<(), String> {
-        #[cfg(feature = "native-upscalers")]
-        {
-            self.native.configure(
-                self.settings.upscaler,
-                self.settings.upscale_quality,
-                self.temporal.size,
-                (self.width, self.height),
-                &self.queue,
-            )
-        }
-        #[cfg(not(feature = "native-upscalers"))]
-        {
-            if self.settings.upscaler != 0 {
-                Err("DLSS/FSR require a native-upscalers build (tools/run-native.sh)".into())
-            } else {
-                Ok(())
-            }
         }
     }
     pub fn update_world(&mut self, w: &mut World, pos: Vec3) {
@@ -892,17 +818,8 @@ impl Renderer {
         };
         let strength = daylight + (1. - daylight) * 0.025 * sun.y.max(0.).sqrt();
         let eye = g.player.eye();
-        let mut sky = [daylight, g.time.fract(), 0., 1.];
-        #[cfg(feature = "native-upscalers")]
-        let native_active = self.native.active();
-        #[cfg(not(feature = "native-upscalers"))]
-        let native_active = false;
-        // Preserve texture detail for temporal reconstruction at the output resolution.
-        // sky.z is unused by atmosphere and carries the world texture LOD bias.
-        if native_active {
-            sky[2] = (self.temporal.size.0 as f32 / self.width as f32).log2() - 1.;
-        }
-        let jitter = self.temporal.jitter(self.settings.taa || native_active);
+        let sky = [daylight, g.time.fract(), 0., 1.];
+        let jitter = self.temporal.jitter(self.settings.aa == crate::settings::Aa::Taa);
         let jitter_matrix = Mat4::from_translation(Vec3::new(jitter.x, jitter.y, 0.));
         let stable_camera = Mat4::perspective_rh(
             75_f32.to_radians(),
@@ -973,6 +890,10 @@ impl Renderer {
         for (_, m) in g.entities.iter() {
             let p = m.pos;
             let creature_start = dynamic.len();
+            if matches!(m.kind, MobKind::Penguin { .. } | MobKind::PolarBear { .. }) {
+                polar_mob_mesh(&mut dynamic, m);
+                continue;
+            }
             if let crate::ecs::MobKind::Sheep { male } = m.kind {
                 box_mesh(
                     &mut dynamic,
@@ -1128,11 +1049,11 @@ impl Renderer {
             let toward = (Vec3::from_array(g.player.pos) - p)
                 .with_y(0.)
                 .normalize_or_zero();
-            let rotation = glam::Quat::from_rotation_y((-toward.x).atan2(-toward.z));
-            for vertex in &mut dynamic[creature_start..] {
-                vertex.pos = (p + rotation * (Vec3::from_array(vertex.pos) - p)).to_array();
-                vertex.normal = (rotation * Vec3::from_array(vertex.normal)).to_array();
-            }
+            rotate_mob(
+                &mut dynamic[creature_start..],
+                p,
+                (-toward.x).atan2(-toward.z),
+            );
         }
         let mut icon = Ui::new();
         icon.width = 16.;
@@ -1358,33 +1279,6 @@ impl Renderer {
         if let (Some(p), Some(slot)) = (&self.gpu_profile, gpu_slot) {
             p.stamp(&mut encoder, slot, 2);
         }
-        let now = std::time::Instant::now();
-        #[cfg(feature = "native-upscalers")]
-        if native_active {
-            self.temporal.native(
-                &self.device,
-                &self.queue,
-                &mut encoder,
-                &view,
-                stable_camera,
-                eye,
-                &mut self.native,
-                now.duration_since(self.last_draw)
-                    .as_secs_f32()
-                    .clamp(0.001, 0.1),
-            )?;
-        } else {
-            self.temporal.draw(
-                &self.device,
-                &self.queue,
-                &mut encoder,
-                &view,
-                stable_camera,
-                eye,
-                self.settings.taa,
-            );
-        }
-        #[cfg(not(feature = "native-upscalers"))]
         self.temporal.draw(
             &self.device,
             &self.queue,
@@ -1392,12 +1286,11 @@ impl Renderer {
             &view,
             stable_camera,
             eye,
-            self.settings.taa,
+            self.settings.aa,
         );
         if let (Some(p), Some(slot)) = (&self.gpu_profile, gpu_slot) {
             p.stamp(&mut encoder, slot, 3);
         }
-        self.last_draw = now;
         if let Some(buffer) = &held_buffer {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("Held item pass"),
@@ -2179,6 +2072,91 @@ fn textured_box(out: &mut Vec<Vertex>, pos: Vec3, size: Vec3, block: Block) {
         vertex.tile = [uv[0], uv[1], crate::art::layer(block, face) as f32];
     }
 }
+fn rotate_mob(vertices: &mut [Vertex], origin: Vec3, heading: f32) {
+    let rotation = glam::Quat::from_rotation_y(heading);
+    for vertex in vertices {
+        vertex.pos = (origin + rotation * (Vec3::from_array(vertex.pos) - origin)).to_array();
+        vertex.normal = (rotation * Vec3::from_array(vertex.normal)).to_array();
+    }
+}
+
+fn polar_mob_mesh(out: &mut Vec<Vertex>, mob: &Mob) {
+    let start = out.len();
+    let mut part = |offset: [f32; 3], size: [f32; 3], color| {
+        box_mesh(
+            out,
+            mob.pos + Vec3::from_array(offset),
+            Vec3::from_array(size),
+            color,
+        );
+    };
+    let step = (mob.stride * 13.).sin();
+    let dark = [0.10, 0.13, 0.18];
+    if matches!(mob.kind, MobKind::Penguin { .. }) {
+        let white = [0.95, 0.96, 0.89];
+        let amber = [0.91, 0.53, 0.13];
+        let sway = step * 0.027;
+        part([-0.19 + sway, 0.11, -0.16], [0.38, 0.51, 0.34], dark);
+        part([-0.145 + sway, 0.15, -0.20], [0.29, 0.43, 0.12], white);
+        part([-0.16 + sway, 0.59, -0.18], [0.32, 0.27, 0.31], dark);
+        part([-0.064 + sway, 0.64, -0.29], [0.128, 0.08, 0.13], amber);
+        for side in [-1., 1.] {
+            let foot = step * side * 0.075;
+            part(
+                [side * 0.1 - 0.058, foot.max(0.) * 0.45, -0.22 + foot],
+                [0.116, 0.10, 0.24],
+                amber,
+            );
+            part(
+                [side * 0.215 - 0.052 + sway, 0.19, -0.06 + foot],
+                [0.104, 0.34, 0.15],
+                dark,
+            );
+            part(
+                [side * 0.116 - 0.035 + sway, 0.714, -0.187],
+                [0.07, 0.074, 0.032],
+                white,
+            );
+            part(
+                [side * 0.116 - 0.017 + sway, 0.731, -0.200],
+                [0.034, 0.042, 0.026],
+                dark,
+            );
+        }
+    } else {
+        let fur = [0.91, 0.90, 0.82];
+        let shade = [0.79, 0.81, 0.78];
+        part([-0.39, 0.43, -0.58], [0.78, 0.61, 1.18], fur);
+        part([-0.35, 0.52, -0.71], [0.70, 0.61, 0.46], fur);
+        part([-0.27, 0.76, -0.95], [0.54, 0.46, 0.52], fur);
+        part([-0.17, 0.76, -1.14], [0.34, 0.23, 0.35], shade);
+        part([-0.09, 0.88, -1.17], [0.18, 0.095, 0.07], dark);
+        part([-0.10, 0.57, 0.54], [0.20, 0.20, 0.16], shade);
+        for side in [-1., 1.] {
+            part([side * 0.19 - 0.087, 1.15, -0.68], [0.174, 0.17, 0.17], fur);
+            part(
+                [side * 0.19 - 0.048, 1.19, -0.691],
+                [0.096, 0.083, 0.04],
+                shade,
+            );
+            part(
+                [side * 0.192 - 0.027, 1.017, -0.963],
+                [0.054, 0.05, 0.03],
+                dark,
+            );
+            for end in [-1., 1.] {
+                let swing = step * side * end * 0.16;
+                let x = side * 0.265 - 0.135;
+                let y = swing.max(0.) * 0.44;
+                let z = end * 0.40 - 0.15 + swing;
+                part([x, y + 0.08, z], [0.27, 0.51, 0.30], fur);
+                part([x - 0.01, y, z - 0.08], [0.29, 0.16, 0.38], shade);
+            }
+        }
+    }
+    rotate_mob(&mut out[start..], mob.pos, mob.heading);
+}
+
 fn box_mesh(out: &mut Vec<Vertex>, pos: Vec3, size: Vec3, color: [f32; 3]) {
     for (n, u, v) in FACES {
         let verts = CORNERS.map(|(a, b)| {

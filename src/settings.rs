@@ -6,46 +6,50 @@ pub const RESOLUTIONS: [(u32, u32); 5] =
     [(0, 0), (1280, 720), (1600, 900), (1920, 1080), (2560, 1440)];
 pub const SCALES: [u32; 5] = [50, 67, 75, 85, 100];
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub enum UpscaleQuality {
+#[serde(rename_all = "lowercase")]
+pub enum Aa {
+    Off,
+    Fxaa,
+    Smaa,
     #[default]
-    #[serde(alias = "Custom")]
-    Quality,
-    Balanced,
-    Performance,
-    Native,
+    Taa,
 }
-impl UpscaleQuality {
+impl Aa {
     fn next(self) -> Self {
         match self {
-            Self::Quality => Self::Balanced,
-            Self::Balanced => Self::Performance,
-            Self::Performance => Self::Native,
-            Self::Native => Self::Quality,
+            Self::Off => Self::Fxaa,
+            Self::Fxaa => Self::Smaa,
+            Self::Smaa => Self::Taa,
+            Self::Taa => Self::Off,
         }
     }
     fn label(self) -> &'static str {
         match self {
-            Self::Quality => "Quality",
-            Self::Balanced => "Balanced",
-            Self::Performance => "Performance",
-            Self::Native => "Native AA",
+            Self::Off => "Off",
+            Self::Fxaa => "FXAA",
+            Self::Smaa => "SMAA",
+            Self::Taa => "TAA",
         }
     }
-    fn ratio(self) -> f64 {
-        match self {
-            Self::Quality => 1. / 1.5,
-            Self::Balanced => 1. / 1.7,
-            Self::Performance => 0.5,
-            Self::Native => 1.,
-        }
+}
+fn read_aa<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<Aa, D::Error> {
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum SavedAa {
+        Mode(Aa),
+        LegacyTaa(bool),
     }
+    Ok(match SavedAa::deserialize(deserializer)? {
+        SavedAa::Mode(mode) => mode,
+        SavedAa::LegacyTaa(true) => Aa::Taa,
+        SavedAa::LegacyTaa(false) => Aa::Off,
+    })
 }
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
-    pub upscaler: u8,
-    pub upscale_quality: UpscaleQuality,
-    pub taa: bool,
+    #[serde(alias = "taa", deserialize_with = "read_aa")]
+    pub aa: Aa,
     pub vsync: bool,
     pub cap: usize,
     pub resolution: usize,
@@ -56,9 +60,7 @@ pub struct Settings {
 impl Default for Settings {
     fn default() -> Self {
         Self {
-            upscaler: 0,
-            upscale_quality: UpscaleQuality::Quality,
-            taa: true,
+            aa: Aa::Taa,
             vsync: true,
             cap: 0,
             resolution: 0,
@@ -76,11 +78,7 @@ impl Settings {
             Err(e) => return Err(e.to_string()),
         };
         let s: Self = serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
-        if s.upscaler > 2
-            || s.cap >= CAPS.len()
-            || s.resolution >= RESOLUTIONS.len()
-            || s.scale >= SCALES.len()
-        {
+        if s.cap >= CAPS.len() || s.resolution >= RESOLUTIONS.len() || s.scale >= SCALES.len() {
             return Err("Invalid graphics settings; using defaults".into());
         }
         Ok(s)
@@ -99,35 +97,21 @@ impl Settings {
     }
     pub fn change(&mut self, n: u8) {
         match n {
-            0 => self.taa = !self.taa,
+            0 => self.aa = self.aa.next(),
             1 => self.vsync = !self.vsync,
             2 => self.cap = (self.cap + 1) % CAPS.len(),
-            3 if self.upscaler == 0 => {
+            3 => {
                 self.resolution = (self.resolution + 1) % RESOLUTIONS.len();
             }
-            4 if self.upscaler == 0 => {
+            4 => {
                 self.scale = (self.scale + 1) % SCALES.len();
             }
             5 => self.fullscreen = !self.fullscreen,
             6 => self.sound = !self.sound,
-            7 => {
-                if self.upscaler == 0 {
-                    self.upscale_quality = UpscaleQuality::Quality;
-                }
-                self.upscaler = (self.upscaler + 1) % 3;
-            }
-            8 if self.upscaler != 0 => self.upscale_quality = self.upscale_quality.next(),
             _ => (),
         }
     }
     pub fn render_size(&self, width: u32, height: u32) -> (u32, u32) {
-        if self.upscaler != 0 {
-            let ratio = self.upscale_quality.ratio();
-            return (
-                ((width as f64 * ratio).round() as u32).max(1),
-                ((height as f64 * ratio).round() as u32).max(1),
-            );
-        }
         let (w, h) = RESOLUTIONS[self.resolution];
         let (w, h) = if w == 0 { (width, height) } else { (w, h) };
         // Fit the resolution preset to the output aspect ratio without stretching.
@@ -142,14 +126,7 @@ impl Settings {
         let on = |b| if b { "On" } else { "Off" };
         let (w, h) = RESOLUTIONS[self.resolution];
         vec![
-            if self.upscaler == 0 {
-                format!("Temporal AA: {}", on(self.taa))
-            } else {
-                format!(
-                    "Temporal AA: {}",
-                    ["", "DLSS", "FSR 2"][self.upscaler as usize]
-                )
-            },
+            format!("Anti-aliasing: {}", self.aa.label()),
             format!("VSync: {}", on(self.vsync)),
             format!(
                 "Frame cap: {}",
@@ -159,30 +136,17 @@ impl Settings {
                     format!("{} FPS", CAPS[self.cap])
                 }
             ),
-            if self.upscaler != 0 {
-                "Render resolution: Upscaler controlled".into()
-            } else {
-                format!(
-                    "Render resolution: {}",
-                    if w == 0 {
-                        "Native".into()
-                    } else {
-                        format!("{w} x {h}")
-                    }
-                )
-            },
-            if self.upscaler != 0 {
-                "Render scale: Upscaler controlled".into()
-            } else {
-                format!("Render scale: {}%", SCALES[self.scale])
-            },
+            format!(
+                "Render resolution: {}",
+                if w == 0 {
+                    "Native".into()
+                } else {
+                    format!("{w} x {h}")
+                }
+            ),
+            format!("Render scale: {}%", SCALES[self.scale]),
             format!("Fullscreen: {}", on(self.fullscreen)),
             format!("Sound: {}", on(self.sound)),
-            format!(
-                "Upscaler: {}",
-                ["Off", "DLSS", "FSR 2"][self.upscaler as usize]
-            ),
-            format!("Upscaler quality: {}", self.upscale_quality.label()),
         ]
     }
 }
@@ -190,46 +154,22 @@ impl Settings {
 mod tests {
     use super::*;
     #[test]
-    fn named_presets_control_size_and_lock_manual_controls() {
-        let mut s = Settings {
-            upscaler: 1,
-            resolution: 1,
-            scale: 0,
-            upscale_quality: UpscaleQuality::Quality,
-            ..Settings::default()
-        };
-        for (quality, expected) in [
-            (UpscaleQuality::Quality, (1280, 720)),
-            (UpscaleQuality::Balanced, (1129, 635)),
-            (UpscaleQuality::Performance, (960, 540)),
-            (UpscaleQuality::Native, (1920, 1080)),
-        ] {
-            s.upscale_quality = quality;
-            assert_eq!(s.render_size(1920, 1080), expected);
-            assert_eq!(s.render_size(1, 1), (1, 1));
+    fn legacy_settings_keep_manual_scale_and_aa_preference() {
+        let mut settings: Settings = serde_json::from_str(
+            r#"{"upscaler":1,"upscale_quality":"Custom","taa":false,"resolution":1,"scale":0}"#,
+        )
+        .unwrap();
+        assert_eq!(settings.aa, Aa::Off);
+        assert_eq!(settings.render_size(1920, 1080), (640, 360));
+        settings.change(3);
+        settings.change(4);
+        assert_eq!((settings.resolution, settings.scale), (2, 1));
+        for mode in [Aa::Fxaa, Aa::Smaa, Aa::Taa, Aa::Off] {
+            settings.change(0);
+            assert_eq!(settings.aa, mode);
         }
-        s.change(8);
-        assert_eq!(s.upscale_quality, UpscaleQuality::Quality);
-        for upscaler in [1, 2] {
-            s.upscaler = upscaler;
-            s.change(3);
-            s.change(4);
-            assert_eq!((s.resolution, s.scale), (1, 0));
-            assert_eq!(s.render_size(1920, 1080), (1280, 720));
-        }
-        s.upscaler = 0;
-        assert_eq!(s.render_size(1920, 1080), (640, 360));
-        s.change(3);
-        s.change(4);
-        assert_eq!((s.resolution, s.scale), (2, 1));
-        for json in [
-            r#"{"upscaler":1,"scale":0}"#,
-            r#"{"upscaler":1,"upscale_quality":"Custom"}"#,
-        ] {
-            let legacy: Settings = serde_json::from_str(json).unwrap();
-            assert_eq!(legacy.upscale_quality, UpscaleQuality::Quality);
-            assert_eq!(legacy.render_size(1920, 1080), (1280, 720));
-        }
+        let legacy: Settings = serde_json::from_str(r#"{"upscaler":2,"taa":true}"#).unwrap();
+        assert_eq!(legacy.aa, Aa::Taa);
     }
     #[test]
     fn scaled_resolution_preserves_output_aspect_and_never_zero() {
@@ -254,15 +194,14 @@ mod persistence_tests {
             vsync: false,
             cap: 5,
             scale: 1,
-            upscaler: 2,
-            upscale_quality: UpscaleQuality::Balanced,
+            aa: Aa::Smaa,
             ..Settings::default()
         };
         settings.write(&path).unwrap();
         let read = Settings::read(&path).unwrap();
         assert!(read.fullscreen && !read.vsync);
-        assert_eq!(read.upscale_quality, UpscaleQuality::Balanced);
-        assert_eq!((read.cap, read.scale, read.upscaler), (5, 1, 2));
+        assert_eq!(read.aa, Aa::Smaa);
+        assert_eq!((read.cap, read.scale), (5, 1));
         std::fs::write(&path, r#"{"scale":99}"#).unwrap();
         assert!(Settings::read(&path).is_err());
         std::fs::remove_file(path).unwrap();

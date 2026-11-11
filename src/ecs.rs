@@ -9,17 +9,40 @@ pub struct Entity {
 pub enum MobKind {
     Husk,
     Sheep { male: bool },
+    Penguin { male: bool },
+    PolarBear { male: bool, provoked: bool },
     Guardian([i32; 3]),
 }
 impl MobKind {
     pub fn hostile(self) -> bool {
-        !matches!(self, Self::Sheep { .. })
+        matches!(
+            self,
+            Self::Husk | Self::Guardian(_) | Self::PolarBear { provoked: true, .. }
+        )
+    }
+    pub fn body(self) -> (f32, f32) {
+        match self {
+            Self::Penguin { .. } => (0.32, 0.90),
+            Self::PolarBear { .. } => (0.57, 1.37),
+            _ => (0.29, 1.79),
+        }
+    }
+    pub fn target_height(self) -> f32 {
+        match self {
+            Self::Penguin { .. } => 0.48,
+            Self::PolarBear { .. } => 0.83,
+            _ => 1.,
+        }
     }
     pub fn name(self) -> &'static str {
         match self {
             Self::Husk => "Husk",
             Self::Sheep { male: true } => "Sheep (male)",
             Self::Sheep { male: false } => "Sheep (female)",
+            Self::Penguin { male: true } => "Penguin (male)",
+            Self::Penguin { male: false } => "Penguin (female)",
+            Self::PolarBear { male: true, .. } => "Polar bear (male)",
+            Self::PolarBear { male: false, .. } => "Polar bear (female)",
             Self::Guardian(_) => "Ruin guardian",
         }
     }
@@ -30,6 +53,8 @@ pub struct Mob {
     pub health: f32,
     pub cooldown: f32,
     pub level: u32,
+    pub heading: f32,
+    pub stride: f32,
 }
 struct Slot {
     generation: u32,
@@ -101,6 +126,8 @@ mod tests {
             health: 10.,
             cooldown: 0.,
             level: 1,
+            heading: 0.,
+            stride: 0.,
         });
         e.despawn(a);
         let b = e.spawn(Mob {
@@ -109,6 +136,8 @@ mod tests {
             health: 10.,
             cooldown: 0.,
             level: 1,
+            heading: 0.,
+            stride: 0.,
         });
         assert_ne!(a, b);
         assert!(e.get_mut(a).is_none());

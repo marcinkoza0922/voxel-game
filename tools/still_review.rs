@@ -6,7 +6,7 @@ pub fn run(options: &Options) -> Result<(), String> {
     let mut game = save::read(&options.save)?.ok_or("Still review needs an existing --save")?;
     let mut renderer = pollster::block_on(Renderer::headless(1280, 800))?;
     let result = (|| {
-        renderer.apply_settings(&crate::settings::Settings::read(&options.settings_path)?)?;
+        renderer.apply_settings(&crate::settings::Settings::read(&options.settings_path)?);
         let start = Instant::now();
         loop {
             renderer.update_world(&mut game.world, game.player.pos.into());

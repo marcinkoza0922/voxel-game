@@ -1,6 +1,7 @@
 use crate::{
     game::{Game, STAT_NAMES},
     items::{Item, RECIPES, Stack, grid_recipe},
+    world::Biome,
 };
 use bytemuck::{Pod, Zeroable};
 #[repr(C)]
@@ -20,6 +21,8 @@ pub enum Action {
     Save,
     Quit,
     NewWorld,
+    BiomeMenu,
+    StartBiome(Biome),
     LoadMenu,
     Load(usize),
     Page(i32),
@@ -33,6 +36,7 @@ pub enum Screen {
     Game,
     Title,
     Load,
+    BiomeTest,
     Settings,
 }
 
@@ -299,7 +303,7 @@ impl Ui {
             }
         }
         if let Some((_, m)) = g.entities.iter().find(|(_, m)| {
-            let d = m.pos + glam::Vec3::Y - g.player.eye();
+            let d = m.pos + glam::Vec3::Y * m.kind.target_height() - g.player.eye();
             d.length() < 8. && d.normalize_or_zero().dot(g.player.direction()) > 0.96
         }) {
             self.text(
@@ -370,11 +374,24 @@ impl Ui {
                 for (n, label, action) in [
                     (0, "New game", Action::NewWorld),
                     (1, "Load game", Action::LoadMenu),
-                    (2, "Settings", Action::Settings),
-                    (3, "Quit", Action::Quit),
+                    (2, "Biome test", Action::BiomeMenu),
+                    (3, "Settings", Action::Settings),
+                    (4, "Quit", Action::Quit),
                 ] {
                     self.button([x, 244. + n as f32 * 57., 440., 44.], label, action, true);
                 }
+            }
+            Screen::BiomeTest => {
+                self.text(x, 188., "SELECT A STARTING BIOME", 1.8, INK);
+                for (i, biome) in Biome::SPAWN_CHOICES.into_iter().enumerate() {
+                    self.button(
+                        [x, 222. + i as f32 * 42., 440., 36.],
+                        biome.name(),
+                        Action::StartBiome(biome),
+                        true,
+                    );
+                }
+                self.button([x, 609., 440., 36.], "Back", Action::Back, true);
             }
             Screen::Settings => {
                 let settings = self.settings.clone();
@@ -383,9 +400,7 @@ impl Ui {
                         [x, 180. + n as f32 * 42., 440., 35.],
                         label,
                         Action::Setting(n as u8),
-                        (n != 0 || settings.upscaler == 0)
-                            && (!matches!(n, 3 | 4) || settings.upscaler == 0)
-                            && (n != 8 || settings.upscaler != 0),
+                        true,
                     );
                 }
                 let output = (
@@ -395,7 +410,7 @@ impl Ui {
                 let size = settings.render_size(output.0, output.1);
                 self.text(
                     x,
-                    565.,
+                    481.,
                     &format!(
                         "World: {} x {}   Output: {} x {}",
                         size.0, size.1, output.0, output.1
@@ -403,7 +418,7 @@ impl Ui {
                     1.2,
                     MUTED,
                 );
-                self.button([x, 590., 440., 39.], "Back", Action::Back, true);
+                self.button([x, 506., 440., 39.], "Back", Action::Back, true);
             }
             Screen::Load => {
                 self.text(x, 188., "SELECT A SAVED WORLD", 1.8, INK);
@@ -1039,13 +1054,30 @@ mod menu_tests {
         let mut ui = Ui::new();
         ui.screen = Screen::Title;
         ui.build(&Game::new(7), false, false, 900, 600, 60.);
-        assert_eq!(ui.hits.len(), 4);
+        assert_eq!(ui.hits.len(), 5);
         assert!(matches!(ui.hits[0].1, Action::NewWorld));
         assert!(matches!(ui.hits[1].1, Action::LoadMenu));
-        assert!(matches!(ui.hits[2].1, Action::Settings));
+        assert!(matches!(ui.hits[2].1, Action::BiomeMenu));
+        assert!(matches!(ui.hits[3].1, Action::Settings));
         ui.begin(900, 600);
         ui.button([10., 10., 100., 40.], "Disabled", Action::Quit, false);
         assert!(ui.click(20. * ui.scale, 20. * ui.scale).is_none());
+    }
+    #[test]
+    fn biome_picker_has_a_clickable_button_for_each_spawn_choice_and_back() {
+        let mut ui = Ui::new();
+        ui.screen = Screen::BiomeTest;
+        ui.build(&Game::new(7), false, false, 900, 600, 60.);
+        assert_eq!(ui.hits.len(), Biome::SPAWN_CHOICES.len() + 1);
+        for (i, biome) in Biome::SPAWN_CHOICES.into_iter().enumerate() {
+            let ([x, y, w, h], _) = ui.hits[i];
+            assert!(x + w <= ui.width && y + h <= ui.height);
+            assert!(matches!(
+                ui.click((x + w / 2.) * ui.scale, (y + h / 2.) * ui.scale),
+                Some(Action::StartBiome(selected)) if selected == biome
+            ));
+        }
+        assert!(matches!(ui.hits.last(), Some((_, Action::Back))));
     }
     #[test]
     fn every_save_is_reachable_and_settings_fit_minimum_window() {
@@ -1058,7 +1090,7 @@ mod menu_tests {
         assert!(!ui.hits.iter().any(|(_, a)| matches!(a, Action::Page(1))));
         ui.screen = Screen::Settings;
         ui.build(&Game::new(7), false, false, 900, 600, 60.);
-        assert_eq!(ui.hits.len(), 9);
+        assert_eq!(ui.hits.len(), 8);
         for (r, _) in &ui.hits {
             assert!(
                 r[0] >= 0. && r[1] >= 0. && r[0] + r[2] <= ui.width && r[1] + r[3] <= ui.height

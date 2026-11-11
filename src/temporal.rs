@@ -1,4 +1,5 @@
 //! World-only temporal resolve and resolution-independent presentation.
+use crate::{settings::Aa, smaa::Smaa};
 use glam::Mat4;
 use wgpu::util::DeviceExt;
 
@@ -16,10 +17,10 @@ pub struct Temporal {
     history: [wgpu::TextureView; 2],
     resolve: wgpu::RenderPipeline,
     present: wgpu::RenderPipeline,
-    #[cfg(feature = "native-upscalers")]
-    velocity: wgpu::RenderPipeline,
-    #[cfg(feature = "native-upscalers")]
-    depth_copy: wgpu::RenderPipeline,
+    fxaa: wgpu::RenderPipeline,
+    smaa: Option<Smaa>,
+    output: (u32, u32),
+    format: wgpu::TextureFormat,
     layout: wgpu::BindGroupLayout,
     sampler: wgpu::Sampler,
     uniform: wgpu::Buffer,
@@ -156,20 +157,17 @@ impl Temporal {
         };
         let resolve = pipeline("resolve", wgpu::TextureFormat::Rgba16Float);
         let present = pipeline("present", format);
-        #[cfg(feature = "native-upscalers")]
-        let velocity = pipeline("velocity", wgpu::TextureFormat::Rg16Float);
-        #[cfg(feature = "native-upscalers")]
-        let depth_copy = pipeline("depth_copy", wgpu::TextureFormat::R32Float);
+        let fxaa = pipeline("fxaa", format);
         Self {
             scene,
-            #[cfg(feature = "native-upscalers")]
-            velocity,
-            #[cfg(feature = "native-upscalers")]
-            depth_copy,
             depth,
             history,
             resolve,
             present,
+            fxaa,
+            smaa: None,
+            output,
+            format,
             layout,
             sampler,
             uniform,
@@ -235,100 +233,7 @@ impl Temporal {
                 },
             ],
         });
-        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-            label: Some("Resolve"),
-            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                view: target,
-                resolve_target: None,
-                depth_slice: None,
-                ops: wgpu::Operations {
-                    load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
-                    store: wgpu::StoreOp::Store,
-                },
-            })],
-            ..Default::default()
-        });
-        pass.set_pipeline(pipeline);
-        pass.set_bind_group(0, &bind, &[]);
-        pass.draw(0..3, 0..1);
-    }
-    #[cfg(feature = "native-upscalers")]
-    #[allow(clippy::too_many_arguments)]
-    pub fn native(
-        &mut self,
-        device: &wgpu::Device,
-        queue: &wgpu::Queue,
-        encoder: &mut wgpu::CommandEncoder,
-        output: &wgpu::TextureView,
-        stable_camera: Mat4,
-        eye: glam::Vec3,
-        native: &mut crate::native_upscale::Native,
-        dt: f32,
-    ) -> Result<(), String> {
-        let delta = self.previous_eye - eye;
-        let jitter = self.jitter(true);
-        let camera = Mat4::from_translation(jitter.extend(0.)) * stable_camera;
-        let offset = jitter * glam::Vec2::new(0.5, -0.5);
-        queue.write_buffer(
-            &self.uniform,
-            0,
-            bytemuck::bytes_of(&Params {
-                inverse: camera.inverse().to_cols_array_2d(),
-                previous: self.previous.to_cols_array_2d(),
-                eye_delta: [delta.x, delta.y, delta.z, 0.],
-                flags: [
-                    0.,
-                    offset.x,
-                    offset.y,
-                    stationary_history(
-                        self.valid,
-                        stable_camera,
-                        self.previous,
-                        eye,
-                        self.previous_eye,
-                    ) as u32 as f32,
-                ],
-            }),
-        );
-        self.pass(
-            device,
-            encoder,
-            &native.linear_depth,
-            &self.scene,
-            &self.history[0],
-            &self.depth_copy,
-        );
-        self.pass(
-            device,
-            encoder,
-            &native.motion,
-            &self.scene,
-            &self.history[0],
-            &self.velocity,
-        );
-        let pixel_jitter =
-            jitter * glam::Vec2::new(self.size.0 as f32 * 0.5, -(self.size.1 as f32) * 0.5);
-        native.render(
-            encoder,
-            &self.scene,
-            &self.depth,
-            pixel_jitter,
-            !self.valid || delta.length_squared() > 16.,
-            dt,
-        )?;
-        self.pass(
-            device,
-            encoder,
-            output,
-            &native.output,
-            &self.history[0],
-            &self.present,
-        );
-        self.previous = stable_camera;
-        self.previous_eye = eye;
-        self.valid = true;
-        self.frame = self.frame.wrapping_add(1);
-        Ok(())
+        fullscreen_pass(encoder, target, pipeline, &bind);
     }
     #[allow(clippy::too_many_arguments)]
     pub fn draw(
@@ -339,12 +244,54 @@ impl Temporal {
         output: &wgpu::TextureView,
         stable_camera: Mat4,
         eye: glam::Vec3,
-        enabled: bool,
+        aa: Aa,
     ) {
-        let jitter = self.jitter(enabled);
+        if aa != Aa::Taa {
+            self.valid = false;
+            if aa == Aa::Smaa {
+                self.smaa.get_or_insert_with(|| {
+                    Smaa::new(
+                        device,
+                        queue,
+                        &self.scene,
+                        self.size,
+                        self.output,
+                        self.format,
+                    )
+                });
+                let smaa = self.smaa.as_ref().unwrap();
+                smaa.draw(encoder, output);
+                if let Some(scaled) = &smaa.scaled {
+                    self.pass(
+                        device,
+                        encoder,
+                        output,
+                        scaled,
+                        &self.history[0],
+                        &self.present,
+                    );
+                }
+            } else {
+                let pipeline = if aa == Aa::Fxaa {
+                    &self.fxaa
+                } else {
+                    &self.present
+                };
+                self.pass(
+                    device,
+                    encoder,
+                    output,
+                    &self.scene,
+                    &self.history[0],
+                    pipeline,
+                );
+            }
+            return;
+        }
+        let jitter = self.jitter(true);
         let camera = Mat4::from_translation(jitter.extend(0.)) * stable_camera;
         let delta = self.previous_eye - eye;
-        let valid = enabled && self.valid && delta.length_squared() < 16.;
+        let valid = self.valid && delta.length_squared() < 16.;
         queue.write_buffer(
             &self.uniform,
             0,
@@ -384,6 +331,29 @@ impl Temporal {
         self.frame = self.frame.wrapping_add(1);
     }
 }
+pub fn fullscreen_pass(
+    encoder: &mut wgpu::CommandEncoder,
+    target: &wgpu::TextureView,
+    pipeline: &wgpu::RenderPipeline,
+    bind: &wgpu::BindGroup,
+) {
+    let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+        label: None,
+        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+            view: target,
+            resolve_target: None,
+            depth_slice: None,
+            ops: wgpu::Operations {
+                load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                store: wgpu::StoreOp::Store,
+            },
+        })],
+        ..Default::default()
+    });
+    pass.set_pipeline(pipeline);
+    pass.set_bind_group(0, bind, &[]);
+    pass.draw(0..3, 0..1);
+}
 impl Params {
     fn zero() -> Self {
         bytemuck::Zeroable::zeroed()
@@ -405,31 +375,6 @@ fn stationary_history(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn native_motion_reprojects_to_previous_unjittered_pixel() {
-        use glam::{Vec2, Vec3, Vec4};
-        let projection = Mat4::perspective_rh(75_f32.to_radians(), 1.6, 0.05, 1024.);
-        let previous = projection * Mat4::look_at_rh(Vec3::ZERO, Vec3::NEG_Z, Vec3::Y);
-        let eye = Vec3::new(0.2, 0.1, 0.);
-        let stable = projection * Mat4::look_at_rh(eye, eye + Vec3::NEG_Z, Vec3::Y);
-        let point = Vec4::new(1., 0.5, -8., 1.);
-        let uv = |clip: Vec4| {
-            clip.truncate().truncate() / clip.w * Vec2::new(0.5, -0.5) + Vec2::splat(0.5)
-        };
-        let expected = uv(previous * point) - uv(stable * point);
-        assert!(expected.length() > 0.001);
-        for jitter in [Vec2::new(-0.0007, 0.001), Vec2::new(0.0005, -0.0008)] {
-            let camera = Mat4::from_translation(jitter.extend(0.)) * stable;
-            let clip = camera * point;
-            let current_uv = uv(clip);
-            let ndc = clip / clip.w;
-            let world = camera.inverse() * ndc;
-            let motion =
-                uv(previous * (world / world.w)) - current_uv + jitter * Vec2::new(0.5, -0.5);
-            assert!((motion - expected).length() < 0.00001);
-        }
-    }
 
     #[test]
     fn stationary_history_requires_identical_view_and_valid_history() {

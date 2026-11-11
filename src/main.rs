@@ -14,8 +14,6 @@ mod gpu_profile;
 mod headless;
 mod hydrology;
 mod items;
-#[cfg(feature = "native-upscalers")]
-mod native_upscale;
 #[path = "../tools/performance.rs"]
 mod performance;
 #[path = "../tools/playtest.rs"]
@@ -23,6 +21,7 @@ mod playtest;
 mod render;
 mod save;
 mod settings;
+mod smaa;
 #[path = "../tools/still_review.rs"]
 mod still_review;
 mod streaming;
@@ -44,6 +43,8 @@ use winit::{
     window::{CursorGrabMode, Window, WindowId},
 };
 
+const DEFAULT_SEED: u64 = 314159;
+
 struct Options {
     stress: bool,
     frontier_review: bool,
@@ -54,6 +55,7 @@ struct Options {
     settings_path: PathBuf,
     seed: u64,
     new: bool,
+    biome_test: Option<world::Biome>,
     save: PathBuf,
     smoke: bool,
     expedition: bool,
@@ -74,8 +76,9 @@ fn options() -> Result<Options, String> {
         headless: false,
         title: false,
         settings_path: PathBuf::from("saves/settings.json"),
-        seed: 314159,
+        seed: DEFAULT_SEED,
         new: false,
+        biome_test: None,
         save: PathBuf::from("saves/world.json"),
         smoke: false,
         expedition: false,
@@ -101,6 +104,16 @@ fn options() -> Result<Options, String> {
                 o.settings_path = PathBuf::from(args.next().ok_or("--settings needs a path")?)
             }
             "--new" => o.new = true,
+            "--biome-test" => {
+                let name = args.next().ok_or("--biome-test needs a biome name")?;
+                o.biome_test = Some(world::Biome::from_spawn_name(&name).ok_or_else(|| {
+                    format!(
+                        "Unknown biome {name:?}. Choose from {}",
+                        world::Biome::SPAWN_NAMES
+                    )
+                })?);
+                o.new = true;
+            }
             "--mute" => o.mute = true,
             "--seed" => {
                 explicit_seed = true;
@@ -142,6 +155,10 @@ fn options() -> Result<Options, String> {
                 println!(
                     "Voxel Adventure\n  --still-review frozen temporal captures; --save is read only, --capture is output directory\n  --frontier-review benchmark mining invalidation without writing saves\n  --water-review render a natural waterfall to target/water-review (isolated save/settings)\n  --stress       CPU stress suite; --frames sets repetitions (default 12), --profile writes samples\n  --headless     render offscreen without display/audio (default 240 frames)\n  --new          create a separate fresh save with a random seed\n  --seed N       seed for a new world (default 314159)\n  --save PATH    world file (default saves/world.json)\n  --smoke        headless gameplay/persistence check; uses a temporary save\n  --frames N     render N frames then save and exit\n  --capture PATH save final frame as PPM (defaults to 240 frames)\n  --tour         scripted camera relocations for streaming measurements\n  --playtest     run headless mechanics course and progression expedition\n  --expedition   run controlled headless progression expedition\n  --profile PATH write frame timings and chunk backlog as CSV\n  --mute         disable sound playback\n  --pack         start with the inventory open\n  --title        show title screen (also supports headless previews)\n  --settings PATH graphics settings JSON (default saves/settings.json)\n\nWASD move; mouse look; Space jump; double-tap W sprint; Shift walk\nLMB mine/attack; RMB place/eat/use; wheel or 1-9 select\nE inventory/crafting/stats; R sleep near bed; F5 save; Esc menu"
                 );
+                println!(
+                    "\n--biome-test BIOME starts a fresh test world in that biome (seed 314159 unless specified).\nBiomes: {}",
+                    world::Biome::SPAWN_NAMES
+                );
                 std::process::exit(0);
             }
             _ => return Err(format!("Unknown argument: {arg}")),
@@ -159,7 +176,20 @@ fn options() -> Result<Options, String> {
                 .into(),
         );
     }
-    if o.new && !explicit_seed {
+    if o.biome_test.is_some()
+        && (o.title
+            || o.tour
+            || o.stress
+            || o.frontier_review
+            || o.still_review
+            || o.water_review
+            || o.smoke
+            || o.expedition
+            || o.playtest)
+    {
+        return Err("--biome-test starts directly in a new world and cannot be combined with title, tour, or scripted tests".into());
+    }
+    if o.new && !explicit_seed && o.biome_test.is_none() {
         o.seed = fresh_seed();
     }
     Ok(o)
@@ -235,15 +265,26 @@ impl App {
             }
         }
     }
-    fn new_world(&mut self) {
+    fn new_world(&mut self, biome: Option<world::Biome>) {
         if !self.save() {
             return;
         }
-        let mut game = Game::new(fresh_seed());
+        let mut game = if let Some(biome) = biome {
+            match Game::new_in_biome(DEFAULT_SEED, biome) {
+                Ok(game) => game,
+                Err(e) => {
+                    self.notice = e;
+                    return;
+                }
+            }
+        } else {
+            Game::new(fresh_seed())
+        };
         match save::create(&game, &self.options.save) {
             Ok(path) => {
                 game.say(format!("New world: {}", path.display()));
                 self.game = game;
+                self.notice.clear();
                 self.active = true;
                 self.screen = ui::Screen::Game;
                 self.options.save = path;
@@ -277,12 +318,8 @@ impl App {
                     .then(|| winit::window::Fullscreen::Borderless(w.current_monitor())),
             );
         }
-        if let Some(r) = &mut self.renderer
-            && let Err(e) = r.apply_settings(&self.settings)
-        {
-            self.notice = e;
-            self.settings.upscaler = 0;
-            let _ = r.apply_settings(&self.settings);
+        if let Some(r) = &mut self.renderer {
+            r.apply_settings(&self.settings);
         }
         self.next_frame = Instant::now();
     }
@@ -307,6 +344,12 @@ impl App {
                 self.capture();
             }
             ui::Action::Back => {
+                if self.screen == ui::Screen::BiomeTest
+                    && let Some(r) = &mut self.renderer
+                {
+                    r.ui.focus = 0;
+                    r.ui.hits.clear();
+                }
                 self.screen = if self.screen == ui::Screen::Settings {
                     self.settings_back
                 } else {
@@ -435,7 +478,17 @@ impl App {
             ui::Action::Save => {
                 self.save();
             }
-            ui::Action::NewWorld => self.new_world(),
+            ui::Action::NewWorld => self.new_world(None),
+            ui::Action::BiomeMenu => {
+                self.screen = ui::Screen::BiomeTest;
+                self.notice.clear();
+                if let Some(r) = &mut self.renderer {
+                    r.ui.focus = 0;
+                    r.ui.hits.clear();
+                }
+                self.capture();
+            }
+            ui::Action::StartBiome(biome) => self.new_world(Some(biome)),
             ui::Action::Quit => self.exit(event_loop),
         }
     }
@@ -945,7 +998,14 @@ fn run() -> Result<(), String> {
     let direct = !options.title
         && (options.new || options.headless || options.frames.is_some() || options.pack);
     let game = if options.new {
-        let game = Game::new(options.seed);
+        let game = if let Some(biome) = options.biome_test {
+            let game = Game::new_in_biome(options.seed, biome)?;
+            let [x, y, z] = game.player.spawn;
+            println!("{} spawn at ({x:.1}, {y:.1}, {z:.1})", biome.name());
+            game
+        } else {
+            Game::new(options.seed)
+        };
         options.save = save::create(&game, &options.save)?;
         println!("Created {} (seed {})", options.save.display(), options.seed);
         game

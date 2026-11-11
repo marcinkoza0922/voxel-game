@@ -263,6 +263,32 @@ pub enum Biome {
     SnowMegaMountains,
 }
 impl Biome {
+    pub const SPAWN_CHOICES: [Self; 9] = [
+        Self::Grassland,
+        Self::GrasslandHills,
+        Self::GrasslandMountains,
+        Self::GrasslandMegaMountains,
+        Self::Forest,
+        Self::Tundra,
+        Self::SnowHills,
+        Self::SnowMountains,
+        Self::SnowMegaMountains,
+    ];
+
+    pub const SPAWN_NAMES: &str = "grasslands, grassland-hills, grassland-mountains, grassland-mega-mountains, oak-forest, polar, polar-plains, polar-hills, polar-mountains, polar-mega-mountains";
+
+    pub fn from_spawn_name(name: &str) -> Option<Self> {
+        let name = name.to_ascii_lowercase().replace(' ', "-");
+        match name.as_str() {
+            "grassland" => Some(Self::Grassland),
+            "forest" => Some(Self::Forest),
+            "polar" => Some(Self::Tundra),
+            _ => Self::SPAWN_CHOICES
+                .into_iter()
+                .find(|biome| biome.name().to_ascii_lowercase().replace(' ', "-") == name),
+        }
+    }
+
     pub fn is_snow(self) -> bool {
         matches!(
             self,
@@ -282,13 +308,23 @@ impl Biome {
         match self {
             Self::Grassland => "Grasslands",
             Self::Forest => "Oak forest",
-            Self::Tundra => "Tundra",
+            Self::Tundra => "Polar plains",
             Self::GrasslandHills => "Grassland hills",
             Self::GrasslandMountains => "Grassland mountains",
             Self::GrasslandMegaMountains => "Grassland mega mountains",
+            Self::SnowHills => "Polar hills",
+            Self::SnowMountains => "Polar mountains",
+            Self::SnowMegaMountains => "Polar mega mountains",
+        }
+    }
+
+    pub fn discovery_name(self) -> &'static str {
+        match self {
+            Self::Tundra => "Tundra",
             Self::SnowHills => "Snow hills",
             Self::SnowMountains => "Snow mountains",
             Self::SnowMegaMountains => "Snow mega mountains",
+            _ => self.name(),
         }
     }
 }
@@ -307,6 +343,13 @@ struct TerrainColumn {
     ruin: Option<IVec3>,
     cave: Option<(i32, i32)>,
     water: Option<crate::hydrology::Column>,
+    glacier: Option<GlacierColumn>,
+}
+
+struct GlacierColumn {
+    depth: i32,
+    crevasse: i32,
+    cavern: bool,
 }
 
 pub(crate) struct SkyColumn {
@@ -589,6 +632,7 @@ impl World {
                                     ruin: self.nearby_ruin(cx, cz),
                                     cave: self.cave_column(cx, cz),
                                     water: self.waterway_terrain_column(cx, cz),
+                                    glacier: None,
                                 },
                             )
                             .replaceable()
@@ -763,6 +807,64 @@ impl World {
         None
     }
 
+    fn glacier_column(&self, x: i32, z: i32, height: i32, biome: Biome) -> Option<GlacierColumn> {
+        if !matches!(biome, Biome::SnowMountains | Biome::SnowMegaMountains)
+            || height < SEA_LEVEL + 22
+        {
+            return None;
+        }
+        const CELL: i32 = 160;
+        let cell_x = x.div_euclid(CELL);
+        let cell_z = z.div_euclid(CELL);
+        let seed = self.seed ^ 0x676c6163696572;
+        let h = hash(seed, cell_x, 0, cell_z);
+        if h.is_multiple_of(3) {
+            return None;
+        }
+        let cx = cell_x * CELL + 72 + (h % 17) as i32;
+        let cz = cell_z * CELL + 72 + ((h >> 8) % 17) as i32;
+        let (along, across) = if h & 1 == 0 {
+            (x - cx, z - cz)
+        } else {
+            (z - cz, x - cx)
+        };
+        if along.abs() >= 65 || across.abs() >= 34 {
+            return None;
+        }
+        let (dx, dz) = if h & 1 == 0 { (52, 0) } else { (0, 52) };
+        let forward = self.height(cx + dx, cz + dz);
+        let backward = self.height(cx - dx, cz - dz);
+        if (forward - backward).abs() < 8 {
+            return None;
+        }
+        let u = along as f32 / 61. * if forward < backward { 1. } else { -1. };
+        let bend = (u * 2.4).sin() * 8.;
+        let width = 20. - u * 8.;
+        let v = (across as f32 - bend) / width;
+        let edge = noise(seed, x as f32 / 13., z as f32 / 13.) - 0.5;
+        let interior = 1. - u * u - v * v + edge * 0.2;
+        if interior <= 0. {
+            return None;
+        }
+        let depth = 1 + (interior * 11.) as i32;
+        let fracture = along as f32 + across as f32 * 0.28 + edge * 5.;
+        let cavern = (h >> 24).is_multiple_of(5)
+            && depth >= 9
+            && ((fracture + 3.) / 10.).powi(2) + ((across as f32 - bend) / 7.).powi(2) < 1.;
+        let crevasse = if cavern && (-4.0..-2.4).contains(&fracture) {
+            7
+        } else if depth >= 6 && (fracture + 4.).rem_euclid(23.) < 1.6 {
+            2 + depth / 4
+        } else {
+            0
+        };
+        Some(GlacierColumn {
+            depth,
+            crevasse,
+            cavern,
+        })
+    }
+
     fn natural_column(&self, p: IVec3, column: &TerrainColumn) -> Block {
         let TerrainColumn {
             height,
@@ -771,6 +873,7 @@ impl World {
             ruin,
             cave,
             water,
+            ref glacier,
         } = *column;
         if !(MIN_Y..=MAX_Y).contains(&p.y) {
             return if p.y < MIN_Y {
@@ -847,6 +950,18 @@ impl World {
         }
         if p.y > MIN_Y + 3 && cave.is_some_and(|(lo, hi)| (lo..=hi).contains(&p.y)) {
             return Block::Air;
+        }
+        if let Some(ice) = glacier
+            && (0..ice.depth).contains(&(height - p.y))
+        {
+            let below_surface = height - p.y;
+            return if below_surface < ice.crevasse
+                || (ice.cavern && (4..=7).contains(&below_surface))
+            {
+                Block::Air
+            } else {
+                Block::Ice
+            };
         }
         if let Some(rock) = self.surface_rock(p, height, biome) {
             return rock;
@@ -927,13 +1042,16 @@ impl World {
     fn terrain_column(&self, x: i32, z: i32) -> TerrainColumn {
         let climate = self.climate(x, z);
         let relief = self.relief(x, z);
+        let height = self.height_from_fields(x, z, relief, climate);
+        let biome = Self::biome_from_fields(climate, relief);
         TerrainColumn {
-            height: self.height_from_fields(x, z, relief, climate),
-            biome: Self::biome_from_fields(climate, relief),
+            height,
+            biome,
             tree: self.tree(x, z),
             ruin: self.nearby_ruin(x, z),
             cave: self.cave_column(x, z),
             water: self.waterway_terrain_column(x, z),
+            glacier: self.glacier_column(x, z, height, biome),
         }
     }
     /// Prepare one column for both roof searches and ray occupancy queries.
@@ -1858,6 +1976,74 @@ mod tests {
                 Block::Stone
             );
         }
+    }
+
+    #[test]
+    fn polar_glacier_has_deep_ice_and_open_crevasses_in_chunk_halos() {
+        let mut world = World::new(314159);
+        let (x, z, height, depth) = (-3200..3200)
+            .step_by(5)
+            .flat_map(|x| (-3200..3200).step_by(5).map(move |z| (x, z)))
+            .find_map(|(x, z)| {
+                let biome = world.biome(x, z);
+                if !matches!(biome, Biome::SnowMountains | Biome::SnowMegaMountains) {
+                    return None;
+                }
+                let height = world.height(x, z);
+                let GlacierColumn {
+                    depth,
+                    crevasse,
+                    cavern,
+                } = world.glacier_column(x, z, height, biome)?;
+                (crevasse >= 3
+                    && !cavern
+                    && world.get(IVec3::new(x, height - depth + 1, z)) == Block::Ice
+                    && world.get(IVec3::new(x, height - crevasse, z)) == Block::Ice)
+                    .then_some((x, z, height, crevasse))
+            })
+            .expect("seed has a deep open glacier crevasse");
+        let floor = IVec3::new(x, height - depth, z);
+        for (p, block) in [(floor, Block::Ice), (floor + IVec3::Y, Block::Air)] {
+            let key = chunk(p);
+            let local = p - key * SIZE + IVec3::ONE;
+            let index = (local.x + 18 * (local.z + 18 * local.y)) as usize;
+            assert_eq!(world.get(p), block);
+            assert_eq!(world.halo(key)[index], block);
+        }
+        world.set(floor, Block::Stone);
+        assert_eq!(world.get(floor), Block::Stone);
+    }
+
+    #[test]
+    fn polar_glacier_caverns_have_ice_roofs_and_crevasse_entrances() {
+        let world = World::new(314159);
+        let mut roofed_chamber = false;
+        let mut open_entrance = false;
+        for x in (-3200..3200).step_by(3) {
+            for z in (-3200..3200).step_by(3) {
+                let biome = world.biome(x, z);
+                if !matches!(biome, Biome::SnowMountains | Biome::SnowMegaMountains) {
+                    continue;
+                }
+                let height = world.height(x, z);
+                let Some(ice) = world.glacier_column(x, z, height, biome) else {
+                    continue;
+                };
+                let top = IVec3::new(x, height, z);
+                if !ice.cavern || world.get(top - IVec3::Y * 8) != Block::Ice {
+                    continue;
+                }
+                roofed_chamber |= ice.crevasse == 0
+                    && world.get(top) == Block::Ice
+                    && (4..=7).all(|depth| world.get(top - IVec3::Y * depth) == Block::Air);
+                open_entrance |= ice.crevasse == 7
+                    && (0..=7).all(|depth| world.get(top - IVec3::Y * depth) == Block::Air);
+                if roofed_chamber && open_entrance {
+                    return;
+                }
+            }
+        }
+        panic!("expected both roofed chambers and open entrances in seeded glaciers");
     }
     #[test]
     fn cached_surface_plans_match_fresh_worlds_and_stay_bounded() {
