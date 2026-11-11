@@ -162,6 +162,63 @@ impl Game {
             torch_life: Default::default(),
         }
     }
+
+    pub fn new_in_biome(seed: u64, biome: Biome) -> Result<Self, String> {
+        let mut game = Self::new(seed);
+        const GRID_STEP: i32 = 24;
+        const SEARCH_RADIUS: i32 = 16_384;
+        let candidate = |x, z| {
+            if game.world.biome(x, z) != biome {
+                return None;
+            }
+            let y = game.world.height(x, z);
+            if y <= crate::world::SEA_LEVEL
+                || [(8, 0), (-8, 0), (0, 8), (0, -8)]
+                    .into_iter()
+                    .any(|(dx, dz)| game.world.biome(x + dx, z + dz) != biome)
+                || [(2, 0), (-2, 0), (0, 2), (0, -2)]
+                    .into_iter()
+                    .any(|(dx, dz)| (game.world.height(x + dx, z + dz) - y).abs() > 3)
+            {
+                return None;
+            }
+            let ground = IVec3::new(x, y, z);
+            if !matches!(
+                game.world.get(ground),
+                Block::Grass | Block::Snow | Block::Stone | Block::Dirt | Block::Ice
+            ) || !(1..=2).all(|dy| {
+                let block = game.world.get(ground + IVec3::Y * dy);
+                !block.solid() && block.fluid().is_none()
+            }) {
+                return None;
+            }
+            Some(ground.as_vec3() + Vec3::new(0.5, 1.01, 0.5))
+        };
+        let spawn = candidate(2, 2).or_else(|| {
+            (GRID_STEP..=SEARCH_RADIUS)
+                .step_by(GRID_STEP as usize)
+                .find_map(|r| {
+                    (-r..=r).step_by(GRID_STEP as usize).find_map(|s| {
+                        candidate(s, -r).or_else(|| candidate(s, r)).or_else(|| {
+                            if s.abs() < r {
+                                candidate(-r, s).or_else(|| candidate(r, s))
+                            } else {
+                                None
+                            }
+                        })
+                    })
+                })
+        });
+        let Some(spawn) = spawn else {
+            return Err(format!(
+                "No dry {} spawn found within {SEARCH_RADIUS} blocks for seed {seed}",
+                biome.name()
+            ));
+        };
+        game.player.pos = spawn.to_array();
+        game.player.spawn = game.player.pos;
+        Ok(game)
+    }
     pub fn toggle_god_mode(&mut self) {
         self.god_mode = !self.god_mode;
         self.velocity = Vec3::ZERO;
@@ -717,8 +774,9 @@ impl Game {
         };
         self.tick_drops(dt);
         self.collect_drops();
-        let biome = self.world.biome(pos.x as i32, pos.z as i32);
-        self.player.discover(format!("biome:{}", biome.name()), 30);
+        let biome = self.world.biome(pos.x.floor() as i32, pos.z.floor() as i32);
+        self.player
+            .discover(format!("biome:{}", biome.discovery_name()), 30);
         self.target();
         if input.attack {
             if self.feedback.swing == 0. {
@@ -756,7 +814,7 @@ impl Game {
             .entities
             .iter()
             .filter_map(|(id, m)| {
-                let d = m.pos + Vec3::Y - eye;
+                let d = m.pos + Vec3::Y * m.kind.target_height() - eye;
                 let along = d.dot(dir);
                 if along > 0.
                     && along < 3.2
@@ -792,7 +850,15 @@ impl Game {
             let mut killed = None;
             if let Some(m) = self.entities.get_mut(id) {
                 m.health -= damage;
-                m.pos += Vec3::new(dir.x, 0., dir.z) * 0.4;
+                if let MobKind::PolarBear { provoked, .. } = &mut m.kind {
+                    *provoked = true;
+                }
+                let pushed = m.pos + Vec3::new(dir.x, 0., dir.z) * 0.4;
+                if !matches!(m.kind, MobKind::Penguin { .. } | MobKind::PolarBear { .. })
+                    || !mob_blocked(&self.world, pushed, m.kind)
+                {
+                    m.pos = pushed;
+                }
                 if m.health <= 0. {
                     killed = Some((m.level, m.pos, m.kind));
                 }
@@ -1006,6 +1072,150 @@ impl Game {
                 && torch_lit(Vec3::from_array(self.player.pos) + Vec3::Y * 1.6))
     }
 
+    fn polar_spawn_site(&self, x: i32, z: i32, kind: MobKind) -> Option<Vec3> {
+        if !self.world.biome(x, z).is_snow() {
+            return None;
+        }
+        let height = self.world.height(x, z);
+        for y in (height - 4..=height + 3).rev() {
+            let ground = IVec3::new(x, y, z);
+            let block = self.world.get(ground);
+            if !block.solid() {
+                continue;
+            }
+            let suitable = match kind {
+                MobKind::Penguin { .. } => {
+                    matches!(
+                        block,
+                        Block::Snow | Block::Sand | Block::Gravel | Block::Dirt
+                    )
+                }
+                _ => matches!(block, Block::Snow | Block::Sand | Block::Gravel),
+            };
+            let pos = ground.as_vec3() + Vec3::new(0.5, 1.01, 0.5);
+            return (suitable
+                && !mob_blocked(&self.world, pos, kind)
+                && self
+                    .entities
+                    .iter()
+                    .all(|(_, mob)| mob.pos.distance(pos) > 1.5))
+            .then_some(pos);
+        }
+        None
+    }
+
+    fn penguin_shore(&self, pos: Vec3) -> bool {
+        let p = pos.floor().as_ivec3();
+        [IVec3::X, IVec3::NEG_X, IVec3::Z, IVec3::NEG_Z]
+            .into_iter()
+            .any(|side| {
+                (p.y - 4..p.y).any(|y| {
+                    [4, 8].into_iter().all(|distance| {
+                        let q = p.with_y(y) + side * distance;
+                        let block = self.world.get(q);
+                        block == Block::Water
+                            || (block == Block::Ice && self.world.get(q - IVec3::Y) == Block::Water)
+                    })
+                })
+            })
+    }
+
+    fn spawn_polar_wildlife(&mut self, player: Vec3) {
+        let penguins = self
+            .entities
+            .iter()
+            .any(|(_, m)| matches!(m.kind, MobKind::Penguin { .. }));
+        let bear = self
+            .entities
+            .iter()
+            .any(|(_, m)| matches!(m.kind, MobKind::PolarBear { .. }));
+        if penguins && bear {
+            return;
+        }
+        let h = crate::world::hash(
+            self.world.seed ^ 0x706f6c6172,
+            (self.time * 10000.) as i32,
+            0,
+            0,
+        );
+        let angle = (h % 628) as f32 / 100.;
+        let candidates = || {
+            (0..16).map(|index| {
+                let heading = angle + index as f32 * 2.39996;
+                let radius = 18. + (index % 4) as f32 * 7.;
+                let x = (player.x + heading.sin() * radius).floor() as i32;
+                let z = (player.z + heading.cos() * radius).floor() as i32;
+                (x, z, heading)
+            })
+        };
+        if !penguins {
+            let kind = MobKind::Penguin { male: false };
+            for (x, z, heading) in candidates() {
+                let Some(site) = self.polar_spawn_site(x, z, kind) else {
+                    continue;
+                };
+                if (site.y - player.y).abs() > 20.
+                    || self.entities.iter().any(|(_, m)| {
+                        matches!(m.kind, MobKind::PolarBear { .. }) && m.pos.distance(site) <= 36.
+                    })
+                    || !self.penguin_shore(site)
+                {
+                    continue;
+                }
+                let mut colony = vec![site];
+                for (dx, dz) in [(2, 1), (-2, 1), (0, -2), (3, -2), (-3, -2)] {
+                    if let Some(pos) = self.polar_spawn_site(x + dx, z + dz, kind)
+                        && (pos.y - site.y).abs() <= 1.1
+                    {
+                        colony.push(pos);
+                    }
+                }
+                if colony.len() < 3 {
+                    continue;
+                }
+                for (member, pos) in colony.into_iter().take(5).enumerate() {
+                    self.entities.spawn(Mob {
+                        kind: MobKind::Penguin {
+                            male: (member as u64 + (h >> 8)) & 1 == 0,
+                        },
+                        pos,
+                        health: 12.,
+                        cooldown: 0.,
+                        level: 1,
+                        heading,
+                        stride: 0.,
+                    });
+                }
+                break;
+            }
+        }
+        if !bear {
+            let kind = MobKind::PolarBear {
+                male: (h >> 9) & 1 == 0,
+                provoked: false,
+            };
+            for (x, z, heading) in candidates() {
+                if let Some(pos) = self.polar_spawn_site(x, z, kind)
+                    && (pos.y - player.y).abs() <= 20.
+                    && self.entities.iter().all(|(_, m)| {
+                        !matches!(m.kind, MobKind::Penguin { .. }) || m.pos.distance(pos) > 32.
+                    })
+                {
+                    self.entities.spawn(Mob {
+                        kind,
+                        pos,
+                        health: 60.,
+                        cooldown: 0.,
+                        level: 3,
+                        heading,
+                        stride: 0.,
+                    });
+                    break;
+                }
+            }
+        }
+    }
+
     fn update_mobs(&mut self, dt: f32) {
         let player = Vec3::from_array(self.player.pos);
         if let Some(home) = self.world.nearby_ruin(player.x as i32, player.z as i32) {
@@ -1025,6 +1235,8 @@ impl Game {
                     health: 65.,
                     cooldown: 0.8,
                     level: 4,
+                    heading: 0.,
+                    stride: 0.,
                 });
                 self.player
                     .discover(format!("ruin:{:?}", home.to_array()), 50);
@@ -1037,7 +1249,7 @@ impl Game {
             if self
                 .entities
                 .iter()
-                .filter(|(_, m)| !m.kind.hostile())
+                .filter(|(_, m)| matches!(m.kind, MobKind::Sheep { .. }))
                 .count()
                 < 6
             {
@@ -1051,7 +1263,7 @@ impl Game {
                 let remaining = 6 - self
                     .entities
                     .iter()
-                    .filter(|(_, m)| !m.kind.hostile())
+                    .filter(|(_, m)| matches!(m.kind, MobKind::Sheep { .. }))
                     .count();
                 for member in 0..remaining.min(3) as i32 {
                     let x = (player.x + angle.sin() * 26.) as i32 + member * 2;
@@ -1070,15 +1282,18 @@ impl Game {
                             health: 16.,
                             cooldown: 0.,
                             level: 1,
+                            heading: 0.,
+                            stride: 0.,
                         });
                     }
                 }
             }
 
+            self.spawn_polar_wildlife(player);
             if self
                 .entities
                 .iter()
-                .filter(|(_, m)| m.kind.hostile())
+                .filter(|(_, m)| matches!(m.kind, MobKind::Husk | MobKind::Guardian(_)))
                 .count()
                 < 5
             {
@@ -1104,6 +1319,8 @@ impl Game {
                         health: 30.,
                         cooldown: 0.,
                         level: 1,
+                        heading: 0.,
+                        stride: 0.,
                     });
                 }
             }
@@ -1121,10 +1338,21 @@ impl Game {
             mob.cooldown = (mob.cooldown - dt).max(0.);
             let diff = player - mob.pos;
             let dist = diff.length();
-            let sheep = !mob.kind.hostile();
+            if dist > 22.
+                && let MobKind::PolarBear { provoked, .. } = &mut mob.kind
+            {
+                *provoked = false;
+            }
+            let passive = !mob.kind.hostile();
+            let penguin = matches!(mob.kind, MobKind::Penguin { .. });
+            let bear = matches!(mob.kind, MobKind::PolarBear { .. });
+            let flee = !bear && dist < if penguin { 5. } else { 3. };
+            if bear && !passive && dist < 18. {
+                mob.heading = (-diff.x).atan2(-diff.z);
+            }
             let phase = self.time * 1200. + mob.pos.x * 0.07 + mob.pos.z * 0.05;
-            let direction = if sheep {
-                if dist < 3. {
+            let direction = if passive {
+                if flee {
                     -diff
                 } else {
                     Vec3::new(phase.sin(), 0., phase.cos())
@@ -1132,9 +1360,12 @@ impl Game {
             } else {
                 diff
             };
-            if (sheep && (dist < 3. || phase.sin() > 0.35)) || (!sheep && dist < 18. && dist > 1.4)
-            {
-                let speed = if sheep {
+            if (passive && (flee || phase.sin() > 0.35)) || (!passive && dist < 18. && dist > 1.4) {
+                let speed = if bear {
+                    if passive { 0.85 } else { 2.65 }
+                } else if penguin {
+                    if flee { 1.65 } else { 0.9 }
+                } else if passive {
                     0.65
                 } else if matches!(mob.kind, MobKind::Guardian(_)) {
                     2.2
@@ -1143,20 +1374,25 @@ impl Game {
                 };
                 let movement =
                     Vec3::new(direction.x, 0., direction.z).normalize_or_zero() * dt * speed;
+                let before = mob.pos;
                 for axis in [0, 2] {
                     let mut p = mob.pos;
                     p[axis] += movement[axis];
-                    if !collides(&self.world, p) {
+                    if !mob_blocked(&self.world, p, mob.kind) {
                         mob.pos = p;
-                    } else if !collides(&self.world, p + Vec3::Y)
-                        && collides(&self.world, p - Vec3::Y * 0.1)
+                    } else if !mob_blocked(&self.world, p + Vec3::Y, mob.kind)
+                        && body_collides(&self.world, p - Vec3::Y * 0.1, mob.kind.body())
                     {
                         mob.pos = p + Vec3::Y;
                     }
                 }
+                if (penguin || bear) && mob.pos != before {
+                    mob.heading = (-movement.x).atan2(-movement.z);
+                    mob.stride += before.distance(mob.pos);
+                }
             }
             let down = mob.pos - Vec3::Y * dt * 6.;
-            if !collides(&self.world, down) {
+            if !mob_blocked(&self.world, down, mob.kind) {
                 mob.pos = down;
             }
             if mob.kind.hostile()
@@ -1172,10 +1408,10 @@ impl Game {
                     .is_none()
             {
                 if !self.god_mode {
-                    self.player.health -= if matches!(mob.kind, MobKind::Guardian(_)) {
-                        12.
-                    } else {
-                        7.
+                    self.player.health -= match mob.kind {
+                        MobKind::PolarBear { .. } => 15.,
+                        MobKind::Guardian(_) => 12.,
+                        _ => 7.,
                     };
                 }
                 mob.cooldown = 1.2;
@@ -1184,7 +1420,7 @@ impl Game {
     }
     pub fn biome(&self) -> Biome {
         let p = Vec3::from_array(self.player.pos);
-        self.world.biome(p.x as i32, p.z as i32)
+        self.world.biome(p.x.floor() as i32, p.z.floor() as i32)
     }
 }
 fn drop_collides(world: &World, pos: Vec3) -> bool {
@@ -1211,8 +1447,18 @@ pub fn overlaps(pos: Vec3, b: IVec3) -> bool {
         && pos.z - 0.29 < (b.z + 1) as f32
 }
 pub fn collides(world: &World, pos: Vec3) -> bool {
-    let min = (pos - Vec3::new(0.29, 0., 0.29)).floor().as_ivec3();
-    let max = (pos + Vec3::new(0.29, 1.79, 0.29)).floor().as_ivec3();
+    body_collides(world, pos, (0.29, 1.79))
+}
+
+fn mob_blocked(world: &World, pos: Vec3, kind: MobKind) -> bool {
+    body_collides(world, pos, kind.body())
+        || (matches!(kind, MobKind::Penguin { .. } | MobKind::PolarBear { .. })
+            && world.get(pos.floor().as_ivec3()).fluid().is_some())
+}
+
+fn body_collides(world: &World, pos: Vec3, (radius, height): (f32, f32)) -> bool {
+    let min = (pos - Vec3::new(radius, 0., radius)).floor().as_ivec3();
+    let max = (pos + Vec3::new(radius, height, radius)).floor().as_ivec3();
     for x in min.x..=max.x {
         for y in min.y..=max.y {
             for z in min.z..=max.z {
@@ -1228,6 +1474,20 @@ pub fn collides(world: &World, pos: Vec3) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn biome_test_starts_on_dry_ground_in_each_selectable_biome() {
+        for name in Biome::SPAWN_NAMES.split(", ") {
+            let biome = Biome::from_spawn_name(name).unwrap();
+            let game = Game::new_in_biome(314159, biome).unwrap();
+            assert_eq!(game.biome(), biome, "{name}");
+            assert_eq!(game.player.pos, game.player.spawn);
+            let pos = Vec3::from_array(game.player.pos);
+            assert!(!collides(&game.world, pos));
+            assert!(collides(&game.world, pos - Vec3::Y * 0.06));
+            assert!(game.world.get(pos.floor().as_ivec3()).fluid().is_none());
+        }
+    }
     #[test]
     fn god_mode_flies_through_blocks_and_preserves_survival() {
         let mut g = Game::new(42);
@@ -1281,6 +1541,8 @@ mod tests {
             health: 16.,
             cooldown: 0.,
             level: 1,
+            heading: 0.,
+            stride: 0.,
         });
         let health = g.player.health;
         g.spawn_timer = 100.;
@@ -1292,6 +1554,77 @@ mod tests {
             g.update_mobs(0.);
         }
         assert!(g.entities.iter().filter(|(_, m)| !m.kind.hostile()).count() <= 6);
+    }
+
+    #[test]
+    fn polar_wildlife_spawns_in_coastal_colonies_and_solitary_bears() {
+        let mut game = Game::new(314159);
+        let world = &game.world;
+        let coast = (-1500..1500)
+            .step_by(12)
+            .flat_map(|x| (-1500..1500).step_by(12).map(move |z| (x, z)))
+            .find_map(|(x, z)| {
+                let y = world.height(x, z);
+                if y != crate::world::SEA_LEVEL + 1 || !world.biome(x, z).is_snow() {
+                    return None;
+                }
+                let pos = Vec3::new(x as f32 + 0.5, y as f32 + 1.01, z as f32 + 0.5);
+                game.penguin_shore(pos).then_some(pos)
+            })
+            .expect("seed has a polar coast");
+        for attempt in 0..24 {
+            game.time = attempt as f32 / 100.;
+            game.spawn_polar_wildlife(coast);
+            let penguins: Vec<_> = game
+                .entities
+                .iter()
+                .filter(|(_, m)| matches!(m.kind, MobKind::Penguin { .. }))
+                .collect();
+            let bears: Vec<_> = game
+                .entities
+                .iter()
+                .filter(|(_, m)| matches!(m.kind, MobKind::PolarBear { .. }))
+                .collect();
+            if !penguins.is_empty() && !bears.is_empty() {
+                assert!((3..=5).contains(&penguins.len()));
+                assert_eq!(bears.len(), 1);
+                assert!(
+                    penguins
+                        .iter()
+                        .all(|(_, m)| m.pos.distance(bears[0].1.pos) > 32.)
+                );
+                return;
+            }
+        }
+        panic!("expected both polar species near the seeded coastline");
+    }
+
+    #[test]
+    fn polar_bear_retaliates_after_a_player_hit() {
+        let mut g = sky_fixture();
+        g.spawn_timer = 100.;
+        g.player.pitch = -0.45;
+        g.entities.spawn(Mob {
+            kind: MobKind::PolarBear {
+                male: false,
+                provoked: false,
+            },
+            pos: Vec3::new(0.5, 100.01, -1.0),
+            health: 60.,
+            cooldown: 0.,
+            level: 3,
+            heading: 0.,
+            stride: 0.,
+        });
+        let health = g.player.health;
+        g.update_mobs(0.);
+        assert_eq!(g.player.health, health);
+        g.attack(STEP);
+        assert!(g.entities.iter().any(|(_, m)| m.kind.hostile()));
+        for _ in 0..60 {
+            g.update_mobs(STEP);
+        }
+        assert!(g.player.health < health);
     }
     #[test]
     fn spawning_requires_darkness_and_respects_torches() {

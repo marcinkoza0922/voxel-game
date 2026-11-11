@@ -1,4 +1,5 @@
 use crate::{
+    ecs::{Mob, MobKind},
     game::Game,
     ui::{Ui, UiVertex},
     world::{Block, SIZE, VIEW_RADIUS, World},
@@ -973,6 +974,10 @@ impl Renderer {
         for (_, m) in g.entities.iter() {
             let p = m.pos;
             let creature_start = dynamic.len();
+            if matches!(m.kind, MobKind::Penguin { .. } | MobKind::PolarBear { .. }) {
+                polar_mob_mesh(&mut dynamic, m);
+                continue;
+            }
             if let crate::ecs::MobKind::Sheep { male } = m.kind {
                 box_mesh(
                     &mut dynamic,
@@ -1128,11 +1133,11 @@ impl Renderer {
             let toward = (Vec3::from_array(g.player.pos) - p)
                 .with_y(0.)
                 .normalize_or_zero();
-            let rotation = glam::Quat::from_rotation_y((-toward.x).atan2(-toward.z));
-            for vertex in &mut dynamic[creature_start..] {
-                vertex.pos = (p + rotation * (Vec3::from_array(vertex.pos) - p)).to_array();
-                vertex.normal = (rotation * Vec3::from_array(vertex.normal)).to_array();
-            }
+            rotate_mob(
+                &mut dynamic[creature_start..],
+                p,
+                (-toward.x).atan2(-toward.z),
+            );
         }
         let mut icon = Ui::new();
         icon.width = 16.;
@@ -2179,6 +2184,91 @@ fn textured_box(out: &mut Vec<Vertex>, pos: Vec3, size: Vec3, block: Block) {
         vertex.tile = [uv[0], uv[1], crate::art::layer(block, face) as f32];
     }
 }
+fn rotate_mob(vertices: &mut [Vertex], origin: Vec3, heading: f32) {
+    let rotation = glam::Quat::from_rotation_y(heading);
+    for vertex in vertices {
+        vertex.pos = (origin + rotation * (Vec3::from_array(vertex.pos) - origin)).to_array();
+        vertex.normal = (rotation * Vec3::from_array(vertex.normal)).to_array();
+    }
+}
+
+fn polar_mob_mesh(out: &mut Vec<Vertex>, mob: &Mob) {
+    let start = out.len();
+    let mut part = |offset: [f32; 3], size: [f32; 3], color| {
+        box_mesh(
+            out,
+            mob.pos + Vec3::from_array(offset),
+            Vec3::from_array(size),
+            color,
+        );
+    };
+    let step = (mob.stride * 13.).sin();
+    let dark = [0.10, 0.13, 0.18];
+    if matches!(mob.kind, MobKind::Penguin { .. }) {
+        let white = [0.95, 0.96, 0.89];
+        let amber = [0.91, 0.53, 0.13];
+        let sway = step * 0.027;
+        part([-0.19 + sway, 0.11, -0.16], [0.38, 0.51, 0.34], dark);
+        part([-0.145 + sway, 0.15, -0.20], [0.29, 0.43, 0.12], white);
+        part([-0.16 + sway, 0.59, -0.18], [0.32, 0.27, 0.31], dark);
+        part([-0.064 + sway, 0.64, -0.29], [0.128, 0.08, 0.13], amber);
+        for side in [-1., 1.] {
+            let foot = step * side * 0.075;
+            part(
+                [side * 0.1 - 0.058, foot.max(0.) * 0.45, -0.22 + foot],
+                [0.116, 0.10, 0.24],
+                amber,
+            );
+            part(
+                [side * 0.215 - 0.052 + sway, 0.19, -0.06 + foot],
+                [0.104, 0.34, 0.15],
+                dark,
+            );
+            part(
+                [side * 0.116 - 0.035 + sway, 0.714, -0.187],
+                [0.07, 0.074, 0.032],
+                white,
+            );
+            part(
+                [side * 0.116 - 0.017 + sway, 0.731, -0.200],
+                [0.034, 0.042, 0.026],
+                dark,
+            );
+        }
+    } else {
+        let fur = [0.91, 0.90, 0.82];
+        let shade = [0.79, 0.81, 0.78];
+        part([-0.39, 0.43, -0.58], [0.78, 0.61, 1.18], fur);
+        part([-0.35, 0.52, -0.71], [0.70, 0.61, 0.46], fur);
+        part([-0.27, 0.76, -0.95], [0.54, 0.46, 0.52], fur);
+        part([-0.17, 0.76, -1.14], [0.34, 0.23, 0.35], shade);
+        part([-0.09, 0.88, -1.17], [0.18, 0.095, 0.07], dark);
+        part([-0.10, 0.57, 0.54], [0.20, 0.20, 0.16], shade);
+        for side in [-1., 1.] {
+            part([side * 0.19 - 0.087, 1.15, -0.68], [0.174, 0.17, 0.17], fur);
+            part(
+                [side * 0.19 - 0.048, 1.19, -0.691],
+                [0.096, 0.083, 0.04],
+                shade,
+            );
+            part(
+                [side * 0.192 - 0.027, 1.017, -0.963],
+                [0.054, 0.05, 0.03],
+                dark,
+            );
+            for end in [-1., 1.] {
+                let swing = step * side * end * 0.16;
+                let x = side * 0.265 - 0.135;
+                let y = swing.max(0.) * 0.44;
+                let z = end * 0.40 - 0.15 + swing;
+                part([x, y + 0.08, z], [0.27, 0.51, 0.30], fur);
+                part([x - 0.01, y, z - 0.08], [0.29, 0.16, 0.38], shade);
+            }
+        }
+    }
+    rotate_mob(&mut out[start..], mob.pos, mob.heading);
+}
+
 fn box_mesh(out: &mut Vec<Vertex>, pos: Vec3, size: Vec3, color: [f32; 3]) {
     for (n, u, v) in FACES {
         let verts = CORNERS.map(|(a, b)| {

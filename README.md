@@ -19,6 +19,13 @@ You can also launch with `cargo run --release -- --new`. Add `--seed 42` for a
 specific seed; `--save PATH` selects the directory beside PATH for the new file.
 Existing files are preserved.
 
+To playtest a biome, choose **Biome test** on the main menu, then select a
+starting biome. The game creates a separate world with seed `314159`.
+You can also launch directly into Polar plains with
+`cargo run --release -- --biome-test polar`. Use
+`--biome-test polar-mountains` to try the mountain terrain, or add `--seed 42`
+to try another world. Run with `--help` for all biome names.
+
 | Control | Action |
 | --- | --- |
 | WASD / mouse | Walk / look |

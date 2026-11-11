@@ -1272,8 +1272,9 @@ existing water/shore continuity checks.
 ## Regional terrain variants
 
 Grassland and snow climates each expose flat, hills, mountains and mega mountains
-through biome names and discovery. The existing Tundra discovery name is retained
-for snow plains. A seeded 650-block noise field selects tiers at 0.40, 0.72 and
+through biome names and discovery. The snowy family displays as Polar. Its
+legacy discovery keys are retained so old saves keep their discovery progress.
+A seeded 650-block noise field selects tiers at 0.40, 0.72 and
 0.94; smooth ramps within tiers avoid elevation steps. Mega mountain regions
 occupy less than one percent of a broad deterministic sample. Forests retain
 ordinary rolling relief, with mountain amplitude fading across forest boundaries.
@@ -1289,6 +1290,34 @@ slopes, deterministic rarity, and increasing maximum elevations. The pond halo
 regression searches the full supported pond extent for its containing rim.
 Tree roots also reject cave carving at the first trunk voxel, preventing missing
 trunks on the newly common gentle terrain.
+
+### Polar glaciers and wildlife
+
+Seeded 160-block cells can lay elongated glaciers over polar mountain slopes.
+The ice footprint tapers toward the lower end and thickens toward its center.
+Narrow crevasses expose the ice below the surface. Some open into small caverns
+within the thickest ice. The ice replaces shallow
+terrain within the existing elevation envelope. Ruins, water and caves take
+precedence, and saved edits override generated ice. Direct queries and chunk
+halos use the same column geometry.
+
+The regular creature spawn check samples polar surfaces near the player. It
+allows one colony of three to five penguins and one solitary bear at a time,
+with at least 32 blocks of separation at spawn. Penguins spawn on banks near
+continuous water or pond ice and flee approaching players. Bears wander
+passively until struck, pursue within 18 blocks and calm down beyond 22.
+Both species use animated code-native voxel models, stay out of fluids and
+share the existing transient creature lifecycle.
+
+### Biome test worlds
+
+The main menu's Biome test picker and `--biome-test BIOME` share the biome
+choices and fresh-world save flow. The picker uses seed 314159, which is also
+the CLI default. Both search outward on a 24-block grid
+for dry ground with headroom, modest local slopes and an eight-block margin
+from the selected biome's boundaries in the cardinal directions. The chosen
+position is saved as both the starting and respawn position. The search ends
+within 16,384 blocks and reports an error if it finds no eligible site.
 
 ### Underground streaming frontiers
 
